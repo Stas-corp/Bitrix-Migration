@@ -19,20 +19,21 @@
 
 ```sql
 SELECT 
-  CONCAT('project_project_', g.ID) AS `external id проекту`,
+  g.ID AS `external_id`,
   g.NAME AS `name`,
-  NULL AS `Етап проекту stage_id`,
-  NULL AS `Клієнт partner_id`,
+  CASE WHEN g.CLOSED = 'Y' THEN 'Завершено' ELSE 'В роботі' END AS `stage_id`,
+  CASE WHEN g.PROJECT = 'Y' THEN 'Проект' ELSE 'Робоча група' END AS `type`,
+  NULL AS `partner_id`,
   (SELECT GROUP_CONCAT(gt.NAME SEPARATOR ', ') 
-   FROM b_sonet_group_tag gt WHERE gt.GROUP_ID = g.ID) AS `Мітки tag_ids`,
-  g.OWNER_ID AS `Керівник проекту user_id`,
-  g.PROJECT_DATE_START AS `Початкова дата date_start`,
-  g.PROJECT_DATE_FINISH AS `Термін дії date`,
+   FROM b_sonet_group_tag gt WHERE gt.GROUP_ID = g.ID) AS `tags`,
+  u.ID AS `user_id`,
+  g.PROJECT_DATE_START AS `date_start`,
+  g.PROJECT_DATE_FINISH AS `date_end`,
   NULL AS `Розподілений час`,
   NULL AS `Доступність`,
-  g.DESCRIPTION AS `Опис`
+  g.DESCRIPTION AS `description`
 FROM b_sonet_group g
-WHERE g.PROJECT = 'Y'
+LEFT JOIN b_user u ON u.ID = g.OWNER_ID
 ORDER BY g.ID
 ```
 
@@ -50,22 +51,22 @@ ORDER BY g.ID
 
 ```sql
 SELECT 
-  CONCAT('project_task_', t.ID) AS `external id завдання`,
-  t.TITLE AS `name завдання`,
+  t.ID AS `external_id`,
+  t.TITLE AS `name`,
   CASE WHEN t.GROUP_ID > 0 
-    THEN CONCAT('project_project_', t.GROUP_ID) 
-    ELSE NULL END AS `external id проекту`,
-  GROUP_CONCAT(DISTINCT m.USER_ID SEPARATOR ', ') AS `Уповноважені user_ids`,
+    THEN t.GROUP_ID
+    ELSE NULL END AS `project_external_id`,
+  GROUP_CONCAT(DISTINCT m.USER_ID SEPARATOR ', ') AS `responsible_user_ids`,
   (SELECT GROUP_CONCAT(DISTINCT tl.NAME SEPARATOR ', ')
    FROM b_tasks_task_tag tt 
    JOIN b_tasks_label tl ON tl.ID = tt.TAG_ID
-   WHERE tt.TASK_ID = t.ID) AS `Мітки tag_ids`,
-  t.DEADLINE AS `Кінцевий термін date_deadline`,
-  t.DESCRIPTION AS `Опис`,
-  t.STAGE_ID AS `Етап завдання stage_id`,
+   WHERE tt.TASK_ID = t.ID) AS `tags`,
+  t.DEADLINE AS `date_deadline`,
+  t.DESCRIPTION AS `description`,
+  t.STAGE_ID AS `stage_id`,
   CASE WHEN t.PARENT_ID > 0 
-    THEN CONCAT('project_task_', t.PARENT_ID) 
-    ELSE NULL END AS `Підзадача (parent_id)`
+    THEN t.PARENT_ID
+    ELSE NULL END AS `parent_id`
 FROM b_tasks t
 LEFT JOIN b_tasks_member m ON m.TASK_ID = t.ID AND m.TYPE IN ('R','A')
 WHERE (t.ZOMBIE = 'N' OR t.ZOMBIE IS NULL)
@@ -205,6 +206,49 @@ ORDER BY ID
 
 **Открытый вопрос:** нужны ли уникальные названия стадий (дедупликация, ~44 штуки) или все стадии с привязкой к группе (535 строк)?
 
+## UPD
+
+```sql
+SELECT
+  g.ID AS `external_id`,
+  g.NAME AS `name`,
+  CASE 
+    WHEN g.PROJECT = 'Y' THEN 'Проект'
+    ELSE 'Робоча група'
+  END AS `entity_type`,
+  s.ID AS `stage_external_id`,
+  s.TITLE AS `stage_name`,
+  CASE 
+    WHEN g.CLOSED = 'Y' THEN 'Завершено'
+    ELSE 'В роботі'
+  END AS `status`,
+  u.ID AS `user_id`,
+  g.PROJECT_DATE_START AS `date_start`,
+  g.PROJECT_DATE_FINISH AS `date_end`,
+  g.DESCRIPTION AS `description`
+FROM b_sonet_group g
+LEFT JOIN b_user u 
+  ON u.ID = g.OWNER_ID
+LEFT JOIN b_tasks_stages s
+  ON s.ENTITY_TYPE = 'G'
+ AND s.ENTITY_ID = g.ID
+ AND s.TITLE IS NOT NULL
+ AND s.TITLE <> ''
+ORDER BY g.ID, s.TITLE;
+```
+
+## Описание
+
+Скрипт выбирает из `b_sonet_group` список сущностей Bitrix24, включая проекты и рабочие группы, затем подтягивает владельца из `b_user` и связанные этапы канбана из `b_tasks_stages`. [web:16][web:36][web:47]  
+В результат выводятся идентификатор, название, тип сущности, статус, пользователь-владелец, даты проекта и название этапа канбана. [web:16][web:36]
+
+## Замечания
+
+- Связь этапов с проектами и рабочими группами выполняется по условию `s.ENTITY_TYPE = 'G'` и `s.ENTITY_ID = g.ID`. [web:16]
+- Поле `g.PROJECT` определяет тип сущности: проект или рабочая группа. [web:36][web:47]
+- Одна сущность может повторяться в нескольких строках, если у нее несколько этапов канбана. [web:16]
+- Для рабочих групп поля `PROJECT_DATE_START` и `PROJECT_DATE_FINISH` могут быть не заполнены, так как проектные даты относятся к проектной логике. [web:36][web:50]
+
 
 ---
 
@@ -213,8 +257,8 @@ ORDER BY ID
 ### Все комментарии (~874K записей)
 ```sql
 SELECT 
-  'project.task' AS `Повязана модель документу`,
-  CONCAT('project_task_', t.ID) AS `id сутності`,
+  'project.task' AS `document_entities`,
+  CONCAT('project_task_', t.ID) AS `entities_id`,
   CASE 
     WHEN fm.SERVICE_TYPE = 1 THEN 'Системне повідомлення'
     WHEN fm.NEW_TOPIC = 'Y' THEN 'Автоповідомлення'
@@ -264,23 +308,68 @@ ORDER BY fm.POST_DATE
 - **`STRAIGHT_JOIN`** — подсказка MySQL, что нужно идти от `b_forum_message` (меньше строк после фильтров) к `b_tasks`.
 - **874K строк** — не выгрузятся через интерфейс Metabase. Сохранить как Question → Download → CSV.
 
+## UPD
+```sql
+-- ============================================================
+-- Комментарии из ЗАДАЧ (через форум)
+-- ============================================================
+SELECT 
+  'project.task'                                AS `document_entities`,
+  t.ID						                    AS `entities_id`,
+  fm.ID                                         AS `message_id`,
+  CASE 
+    WHEN fm.SERVICE_TYPE = 1 THEN 'Системне повідомлення'
+    WHEN fm.NEW_TOPIC = 'Y'  THEN 'Автоповідомлення'
+    ELSE 'Коментар'
+  END                                           AS `type`,
+  'Примітка'                                    AS `subtype`,
+  fm.POST_MESSAGE                               AS `text`,
+  fm.POST_DATE                                  AS `data`,
+  fm.AUTHOR_ID                                  AS `user_id`
+FROM b_forum_message fm
+STRAIGHT_JOIN b_tasks t 
+  ON t.FORUM_TOPIC_ID = fm.TOPIC_ID
+WHERE fm.FORUM_ID = 11
+  AND (t.ZOMBIE = 'N' OR t.ZOMBIE IS NULL)
 
+UNION ALL
+
+-- ============================================================
+-- Комментарии из ВСТРЕЧ (через соцсеть)
+-- ============================================================
+SELECT 
+  'calendar.event'                              AS `Повязана модель документу`,
+  cal_log.SOURCE_ID                             AS `id сутності`,
+  slc.ID                                        AS `message_id`,
+  'Коментар'                                    AS `Тип`,
+  'Примітка'                                    AS `Підтип`,
+  slc.MESSAGE                                   AS `Тіло тексту`,
+  slc.LOG_DATE                                  AS `Дата`,
+  slc.USER_ID                                   AS `Автор`
+FROM b_sonet_log_comment slc
+JOIN (
+  SELECT ID, SOURCE_ID
+  FROM b_sonet_log
+  WHERE EVENT_ID = 'calendar'
+) cal_log ON cal_log.ID = slc.LOG_ID
+```
 ---
 
 # 6. Зустрічі (дедупліковані)
 
 ```sql
 SELECT 
-  ce.NAME AS `Тема зустрічі`,
-  ce.DATE_FROM AS `Дата початку`,
-  ce.DATE_TO AS `Дата кінцева`,
+ce.ID as 'external_id',
+  ce.NAME AS `name`,
+  ce.DATE_FROM AS `date_start`,
+  ce.DATE_TO AS `date_end`,
   (SELECT GROUP_CONCAT(DISTINCT child.OWNER_ID SEPARATOR ', ')
    FROM b_calendar_event child
    WHERE child.PARENT_ID = ce.ID 
      AND child.DELETED = 'N'
-     AND child.ID != child.PARENT_ID) AS `Учасники`,
-  ce.MEETING_HOST AS `Організатор`,
-  ce.DESCRIPTION AS `Опис`
+     AND child.ID != child.PARENT_ID) AS `bitrix_user_id_participants`,
+  ce.MEETING_HOST AS `bitrix_user_id_organizer`,
+  ce.DESCRIPTION AS `description`
 FROM b_calendar_event ce
 WHERE ce.IS_MEETING = '1' 
   AND ce.DELETED = 'N'
