@@ -1,0 +1,204 @@
+from datetime import datetime
+from typing import Optional
+
+from pydantic import BaseModel, field_validator
+
+
+def _clean_str(v):
+    """Convert empty strings and 'NULL' to None."""
+    if v is None:
+        return None
+    if isinstance(v, str):
+        v = v.strip()
+        if v in ('', 'NULL', 'null'):
+            return None
+    return v
+
+
+def _to_datetime(v):
+    """Normalize MySQL datetime to Python datetime."""
+    if v is None:
+        return None
+    if isinstance(v, datetime):
+        return v
+    if isinstance(v, str):
+        v = v.strip()
+        if not v or v in ('NULL', 'null', '0000-00-00 00:00:00'):
+            return None
+        for fmt in ('%Y-%m-%d %H:%M:%S', '%Y-%m-%d'):
+            try:
+                return datetime.strptime(v, fmt)
+            except ValueError:
+                continue
+    return None
+
+
+def _to_int_or_none(v):
+    """Convert 0, empty, 'NULL' to None, otherwise int."""
+    if v is None:
+        return None
+    if isinstance(v, str):
+        v = v.strip()
+        if v in ('', 'NULL', 'null', '0'):
+            return None
+        try:
+            v = int(v)
+        except ValueError:
+            return None
+    if isinstance(v, (int, float)):
+        return int(v) if v else None
+    return None
+
+
+class BitrixProject(BaseModel):
+    external_id: int
+    name: str
+    type: str  # 'project' or 'workgroup'
+    closed: bool = False
+    owner_bitrix_id: Optional[int] = None
+    tags: Optional[str] = None
+    date_start: Optional[datetime] = None
+    date_end: Optional[datetime] = None
+    description: Optional[str] = None
+
+    @field_validator('name', mode='before')
+    @classmethod
+    def clean_name(cls, v):
+        return _clean_str(v) or 'Untitled'
+
+    @field_validator('closed', mode='before')
+    @classmethod
+    def parse_closed(cls, v):
+        if isinstance(v, str):
+            return v.upper() in ('Y', 'YES', '1', 'TRUE')
+        return bool(v)
+
+    @field_validator('type', mode='before')
+    @classmethod
+    def parse_type(cls, v):
+        if isinstance(v, str) and v.upper() == 'Y':
+            return 'project'
+        if v in ('project', 'workgroup'):
+            return v
+        return 'workgroup'
+
+    @field_validator('tags', 'description', mode='before')
+    @classmethod
+    def clean_optional_str(cls, v):
+        return _clean_str(v)
+
+    @field_validator('owner_bitrix_id', mode='before')
+    @classmethod
+    def clean_owner(cls, v):
+        return _to_int_or_none(v)
+
+    @field_validator('date_start', 'date_end', mode='before')
+    @classmethod
+    def clean_dates(cls, v):
+        return _to_datetime(v)
+
+
+class BitrixTask(BaseModel):
+    external_id: int
+    name: str
+    project_external_id: Optional[int] = None
+    responsible_user_ids: Optional[str] = None
+    tags: Optional[str] = None
+    date_deadline: Optional[datetime] = None
+    description: Optional[str] = None
+    stage_id: Optional[int] = None
+    parent_id: Optional[int] = None
+
+    @field_validator('name', mode='before')
+    @classmethod
+    def clean_name(cls, v):
+        return _clean_str(v) or 'Untitled Task'
+
+    @field_validator('project_external_id', 'stage_id', 'parent_id', mode='before')
+    @classmethod
+    def clean_int(cls, v):
+        return _to_int_or_none(v)
+
+    @field_validator('responsible_user_ids', 'tags', 'description', mode='before')
+    @classmethod
+    def clean_str(cls, v):
+        return _clean_str(v)
+
+    @field_validator('date_deadline', mode='before')
+    @classmethod
+    def clean_date(cls, v):
+        return _to_datetime(v)
+
+
+class BitrixStage(BaseModel):
+    id: int
+    name: str
+    entity_type: str = 'G'
+    entity_id: int = 0
+
+    @field_validator('name', mode='before')
+    @classmethod
+    def clean_name(cls, v):
+        return _clean_str(v) or 'Untitled Stage'
+
+
+class BitrixTag(BaseModel):
+    id: int
+    name: str
+    source: Optional[str] = 'task'
+
+    @field_validator('name', mode='before')
+    @classmethod
+    def clean_name(cls, v):
+        return _clean_str(v) or ''
+
+
+class BitrixComment(BaseModel):
+    message_id: int
+    document_model: str = 'project.task'
+    entity_id: int
+    type: str = 'comment'
+    body: Optional[str] = None
+    date: Optional[datetime] = None
+    author_bitrix_id: int = 0
+
+    @field_validator('body', mode='before')
+    @classmethod
+    def clean_body(cls, v):
+        return _clean_str(v)
+
+    @field_validator('date', mode='before')
+    @classmethod
+    def clean_date(cls, v):
+        return _to_datetime(v)
+
+    @field_validator('author_bitrix_id', mode='before')
+    @classmethod
+    def clean_author(cls, v):
+        return int(v) if v else 0
+
+
+class BitrixAttachment(BaseModel):
+    entity_type: str = 'task'  # 'task' or 'comment'
+    entity_id: int = 0
+    forum_message_id: Optional[int] = None
+    file_name: str = ''
+    file_size: int = 0
+    content_type: str = 'application/octet-stream'
+    file_path: str = ''
+    attached_at: Optional[datetime] = None
+
+    @field_validator('file_name', 'content_type', 'file_path', mode='before')
+    @classmethod
+    def clean_str(cls, v):
+        return _clean_str(v) or ''
+
+    @field_validator('forum_message_id', mode='before')
+    @classmethod
+    def clean_fmid(cls, v):
+        return _to_int_or_none(v)
+
+    @field_validator('attached_at', mode='before')
+    @classmethod
+    def clean_date(cls, v):
+        return _to_datetime(v)

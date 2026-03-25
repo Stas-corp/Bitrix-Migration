@@ -1,0 +1,91 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+
+    <!-- Form View -->
+    <record id="view_bitrix_migration_run_form" model="ir.ui.view">
+        <field name="name">bitrix.migration.run.form</field>
+        <field name="model">bitrix.migration.run</field>
+        <field name="arch" type="xml">
+            <form string="Bitrix Migration">
+                <header>
+                    <button name="action_run" string="Run Migration"
+                            type="object" class="btn-primary"
+                            invisible="state != 'draft'"
+                            confirm="Are you sure you want to start the migration?"/>
+                    <button name="action_reset" string="Reset"
+                            type="object" class="btn-secondary"
+                            invisible="state == 'draft'"/>
+                    <field name="state" widget="statusbar"
+                           statusbar_visible="draft,running,done"/>
+                </header>
+                <sheet>
+                    <group>
+                        <group string="Migration Mode">
+                            <field name="mode"/>
+                            <field name="single_task_bitrix_id"
+                                   invisible="mode != 'single_task'"
+                                   placeholder="e.g. 12345"/>
+                            <field name="pilot_project_ids"
+                                   invisible="mode != 'pilot'"
+                                   placeholder="e.g. 1,2,3"/>
+                        </group>
+                        <group string="Options">
+                            <field name="preserve_authorship"/>
+                            <field name="fallback_system_author"/>
+                            <field name="progress" widget="progressbar"/>
+                        </group>
+                    </group>
+                    <notebook>
+                        <page string="MySQL Connection">
+                            <group>
+                                <group>
+                                    <field name="mysql_host" placeholder="localhost"/>
+                                    <field name="mysql_port"/>
+                                    <field name="mysql_database" placeholder="bitrix_db"/>
+                                </group>
+                                <group>
+                                    <field name="mysql_user" placeholder="root"/>
+                                    <field name="mysql_password" password="True"/>
+                                </group>
+                            </group>
+                        </page>
+                        <page string="SFTP Settings">
+                            <group>
+                                <group>
+                                    <field name="sftp_host" placeholder="bitrix-server.local"/>
+                                    <field name="sftp_port"/>
+                                    <field name="sftp_user" placeholder="bitrix"/>
+                                </group>
+                                <group>
+                                    <field name="sftp_key_path" placeholder="/path/to/key"/>
+                                    <field name="sftp_base_path" placeholder="/home/bitrix/www"/>
+                                </group>
+                            </group>
+                        </page>
+                        <page string="Log Output">
+                            <field name="log_output" readonly="1"
+                                   widget="text" nolabel="1"
+                                   placeholder="Migration log will appear here..."/>
+                        </page>
+                    </notebook>
+                </sheet>
+            </form>
+        </field>
+    </record>
+
+    <!-- Action -->
+    <record id="action_bitrix_migration_run" model="ir.actions.act_window">
+        <field name="name">Bitrix Migration</field>
+        <field name="res_model">bitrix.migration.run</field>
+        <field name="view_mode">form</field>
+        <field name="target">new</field>
+    </record>
+
+    <!-- Menu -->
+    <menuitem id="menu_bitrix_migration_root"
+              name="Bitrix Migration"
+              parent="base.menu_custom"
+              action="action_bitrix_migration_run"
+              sequence="100"/>
+
+</odoo>
