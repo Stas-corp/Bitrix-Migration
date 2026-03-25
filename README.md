@@ -338,14 +338,14 @@ UNION ALL
 -- Комментарии из ВСТРЕЧ (через соцсеть)
 -- ============================================================
 SELECT 
-  'calendar.event'                              AS `Повязана модель документу`,
-  cal_log.SOURCE_ID                             AS `id сутності`,
+  'calendar.event'                              AS `document_entities`,
+  cal_log.SOURCE_ID                             AS `entities_id`,
   slc.ID                                        AS `message_id`,
-  'Коментар'                                    AS `Тип`,
-  'Примітка'                                    AS `Підтип`,
+  'Коментар'                                    AS `type`,
+  'Примітка'                                    AS `subtype`,
   slc.MESSAGE                                   AS `Тіло тексту`,
-  slc.LOG_DATE                                  AS `Дата`,
-  slc.USER_ID                                   AS `Автор`
+  slc.LOG_DATE                                  AS `text`,
+  slc.USER_ID                                   AS `user_id`
 FROM b_sonet_log_comment slc
 JOIN (
   SELECT ID, SOURCE_ID
