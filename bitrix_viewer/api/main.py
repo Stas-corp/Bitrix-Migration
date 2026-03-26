@@ -1,6 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from .database import check_connection
 from .routers import comments, employees, projects, tasks
 
 app = FastAPI(
@@ -24,4 +25,6 @@ app.include_router(employees.router)
 
 @app.get("/api/health")
 def health():
-    return {"status": "ok"}
+    """Проверяет доступность API и соединение с БД."""
+    db = check_connection()
+    return {"api": "ok", "db": db}
