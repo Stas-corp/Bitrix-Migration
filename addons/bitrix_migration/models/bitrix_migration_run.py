@@ -6,7 +6,7 @@ from odoo import models, fields, api
 _logger = logging.getLogger(__name__)
 
 
-class BitrixMigrationRun(models.TransientModel):
+class BitrixMigrationRun(models.Model):
     _name = 'bitrix.migration.run'
     _description = 'Bitrix Migration Runner'
 
@@ -404,3 +404,17 @@ class BitrixMigrationRun(models.TransientModel):
         self.state = 'draft'
         self.log_output = ''
         self.progress = 0.0
+
+    @api.model
+    def get_singleton_action(self):
+        record = self.search([], limit=1, order='id asc')
+        if not record:
+            record = self.create({'mode': 'dry_run'})
+        return {
+            'type': 'ir.actions.act_window',
+            'name': 'Bitrix Migration',
+            'res_model': self._name,
+            'view_mode': 'form',
+            'res_id': record.id,
+            'target': 'current',
+        }
