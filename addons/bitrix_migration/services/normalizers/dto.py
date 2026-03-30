@@ -132,7 +132,7 @@ class BitrixTask(BaseModel):
 
 
 class BitrixStage(BaseModel):
-    id: int
+    id: int = Field(validation_alias=AliasChoices('id', 'ID'))
     name: str
     entity_type: str = 'G'
     entity_id: int = 0

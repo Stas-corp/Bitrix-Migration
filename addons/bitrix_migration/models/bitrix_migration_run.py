@@ -259,7 +259,7 @@ class BitrixMigrationRun(models.Model):
             if raw_projects:
                 proj_loader = ProjectLoader(self.env, extractor, log_callback=self._append_log)
                 for row in raw_projects:
-                    from ..normalizers.dto import BitrixProject
+                    from ..services.normalizers.dto import BitrixProject
                     proj = BitrixProject(**row)
                     vals = {
                         'name': proj.name,
@@ -288,7 +288,7 @@ class BitrixMigrationRun(models.Model):
             if raw_stages:
                 stage_loader = StageLoader(self.env, extractor, log_callback=self._append_log)
                 for row in raw_stages:
-                    from ..normalizers.dto import BitrixStage
+                    from ..services.normalizers.dto import BitrixStage
                     stg = BitrixStage(**row)
                     vals = {
                         'name': stg.name,
