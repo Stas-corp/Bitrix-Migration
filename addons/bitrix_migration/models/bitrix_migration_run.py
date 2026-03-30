@@ -18,6 +18,9 @@ class BitrixMigrationRun(models.Model):
         ('relink', 'Relink Parents'),
         ('comments', 'Comments Only'),
         ('single_task', 'Single Task Test'),
+        ('hr', 'HR: Departments + Employees'),
+        ('departments_only', 'HR: Departments Only'),
+        ('employees_only', 'HR: Employees Only'),
     ], required=True, default='dry_run', string='Mode')
 
     # MySQL connection
@@ -91,6 +94,12 @@ class BitrixMigrationRun(models.Model):
                 self._run_relink(extractor)
             elif self.mode == 'comments':
                 self._run_comments(extractor)
+            elif self.mode == 'hr':
+                self._run_hr(extractor)
+            elif self.mode == 'departments_only':
+                self._run_departments_only(extractor)
+            elif self.mode == 'employees_only':
+                self._run_employees_only(extractor)
 
             extractor.close()
             self.state = 'done'
@@ -114,6 +123,8 @@ class BitrixMigrationRun(models.Model):
             'Stages (G)': extractor.count_stages(),
             'Comments (real)': extractor.count_comments(),
             'Meetings': extractor.count_meetings(),
+            'Departments': extractor.count_departments(),
+            'Employees': extractor.count_employees(),
         }
 
         # Odoo existing counts
@@ -124,6 +135,10 @@ class BitrixMigrationRun(models.Model):
                 [('x_bitrix_id', '!=', False)]),
             'Comments': self.env['mail.message'].sudo().search_count(
                 [('x_bitrix_message_id', '!=', False)]),
+            'Departments': self.env['hr.department'].sudo().search_count(
+                [('x_bitrix_id', '!=', 0)]),
+            'Employees': self.env['hr.employee'].sudo().with_context(active_test=False).search_count(
+                [('x_bitrix_id', '!=', 0)]),
         }
 
         self._append_log(f"{'Entity':<20} {'Bitrix':>10} {'Odoo':>10} {'To Create':>10}")
@@ -377,6 +392,59 @@ class BitrixMigrationRun(models.Model):
         )
         loader.run()
 
+    def _run_hr(self, extractor):
+        """Migrate departments (with hierarchy) then employees."""
+        self._run_departments_only(extractor)
+        self._run_employees_only(extractor)
+
+    def _run_departments_only(self, extractor):
+        """Migrate department structure from Bitrix into hr.department."""
+        from ..services.loaders.users import UserLoader
+        from ..services.loaders.departments import DepartmentLoader
+
+        self._append_log('\n--- Users (mapping) ---')
+        user_loader = UserLoader(
+            self.env, extractor,
+            dry_run=self.dry_run,
+            log_callback=self._append_log,
+        )
+        user_map = user_loader.run()
+
+        self._append_log('\n--- Departments ---')
+        dept_loader = DepartmentLoader(
+            self.env, extractor,
+            user_map=user_map or {},
+            dry_run=self.dry_run,
+            log_callback=self._append_log,
+        )
+        dept_loader.run()
+
+    def _run_employees_only(self, extractor):
+        """Migrate active employees into hr.employee (departments must exist)."""
+        from ..services.loaders.users import UserLoader
+        from ..services.loaders.employees import EmployeeLoader
+
+        # Build user map (may already be populated; run is idempotent)
+        self._append_log('\n--- Users (mapping) ---')
+        user_loader = UserLoader(
+            self.env, extractor,
+            dry_run=self.dry_run,
+            log_callback=self._append_log,
+        )
+        user_map = user_loader.run()
+
+        dept_map = self.env['bitrix.migration.mapping'].sudo().get_all_mappings('department')
+
+        self._append_log('\n--- Employees ---')
+        emp_loader = EmployeeLoader(
+            self.env, extractor,
+            user_map=user_map or {},
+            dept_map=dept_map,
+            dry_run=self.dry_run,
+            log_callback=self._append_log,
+        )
+        emp_loader.run()
+
     def _run_reconciliation(self):
         """Print reconciliation report."""
         self._append_log('\n=== RECONCILIATION REPORT ===')
@@ -395,6 +463,10 @@ class BitrixMigrationRun(models.Model):
                 [('x_bitrix_message_id', '!=', False), ('x_bitrix_author_id', '!=', False)]),
             'Attachments': self.env['ir.attachment'].sudo().search_count([]),
             'Mapping records': self.env['bitrix.migration.mapping'].sudo().search_count([]),
+            'Departments': self.env['hr.department'].sudo().search_count(
+                [('x_bitrix_id', '!=', 0)]),
+            'Employees': self.env['hr.employee'].sudo().with_context(active_test=False).search_count(
+                [('x_bitrix_id', '!=', 0)]),
         }
         for label, count in checks.items():
             self._append_log(f'  {label}: {count}')

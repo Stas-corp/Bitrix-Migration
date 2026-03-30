@@ -28,6 +28,15 @@
                             <field name="pilot_project_ids"
                                    invisible="mode != 'pilot'"
                                    placeholder="e.g. 1,2,3"/>
+                            <div invisible="mode not in ('hr', 'departments_only', 'employees_only')"
+                                 class="alert alert-info" role="alert">
+                                <strong>HR modes:</strong>
+                                <ul style="margin-bottom:0">
+                                    <li><b>Departments Only</b> — creates hr.department hierarchy with managers</li>
+                                    <li><b>Employees Only</b> — creates hr.employee (departments must be migrated first)</li>
+                                    <li><b>Departments + Employees</b> — runs both in order</li>
+                                </ul>
+                            </div>
                         </group>
                         <group string="Options">
                             <field name="preserve_authorship"/>

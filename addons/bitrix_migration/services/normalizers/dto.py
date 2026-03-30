@@ -1,7 +1,8 @@
+import re
 from datetime import datetime
 from typing import Optional
 
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, field_validator, model_validator
 
 
 def _clean_str(v):
@@ -176,6 +177,76 @@ class BitrixComment(BaseModel):
     @classmethod
     def clean_author(cls, v):
         return int(v) if v else 0
+
+
+def parse_php_int_array(value: str) -> list:
+    """Parse PHP serialized int array.
+
+    Handles format: a:1:{i:0;s:2:"42";}  →  [42]
+    Also handles:   a:2:{i:0;i:5;i:1;i:10;}  →  [5, 10]
+    """
+    if not value or not str(value).startswith('a:'):
+        return []
+    # String values: s:N:"digits";
+    result = [int(m) for m in re.findall(r's:\d+:"(\d+)";', value)]
+    if result:
+        return result
+    # Integer values — keys are 0,1,2... values follow (every other, starting at index 1)
+    all_ints = re.findall(r'i:(\d+);', value)
+    return [int(v) for v in all_ints[1::2]]
+
+
+class BitrixDepartment(BaseModel):
+    dept_id: int
+    dept_name: str
+    parent_dept_id: Optional[int] = None
+    head_user_id: Optional[int] = None
+    depth_level: int = 0
+
+    @field_validator('dept_name', mode='before')
+    @classmethod
+    def clean_name(cls, v):
+        return _clean_str(v) or 'Untitled Department'
+
+    @field_validator('parent_dept_id', 'head_user_id', mode='before')
+    @classmethod
+    def clean_int(cls, v):
+        return _to_int_or_none(v)
+
+    @field_validator('depth_level', mode='before')
+    @classmethod
+    def clean_depth(cls, v):
+        return int(v) if v else 0
+
+
+class BitrixEmployee(BaseModel):
+    user_id: int
+    login: str = ''
+    full_name: str
+    email: Optional[str] = None
+    dept_ids: list = []
+
+    @model_validator(mode='before')
+    @classmethod
+    def parse_raw_dept(cls, data):
+        raw = data.get('raw_dept') or ''
+        data['dept_ids'] = parse_php_int_array(str(raw)) if raw else []
+        return data
+
+    @field_validator('full_name', mode='before')
+    @classmethod
+    def clean_name(cls, v):
+        return _clean_str(v) or 'Unknown Employee'
+
+    @field_validator('email', mode='before')
+    @classmethod
+    def clean_email(cls, v):
+        return _clean_str(v)
+
+    @field_validator('login', mode='before')
+    @classmethod
+    def clean_login(cls, v):
+        return _clean_str(v) or ''
 
 
 class BitrixAttachment(BaseModel):
