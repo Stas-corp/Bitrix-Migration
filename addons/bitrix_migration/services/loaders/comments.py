@@ -36,7 +36,7 @@ class CommentLoader(BaseLoader):
         if self.system_author_partner_id:
             return self.system_author_partner_id
 
-        partner = self.env['res.partner'].sudo().search(
+        partner = self.env['res.partner'].sudo().with_context(active_test=False).search(
             [('name', '=', MIGRATION_BOT_NAME)], limit=1,
         )
         if not partner:

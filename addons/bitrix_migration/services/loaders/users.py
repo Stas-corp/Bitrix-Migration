@@ -70,6 +70,26 @@ class UserLoader(BaseLoader):
                     if partner:
                         partner_id = partner.id
 
+                # 4. Name-based fallback via hr.employee
+                if not partner_id:
+                    first = (bu.get('NAME') or '').strip()
+                    last = (bu.get('LAST_NAME') or '').strip()
+                    if first or last:
+                        for full_name in filter(None, [
+                            f'{first} {last}'.strip(),
+                            f'{last} {first}'.strip(),
+                        ]):
+                            emp = self.env['hr.employee'].sudo().search(
+                                [('name', '=ilike', full_name)], limit=1,
+                            )
+                            if emp and emp.work_contact_id:
+                                partner_id = emp.work_contact_id.id
+                                self.log(
+                                    f'[user] Name fallback: bitrix_id={bitrix_id} '
+                                    f'"{full_name}" ({email}) → partner_id={partner_id}'
+                                )
+                                break
+
                 if partner_id:
                     if not self.dry_run:
                         mapping.set_mapping(bitrix_id, 'user', 'res.partner', partner_id)

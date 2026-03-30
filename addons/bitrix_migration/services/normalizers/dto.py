@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Optional
 
-from pydantic import BaseModel, field_validator
+from pydantic import AliasChoices, BaseModel, Field, field_validator
 
 
 def _clean_str(v):
@@ -131,7 +131,7 @@ class BitrixTask(BaseModel):
 
 
 class BitrixStage(BaseModel):
-    id: int
+    id: int = Field(validation_alias=AliasChoices('id', 'ID'))
     name: str
     entity_type: str = 'G'
     entity_id: int = 0
