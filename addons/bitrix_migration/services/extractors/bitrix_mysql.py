@@ -72,7 +72,7 @@ class BitrixMySQLExtractor:
 
     # ── Tags ──────────────────────────────────────────────────────────
     SQL_TAGS = """
-        SELECT ID AS id, NAME AS name, 'task' AS source
+        SELECT ID, NAME AS name, 'task' AS source
         FROM (
             SELECT MIN(ID) AS ID, NAME
             FROM b_tasks_label
@@ -83,18 +83,16 @@ class BitrixMySQLExtractor:
         UNION ALL
 
         SELECT
-            900000 + (@row := @row + 1) AS id,
+            900000 + ROW_NUMBER() OVER (ORDER BY NAME) AS ID,
             NAME AS name,
             'project' AS source
         FROM (
-            SELECT DISTINCT gt.NAME
+            SELECT DISTINCT NAME
             FROM b_sonet_group_tag gt
             JOIN b_sonet_group g ON g.ID = gt.GROUP_ID
             WHERE g.PROJECT = 'Y'
-              AND gt.NAME NOT IN (SELECT NAME FROM b_tasks_label)
-              AND gt.NAME IS NOT NULL AND gt.NAME != ''
-            ORDER BY gt.NAME
-        ) pt, (SELECT @row := 0) r
+              AND NAME NOT IN (SELECT NAME FROM b_tasks_label)
+        ) pt
 
         ORDER BY name
     """
