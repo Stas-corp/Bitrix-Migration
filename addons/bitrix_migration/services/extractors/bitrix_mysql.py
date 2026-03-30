@@ -277,6 +277,44 @@ class BitrixMySQLExtractor:
         ORDER BY ce.DATE_FROM
     """
 
+    # ── Departments ───────────────────────────────────────────────────
+    SQL_DEPARTMENTS = """
+        SELECT
+            s.ID                    AS dept_id,
+            s.NAME                  AS dept_name,
+            s.IBLOCK_SECTION_ID     AS parent_dept_id,
+            us.UF_HEAD              AS head_user_id,
+            s.DEPTH_LEVEL
+        FROM b_iblock_section s
+        LEFT JOIN b_uts_iblock_1_section us ON us.VALUE_ID = s.ID
+        WHERE s.IBLOCK_ID = 1
+        ORDER BY s.DEPTH_LEVEL, s.LEFT_MARGIN
+    """
+
+    # ── Employees with departments ────────────────────────────────────
+    SQL_EMPLOYEES = """
+        SELECT
+            u.ID                                    AS user_id,
+            u.LOGIN,
+            CONCAT(u.NAME, ' ', u.LAST_NAME)        AS full_name,
+            u.EMAIL,
+            u.ACTIVE,
+            uu.UF_DEPARTMENT                        AS raw_dept
+        FROM b_user u
+        JOIN b_uts_user uu ON uu.VALUE_ID = u.ID
+        WHERE u.ACTIVE = 'Y'
+          AND uu.UF_DEPARTMENT IS NOT NULL
+          AND uu.UF_DEPARTMENT != ''
+        ORDER BY u.ID
+    """
+
+    SQL_COUNT_DEPARTMENTS = "SELECT COUNT(*) AS cnt FROM b_iblock_section WHERE IBLOCK_ID = 1"
+    SQL_COUNT_EMPLOYEES = """
+        SELECT COUNT(*) AS cnt FROM b_user u
+        JOIN b_uts_user uu ON uu.VALUE_ID = u.ID
+        WHERE u.ACTIVE = 'Y' AND uu.UF_DEPARTMENT IS NOT NULL AND uu.UF_DEPARTMENT != ''
+    """
+
     # ── Count queries ─────────────────────────────────────────────────
     SQL_COUNT_PROJECTS = "SELECT COUNT(*) AS cnt FROM b_sonet_group"
     SQL_COUNT_TASKS = "SELECT COUNT(*) AS cnt FROM b_tasks WHERE (ZOMBIE = 'N' OR ZOMBIE IS NULL)"
@@ -375,6 +413,12 @@ class BitrixMySQLExtractor:
     def get_meetings(self):
         return self._execute(self.SQL_MEETINGS)
 
+    def get_departments(self):
+        return self._execute(self.SQL_DEPARTMENTS)
+
+    def get_employees(self):
+        return self._execute(self.SQL_EMPLOYEES)
+
     # ── Count methods ─────────────────────────────────────────────────
 
     def count_projects(self):
@@ -394,3 +438,9 @@ class BitrixMySQLExtractor:
 
     def count_meetings(self):
         return self._count(self.SQL_COUNT_MEETINGS)
+
+    def count_departments(self):
+        return self._count(self.SQL_COUNT_DEPARTMENTS)
+
+    def count_employees(self):
+        return self._count(self.SQL_COUNT_EMPLOYEES)

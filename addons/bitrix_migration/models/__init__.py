@@ -5,3 +5,5 @@ from . import project_task
 from . import project_task_type
 from . import calendar_event
 from . import mail_message
+from . import hr_department
+from . import hr_employee
