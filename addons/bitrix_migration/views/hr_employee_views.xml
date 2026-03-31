@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <record id="view_employee_form_bitrix_inherit" model="ir.ui.view">
+        <field name="name">hr.employee.form.bitrix.inherit</field>
+        <field name="model">hr.employee</field>
+        <field name="inherit_id" ref="hr.view_employee_form"/>
+        <field name="arch" type="xml">
+            <xpath expr="//field[@name='work_email']/.." position="after">
+                <h5 class="d-flex align-items-baseline mb-0">
+                    <i class="fa fa-paper-plane fa-fw me-1 text-primary" title="Telegram"/>
+                    <span class="me-2 text-muted">Telegram</span>
+                    <field name="x_bitrix_telegram" placeholder="@username or https://t.me/..." class="w-100 w-sm-75"/>
+                </h5>
+            </xpath>
+        </field>
+    </record>
+</odoo>

@@ -15,3 +15,9 @@ class MailMessage(models.Model):
         copy=False,
         help='Original Bitrix author ID, stored when fallback system author was used.',
     )
+    x_bitrix_author_employee_id = fields.Many2one(
+        'hr.employee',
+        string='Bitrix Author Employee',
+        copy=False,
+        help='Employee matched to the Bitrix author, even when the message uses a fallback partner.',
+    )

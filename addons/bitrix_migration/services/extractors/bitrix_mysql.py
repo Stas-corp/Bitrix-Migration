@@ -1,4 +1,6 @@
 import logging
+import re
+from datetime import date, datetime
 
 import pymysql
 from pymysql.cursors import DictCursor
@@ -10,7 +12,7 @@ class BitrixMySQLExtractor:
     """MySQL connector for extracting data from Bitrix24 database."""
 
     # ── Projects ──────────────────────────────────────────────────────
-    SQL_PROJECTS = """
+    SQL_PROJECTS_TEMPLATE = """
         SELECT
             g.ID AS external_id,
             g.NAME AS name,
@@ -25,11 +27,12 @@ class BitrixMySQLExtractor:
             g.DESCRIPTION AS description
         FROM b_sonet_group g
         LEFT JOIN b_user u ON u.ID = g.OWNER_ID
+        WHERE {project_where_clause}
         ORDER BY g.ID
     """
 
     # ── Tasks ─────────────────────────────────────────────────────────
-    SQL_TASKS = """
+    SQL_TASKS_TEMPLATE = """
         SELECT
             t.ID AS external_id,
             t.TITLE AS name,
@@ -40,17 +43,32 @@ class BitrixMySQLExtractor:
              JOIN b_tasks_label tl ON tl.ID = tt.TAG_ID
              WHERE tt.TASK_ID = t.ID) AS tags,
             t.DEADLINE AS date_deadline,
+            {task_created_expr},
             t.DESCRIPTION AS description,
             t.STAGE_ID AS stage_id,
             CASE WHEN t.PARENT_ID > 0 THEN t.PARENT_ID ELSE NULL END AS parent_id
         FROM b_tasks t
         LEFT JOIN b_tasks_member m ON m.TASK_ID = t.ID AND m.TYPE IN ('R','A')
         WHERE (t.ZOMBIE = 'N' OR t.ZOMBIE IS NULL)
+          AND {task_where_clause}
         GROUP BY t.ID
         ORDER BY t.ID
     """
 
-    SQL_SINGLE_TASK = """
+    SQL_COUNT_PROJECTS_TEMPLATE = """
+        SELECT COUNT(*) AS cnt
+        FROM b_sonet_group g
+        WHERE {project_where_clause}
+    """
+
+    SQL_COUNT_TASKS_TEMPLATE = """
+        SELECT COUNT(*) AS cnt
+        FROM b_tasks t
+        WHERE (t.ZOMBIE = 'N' OR t.ZOMBIE IS NULL)
+          AND {task_where_clause}
+    """
+
+    SQL_SINGLE_TASK_TEMPLATE = """
         SELECT
             t.ID AS external_id,
             t.TITLE AS name,
@@ -61,6 +79,7 @@ class BitrixMySQLExtractor:
              JOIN b_tasks_label tl ON tl.ID = tt.TAG_ID
              WHERE tt.TASK_ID = t.ID) AS tags,
             t.DEADLINE AS date_deadline,
+            {task_created_expr},
             t.DESCRIPTION AS description,
             t.STAGE_ID AS stage_id,
             CASE WHEN t.PARENT_ID > 0 THEN t.PARENT_ID ELSE NULL END AS parent_id
@@ -72,35 +91,47 @@ class BitrixMySQLExtractor:
 
     # ── Tags ──────────────────────────────────────────────────────────
     SQL_TAGS = """
-        SELECT ID, NAME AS name, 'task' AS source
+        SELECT merged.ID AS id, merged.name, merged.source
         FROM (
-            SELECT MIN(ID) AS ID, NAME
-            FROM b_tasks_label
-            WHERE NAME IS NOT NULL AND NAME != ''
-            GROUP BY NAME
-        ) tl
+            SELECT
+                MIN(tl.ID) AS ID,
+                tl.NAME AS name,
+                'task' AS source
+            FROM b_tasks_label tl
+            WHERE tl.NAME IS NOT NULL
+              AND tl.NAME != ''
+            GROUP BY tl.NAME
 
-        UNION ALL
+            UNION ALL
 
-        SELECT
-            900000 + ROW_NUMBER() OVER (ORDER BY NAME) AS ID,
-            NAME AS name,
-            'project' AS source
-        FROM (
-            SELECT DISTINCT NAME
-            FROM b_sonet_group_tag gt
-            JOIN b_sonet_group g ON g.ID = gt.GROUP_ID
-            WHERE g.PROJECT = 'Y'
-              AND NAME NOT IN (SELECT NAME FROM b_tasks_label)
-        ) pt
-
-        ORDER BY name
+            SELECT
+                900000 + (@project_tag_rownum := @project_tag_rownum + 1) AS ID,
+                pt.NAME AS name,
+                'project' AS source
+            FROM (
+                SELECT DISTINCT gt.NAME
+                FROM b_sonet_group_tag gt
+                JOIN b_sonet_group g ON g.ID = gt.GROUP_ID
+                WHERE g.PROJECT = 'Y'
+                  AND gt.NAME IS NOT NULL
+                  AND gt.NAME != ''
+                  AND gt.NAME NOT IN (
+                      SELECT tl2.NAME
+                      FROM b_tasks_label tl2
+                      WHERE tl2.NAME IS NOT NULL
+                        AND tl2.NAME != ''
+                  )
+                ORDER BY gt.NAME
+            ) pt
+            CROSS JOIN (SELECT @project_tag_rownum := 0) vars
+        ) merged
+        ORDER BY merged.name
     """
 
     # ── Stages ────────────────────────────────────────────────────────
     SQL_STAGES = """
         SELECT
-            s.ID,
+            s.ID AS id,
             s.TITLE AS name,
             s.ENTITY_TYPE AS entity_type,
             s.ENTITY_ID AS entity_id
@@ -126,7 +157,7 @@ class BitrixMySQLExtractor:
     """
 
     # ── Comments (real only) ──────────────────────────────────────────
-    SQL_COMMENTS = """
+    SQL_COMMENTS_TEMPLATE = """
         SELECT
             'project.task' AS document_model,
             t.ID AS entity_id,
@@ -141,6 +172,7 @@ class BitrixMySQLExtractor:
           AND fm.SERVICE_TYPE IS NULL
           AND fm.NEW_TOPIC = 'N'
           AND (t.ZOMBIE = 'N' OR t.ZOMBIE IS NULL)
+          AND {task_where_clause}
         ORDER BY fm.POST_DATE
     """
 
@@ -183,7 +215,7 @@ class BitrixMySQLExtractor:
     """
 
     # ── Task Attachments ──────────────────────────────────────────────
-    SQL_TASK_ATTACHMENTS = """
+    SQL_TASK_ATTACHMENTS_TEMPLATE = """
         SELECT
             ao.ENTITY_ID AS task_external_id,
             do.NAME AS file_name,
@@ -215,7 +247,7 @@ class BitrixMySQLExtractor:
     """
 
     # ── Comment Attachments ───────────────────────────────────────────
-    SQL_COMMENT_ATTACHMENTS = """
+    SQL_COMMENT_ATTACHMENTS_TEMPLATE = """
         SELECT
             t.ID AS task_external_id,
             ao.ENTITY_ID AS forum_message_id,
@@ -293,17 +325,37 @@ class BitrixMySQLExtractor:
     SQL_EMPLOYEES = """
         SELECT
             u.ID                                    AS user_id,
-            u.LOGIN,
+            u.LOGIN                                 AS login,
             CONCAT(u.NAME, ' ', u.LAST_NAME)        AS full_name,
-            u.EMAIL,
-            u.ACTIVE,
-            uu.UF_DEPARTMENT                        AS raw_dept
+            u.EMAIL                                 AS email,
+            u.ACTIVE                                AS active,
+            uu.UF_DEPARTMENT                        AS raw_dept,
+            u.WORK_PHONE                            AS work_phone,
+            u.PERSONAL_MOBILE                       AS mobile_phone,
+            u.PERSONAL_PHONE                        AS personal_phone
         FROM b_user u
         JOIN b_uts_user uu ON uu.VALUE_ID = u.ID
         WHERE u.ACTIVE = 'Y'
           AND uu.UF_DEPARTMENT IS NOT NULL
           AND uu.UF_DEPARTMENT != ''
         ORDER BY u.ID
+    """
+
+    # Telegram хранится в отдельной таблице мессенджеров Битрикс24
+    SQL_EMPLOYEE_TELEGRAMS = """
+        SELECT USER_ID AS user_id, VALUE AS telegram
+        FROM b_user_field_imtype
+        WHERE TYPE = 'TELEGRAM'
+          AND VALUE IS NOT NULL
+          AND VALUE != ''
+    """
+
+    SQL_USER_TELEGRAM_FIELDS = """
+        SELECT DISTINCT uf.FIELD_NAME AS field_name
+        FROM b_user_field uf
+        LEFT JOIN b_user_field_lang ul ON ul.USER_FIELD_ID = uf.ID
+        WHERE uf.ENTITY_ID = 'USER'
+          AND LOWER(COALESCE(ul.EDIT_FORM_LABEL, '')) = 'telegram'
     """
 
     SQL_COUNT_DEPARTMENTS = "SELECT COUNT(*) AS cnt FROM b_iblock_section WHERE IBLOCK_ID = 1"
@@ -314,25 +366,45 @@ class BitrixMySQLExtractor:
     """
 
     # ── Count queries ─────────────────────────────────────────────────
-    SQL_COUNT_PROJECTS = "SELECT COUNT(*) AS cnt FROM b_sonet_group"
-    SQL_COUNT_TASKS = "SELECT COUNT(*) AS cnt FROM b_tasks WHERE (ZOMBIE = 'N' OR ZOMBIE IS NULL)"
-    SQL_COUNT_COMMENTS = """
+    SQL_COUNT_COMMENTS_TEMPLATE = """
         SELECT COUNT(*) AS cnt FROM b_forum_message fm
         STRAIGHT_JOIN b_tasks t ON t.FORUM_TOPIC_ID = fm.TOPIC_ID
         WHERE fm.FORUM_ID = 11 AND fm.SERVICE_TYPE IS NULL AND fm.NEW_TOPIC = 'N'
           AND (t.ZOMBIE = 'N' OR t.ZOMBIE IS NULL)
+          AND {task_where_clause}
     """
-    SQL_COUNT_TAGS = "SELECT COUNT(DISTINCT NAME) AS cnt FROM b_tasks_label WHERE NAME IS NOT NULL AND NAME != ''"
+    SQL_COUNT_TAGS = """
+        SELECT COUNT(*) AS cnt
+        FROM (
+            SELECT DISTINCT tl.NAME AS name
+            FROM b_tasks_label tl
+            WHERE tl.NAME IS NOT NULL
+              AND tl.NAME != ''
+
+            UNION
+
+            SELECT DISTINCT gt.NAME AS name
+            FROM b_sonet_group_tag gt
+            JOIN b_sonet_group g ON g.ID = gt.GROUP_ID
+            WHERE g.PROJECT = 'Y'
+              AND gt.NAME IS NOT NULL
+              AND gt.NAME != ''
+        ) tags
+    """
     SQL_COUNT_STAGES = "SELECT COUNT(*) AS cnt FROM b_tasks_stages WHERE ENTITY_TYPE = 'G' AND TITLE IS NOT NULL AND TITLE != ''"
     SQL_COUNT_MEETINGS = "SELECT COUNT(*) AS cnt FROM b_calendar_event WHERE IS_MEETING = '1' AND DELETED = 'N' AND ID = PARENT_ID"
 
-    def __init__(self, host, port, user, password, database):
+    def __init__(self, host, port, user, password, database, date_from=None):
         self.host = host
         self.port = port
         self.user = user
         self.password = password
         self.database = database
+        self.date_from = self._normalize_date_from(date_from)
         self._conn = None
+        self._task_created_expr = None
+        self._task_filter_column = None
+        self._project_filter_column = None
 
     def _get_connection(self):
         if self._conn is None or not self._conn.open:
@@ -359,21 +431,105 @@ class BitrixMySQLExtractor:
         result = self._execute(sql)
         return result[0]['cnt'] if result else 0
 
+    @staticmethod
+    def _normalize_date_from(value):
+        if not value:
+            return None
+        if isinstance(value, datetime):
+            return value.strftime('%Y-%m-%d 00:00:00')
+        if isinstance(value, date):
+            return value.strftime('%Y-%m-%d 00:00:00')
+        value = str(value).strip()
+        if not value:
+            return None
+        return f'{value} 00:00:00' if len(value) == 10 else value
+
     def close(self):
         if self._conn and self._conn.open:
             self._conn.close()
             self._conn = None
 
+    def _get_existing_mysql_column(self, table_name, candidates):
+        placeholders = ', '.join(['%s'] * len(candidates))
+        sql = f"""
+            SELECT COLUMN_NAME AS column_name
+            FROM information_schema.columns
+            WHERE table_schema = %s
+              AND table_name = %s
+              AND column_name IN ({placeholders})
+        """
+        rows = self._execute(sql, (self.database, table_name, *candidates))
+        found = {row['column_name'] for row in rows}
+        for candidate in candidates:
+            if candidate in found:
+                return candidate
+        return None
+
+    def _get_task_created_expr(self):
+        if self._task_created_expr is None:
+            column_name = self._get_existing_mysql_column(
+                'b_tasks',
+                ['CREATED_DATE', 'DATE_START', 'CREATED_AT', 'DATE_CREATE'],
+            )
+            self._task_created_expr = (
+                f't.{column_name} AS date_created' if column_name else 'NULL AS date_created'
+            )
+        return self._task_created_expr
+
+    def _get_task_filter_column(self):
+        if self._task_filter_column is None:
+            self._task_filter_column = self._get_existing_mysql_column(
+                'b_tasks',
+                ['CREATED_DATE', 'DATE_START', 'CREATED_AT', 'DATE_CREATE'],
+            )
+        return self._task_filter_column
+
+    def _get_project_filter_column(self):
+        if self._project_filter_column is None:
+            self._project_filter_column = self._get_existing_mysql_column(
+                'b_sonet_group',
+                ['DATE_CREATE', 'PROJECT_DATE_START', 'DATE_ACTIVITY'],
+            )
+        return self._project_filter_column
+
+    def _get_task_where_clause(self):
+        column_name = self._get_task_filter_column()
+        if self.date_from and column_name:
+            return f't.{column_name} >= %s'
+        return '1=1'
+
+    def _get_task_params(self):
+        return (self.date_from,) if self.date_from and self._get_task_filter_column() else None
+
+    def _get_project_where_clause(self):
+        column_name = self._get_project_filter_column()
+        if self.date_from and column_name:
+            return f'g.{column_name} >= %s'
+        return '1=1'
+
+    def _get_project_params(self):
+        return (self.date_from,) if self.date_from and self._get_project_filter_column() else None
+
     # ── Extract methods ───────────────────────────────────────────────
 
     def get_projects(self):
-        return self._execute(self.SQL_PROJECTS)
+        sql = self.SQL_PROJECTS_TEMPLATE.format(
+            project_where_clause=self._get_project_where_clause(),
+        )
+        return self._execute(sql, self._get_project_params())
 
     def get_tasks(self):
-        return self._execute(self.SQL_TASKS)
+        sql = self.SQL_TASKS_TEMPLATE.format(
+            task_created_expr=self._get_task_created_expr(),
+            task_where_clause=self._get_task_where_clause(),
+        )
+        return self._execute(sql, self._get_task_params())
 
     def get_single_task(self, task_id):
-        return self._execute(self.SQL_SINGLE_TASK, (task_id,))
+        sql = self.SQL_SINGLE_TASK_TEMPLATE.format(
+            task_created_expr=self._get_task_created_expr(),
+        )
+        return self._execute(sql, (task_id,))
 
     def get_tags(self):
         return self._execute(self.SQL_TAGS)
@@ -385,7 +541,10 @@ class BitrixMySQLExtractor:
         return self._execute(self.SQL_STAGES_WITH_PROJECTS)
 
     def get_comments(self):
-        return self._execute(self.SQL_COMMENTS)
+        sql = self.SQL_COMMENTS_TEMPLATE.format(
+            task_where_clause=self._get_task_where_clause(),
+        )
+        return self._execute(sql, self._get_task_params())
 
     def get_comments_for_task(self, task_id):
         return self._execute(self.SQL_COMMENTS_FOR_TASK, (task_id,))
@@ -397,13 +556,19 @@ class BitrixMySQLExtractor:
         return self._execute(self.SQL_TASK_MEMBERS)
 
     def get_task_attachments(self):
-        return self._execute(self.SQL_TASK_ATTACHMENTS)
+        sql = self.SQL_TASK_ATTACHMENTS_TEMPLATE.format(
+            task_where_clause=self._get_task_where_clause(),
+        )
+        return self._execute(sql, self._get_task_params())
 
     def get_task_attachments_for_task(self, task_id):
         return self._execute(self.SQL_TASK_ATTACHMENTS_FOR_TASK, (task_id,))
 
     def get_comment_attachments(self):
-        return self._execute(self.SQL_COMMENT_ATTACHMENTS)
+        sql = self.SQL_COMMENT_ATTACHMENTS_TEMPLATE.format(
+            task_where_clause=self._get_task_where_clause(),
+        )
+        return self._execute(sql, self._get_task_params())
 
     def get_comment_attachments_for_task(self, task_id):
         return self._execute(self.SQL_COMMENT_ATTACHMENTS_FOR_TASK, (task_id,))
@@ -417,16 +582,124 @@ class BitrixMySQLExtractor:
     def get_employees(self):
         return self._execute(self.SQL_EMPLOYEES)
 
+    def get_employee_telegrams(self):
+        """Returns {user_id: telegram} dict.
+        Supports both legacy messenger table and custom USER fields named Telegram.
+        """
+        try:
+            rows = self._execute(self.SQL_EMPLOYEE_TELEGRAMS)
+            telegrams = {
+                str(row['user_id']): row['telegram']
+                for row in rows if row.get('telegram')
+            }
+            if telegrams:
+                return telegrams
+        except Exception as e:
+            _logger.warning('Could not fetch Telegram accounts (table may not exist): %s', e)
+
+        return self._get_employee_telegrams_from_user_fields()
+
+    def _get_employee_telegrams_from_user_fields(self):
+        field_names = self._get_user_telegram_field_names()
+        if not field_names:
+            return {}
+
+        select_expr = ', '.join(
+            f'uu.{field_name} AS {field_name.lower()}'
+            for field_name in field_names
+        )
+        sql = f"""
+            SELECT
+                u.ID AS user_id,
+                {select_expr}
+            FROM b_user u
+            JOIN b_uts_user uu ON uu.VALUE_ID = u.ID
+            WHERE u.ACTIVE = 'Y'
+        """
+        rows = self._execute(sql)
+        result = {}
+        for row in rows:
+            telegram = self._pick_telegram_value(
+                row.get(field_name.lower()) for field_name in field_names
+            )
+            if telegram:
+                result[str(row['user_id'])] = telegram
+        return result
+
+    def _get_user_telegram_field_names(self):
+        try:
+            rows = self._execute(self.SQL_USER_TELEGRAM_FIELDS)
+        except Exception as e:
+            _logger.warning('Could not discover Telegram user fields: %s', e)
+            return []
+
+        field_names = []
+        for row in rows:
+            field_name = row.get('field_name')
+            if field_name and re.match(r'^UF_[A-Z0-9_]+$', field_name):
+                field_names.append(field_name)
+        return field_names
+
+    def _pick_telegram_value(self, raw_values):
+        candidates = []
+        for raw_value in raw_values:
+            for value in self._expand_telegram_values(raw_value):
+                if value:
+                    candidates.append(value)
+
+        if not candidates:
+            return None
+
+        def score(value):
+            lower = value.lower()
+            if lower.startswith('@') or 't.me/' in lower or 'telegram.me/' in lower:
+                return 0
+            if any(char.isalpha() for char in value):
+                return 1
+            return 2
+
+        return sorted(candidates, key=score)[0]
+
+    @staticmethod
+    def _expand_telegram_values(raw_value):
+        if raw_value is None:
+            return []
+
+        if not isinstance(raw_value, str):
+            raw_value = str(raw_value)
+
+        raw_value = raw_value.strip()
+        if not raw_value or raw_value == 'a:0:{}':
+            return []
+
+        if raw_value.startswith('a:'):
+            values = [item.strip() for item in re.findall(r's:\d+:"([^"]*)";', raw_value)]
+            return [item for item in values if item]
+
+        return [raw_value]
+
     # ── Count methods ─────────────────────────────────────────────────
 
     def count_projects(self):
-        return self._count(self.SQL_COUNT_PROJECTS)
+        sql = self.SQL_COUNT_PROJECTS_TEMPLATE.format(
+            project_where_clause=self._get_project_where_clause(),
+        )
+        result = self._execute(sql, self._get_project_params())
+        return result[0]['cnt'] if result else 0
 
     def count_tasks(self):
-        return self._count(self.SQL_COUNT_TASKS)
+        sql = self.SQL_COUNT_TASKS_TEMPLATE.format(
+            task_where_clause=self._get_task_where_clause(),
+        )
+        result = self._execute(sql, self._get_task_params())
+        return result[0]['cnt'] if result else 0
 
     def count_comments(self):
-        return self._count(self.SQL_COUNT_COMMENTS)
+        sql = self.SQL_COUNT_COMMENTS_TEMPLATE.format(
+            task_where_clause=self._get_task_where_clause(),
+        )
+        result = self._execute(sql, self._get_task_params())
+        return result[0]['cnt'] if result else 0
 
     def count_tags(self):
         return self._count(self.SQL_COUNT_TAGS)

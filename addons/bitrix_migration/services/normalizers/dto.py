@@ -106,6 +106,7 @@ class BitrixTask(BaseModel):
     responsible_user_ids: Optional[str] = None
     tags: Optional[str] = None
     date_deadline: Optional[datetime] = None
+    date_created: Optional[datetime] = None
     description: Optional[str] = None
     stage_id: Optional[int] = None
     parent_id: Optional[int] = None
@@ -125,7 +126,7 @@ class BitrixTask(BaseModel):
     def clean_str(cls, v):
         return _clean_str(v)
 
-    @field_validator('date_deadline', mode='before')
+    @field_validator('date_deadline', 'date_created', mode='before')
     @classmethod
     def clean_date(cls, v):
         return _to_datetime(v)
@@ -224,7 +225,11 @@ class BitrixEmployee(BaseModel):
     login: str = ''
     full_name: str
     email: Optional[str] = None
-    dept_ids: list = []
+    dept_ids: list = Field(default_factory=list)
+    work_phone: Optional[str] = None
+    mobile_phone: Optional[str] = None
+    personal_phone: Optional[str] = None
+    telegram: Optional[str] = None  # заполняется отдельно в загрузчике
 
     @model_validator(mode='before')
     @classmethod
@@ -238,9 +243,10 @@ class BitrixEmployee(BaseModel):
     def clean_name(cls, v):
         return _clean_str(v) or 'Unknown Employee'
 
-    @field_validator('email', mode='before')
+    @field_validator('email', 'work_phone', 'mobile_phone', 'personal_phone', 'telegram',
+                     mode='before')
     @classmethod
-    def clean_email(cls, v):
+    def clean_contact(cls, v):
         return _clean_str(v)
 
     @field_validator('login', mode='before')

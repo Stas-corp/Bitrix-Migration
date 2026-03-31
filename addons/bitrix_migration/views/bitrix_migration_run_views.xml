@@ -15,8 +15,24 @@
                     <button name="action_reset" string="Reset"
                             type="object" class="btn-secondary"
                             invisible="state == 'draft'"/>
+                    <button name="action_purge_data" string="Purge Imported Data"
+                            type="object" class="btn-danger"
+                            invisible="state == 'running'"
+                            confirm="This will delete imported Bitrix tasks, projects, stages, comments, meetings, attachments, tags, mappings and checkpoints. HR records are kept intact. Continue?"/>
+                    <button name="action_create_employee_users" string="Create Employee Users"
+                            type="object" class="btn-secondary"
+                            invisible="state == 'running'"
+                            confirm="Create Odoo users for imported Bitrix employees with the lowest internal access level?"/>
+                    <button name="action_create_test_employee_user" string="Create Test Employee User"
+                            type="object" class="btn-secondary"
+                            invisible="state == 'running' or not test_employee_id"
+                            confirm="Create or link an Odoo user for the selected test employee?"/>
+                    <button name="action_send_password_reset" string="Send Password Reset"
+                            type="object" class="btn-secondary"
+                            invisible="state == 'running'"
+                            confirm="Send password reset emails to employee users linked to imported Bitrix employees?"/>
                     <field name="state" widget="statusbar"
-                           statusbar_visible="draft,running,done"/>
+                           statusbar_visible="draft,running,done,error"/>
                 </header>
                 <sheet>
                     <group>
@@ -41,6 +57,11 @@
                         <group string="Options">
                             <field name="preserve_authorship"/>
                             <field name="fallback_system_author"/>
+                            <field name="migration_date_from"
+                                   invisible="mode in ('relink', 'comments', 'single_task', 'hr', 'departments_only', 'employees_only')"/>
+                            <field name="test_employee_id"
+                                   options="{'no_create': True, 'no_open': True}"
+                                   placeholder="Select imported employee for test user creation"/>
                             <field name="progress" widget="progressbar"/>
                         </group>
                     </group>

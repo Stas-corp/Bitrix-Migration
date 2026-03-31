@@ -21,8 +21,10 @@ class StageLoader(BaseLoader):
 
         processed = 0
         for batch in self._batched(raw, self.batch_size):
+            last_stage_id = None
             for row in batch:
                 stage = BitrixStage(**row)
+                last_stage_id = stage.id
 
                 vals = {
                     'name': stage.name,
@@ -49,6 +51,6 @@ class StageLoader(BaseLoader):
 
                 processed += 1
 
-            self.commit_checkpoint(processed, last_bitrix_id=row.get('ID'))
+            self.commit_checkpoint(processed, last_bitrix_id=last_stage_id)
 
         self.log_stats()

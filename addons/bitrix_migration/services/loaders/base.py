@@ -27,15 +27,49 @@ class BaseLoader:
         self.skipped_count = 0
         self.error_count = 0
         self.errors = []
+        self._schema_cache = {}
+        self._logged_once_messages = set()
 
     def log(self, message):
         _logger.info('[%s] %s', self.entity_type, message)
         if self.log_callback:
             self.log_callback(f'[{self.entity_type}] {message}')
 
+    def log_once(self, key, message):
+        """Log a message only once per loader instance."""
+        if key in self._logged_once_messages:
+            return
+        self._logged_once_messages.add(key)
+        self.log(message)
+
     def get_mapping(self):
         """Return the mapping model."""
         return self.env['bitrix.migration.mapping'].sudo()
+
+    def db_table_exists(self, table_name):
+        """Check whether a PostgreSQL table exists in the current schema."""
+        cache_key = ('table', table_name)
+        if cache_key not in self._schema_cache:
+            self.env.cr.execute("SELECT to_regclass(%s)", (table_name,))
+            self._schema_cache[cache_key] = bool(self.env.cr.fetchone()[0])
+        return self._schema_cache[cache_key]
+
+    def db_column_exists(self, table_name, column_name):
+        """Check whether a PostgreSQL column exists."""
+        cache_key = ('column', table_name, column_name)
+        if cache_key not in self._schema_cache:
+            self.env.cr.execute(
+                """
+                SELECT 1
+                FROM information_schema.columns
+                WHERE table_name = %s
+                  AND column_name = %s
+                LIMIT 1
+                """,
+                (table_name, column_name),
+            )
+            self._schema_cache[cache_key] = bool(self.env.cr.fetchone())
+        return self._schema_cache[cache_key]
 
     def get_or_create(self, model_name, domain, vals, bitrix_id=None, entity_type=None):
         """Idempotent create: search first, create if not found.
@@ -114,6 +148,51 @@ class BaseLoader:
                 self.log(f'  Error bitrix_id={bid}: {err}')
             if len(self.errors) > 20:
                 self.log(f'  ... and {len(self.errors) - 20} more errors')
+
+    def find_employee_by_bitrix_id(self, bitrix_user_id, employee_map=None):
+        """Resolve hr.employee by Bitrix user id via mapping or x_bitrix_id."""
+        if not bitrix_user_id:
+            return self.env['hr.employee']
+
+        Employee = self.env['hr.employee'].sudo().with_context(active_test=False)
+        bid = str(bitrix_user_id)
+        employee_map = employee_map or {}
+
+        mapped_employee_id = employee_map.get(bid)
+        if mapped_employee_id:
+            employee = Employee.browse(mapped_employee_id).exists()
+            if employee:
+                return employee
+
+        return Employee.search([('x_bitrix_id', '=', int(bitrix_user_id))], limit=1)
+
+    def get_partner_from_employee(self, employee):
+        """Return the best available partner linked to an employee."""
+        if not employee:
+            return self.env['res.partner']
+
+        if 'work_contact_id' in employee._fields and employee.work_contact_id:
+            return employee.work_contact_id
+        if 'user_id' in employee._fields and employee.user_id and employee.user_id.partner_id:
+            return employee.user_id.partner_id
+        if 'address_home_id' in employee._fields and employee.address_home_id:
+            return employee.address_home_id
+        return self.env['res.partner']
+
+    def get_user_from_employee(self, employee):
+        """Return the linked res.users for an employee when available."""
+        if not employee:
+            return self.env['res.users']
+
+        if 'user_id' in employee._fields and employee.user_id:
+            return employee.user_id
+
+        partner = self.get_partner_from_employee(employee)
+        if partner:
+            return self.env['res.users'].sudo().search(
+                [('partner_id', '=', partner.id)], limit=1,
+            )
+        return self.env['res.users']
 
     def run(self):
         """Override in subclasses."""

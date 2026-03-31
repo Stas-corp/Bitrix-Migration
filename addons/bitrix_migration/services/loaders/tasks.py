@@ -12,6 +12,116 @@ class TaskLoader(BaseLoader):
     entity_type = 'task'
     batch_size = 1000
 
+    def _sync_project_and_stage(self, record, task, project_map, stage_map):
+        target_project_id = False
+        if task.project_external_id:
+            target_project_id = project_map.get(str(task.project_external_id)) or False
+
+        target_stage_id = False
+        if target_project_id and task.stage_id:
+            target_stage_id = stage_map.get(str(task.stage_id)) or False
+
+        vals = {}
+        current_project_id = record.project_id.id if record.project_id else False
+        current_stage_id = record.stage_id.id if record.stage_id else False
+
+        if current_project_id != target_project_id:
+            vals['project_id'] = target_project_id
+        if current_stage_id != target_stage_id:
+            vals['stage_id'] = target_stage_id
+
+        if vals:
+            record.write(vals)
+
+    def _sync_tags(self, record, task, tag_name_map):
+        if not task.tags:
+            return
+
+        tag_names = [tag.strip() for tag in task.tags.split(',') if tag.strip()]
+        target_tag_ids = [
+            tag_name_map[tag_name.lower()]
+            for tag_name in tag_names
+            if tag_name.lower() in tag_name_map
+        ]
+        if target_tag_ids and set(record.tag_ids.ids) != set(target_tag_ids):
+            record.write({'tag_ids': [(6, 0, target_tag_ids)]})
+
+    def _sync_created_at(self, record, task):
+        if not task.date_created:
+            return
+
+        if self.db_column_exists('project_task', 'x_bitrix_created_at'):
+            current_created_at = record.x_bitrix_created_at
+            if current_created_at != task.date_created:
+                record.write({'x_bitrix_created_at': task.date_created})
+        else:
+            self.log_once(
+                'missing_project_task_x_bitrix_created_at',
+                'Skipping project_task.x_bitrix_created_at storage: column is missing. '
+                'Upgrade the bitrix_migration module to persist Bitrix task creation date.',
+            )
+
+        self.env.cr.execute(
+            """
+            UPDATE project_task
+            SET create_date = %s
+            WHERE id = %s
+              AND (create_date IS NULL OR create_date != %s)
+            """,
+            (task.date_created, record.id, task.date_created),
+        )
+        record.invalidate_recordset(['create_date'])
+
+    def _sync_assignees(self, record, task, user_map, employee_map):
+        employee_ids = []
+        user_ids = []
+
+        if task.responsible_user_ids:
+            uid_strs = [uid.strip() for uid in task.responsible_user_ids.split(',') if uid.strip()]
+            for uid_str in uid_strs:
+                employee = self.find_employee_by_bitrix_id(uid_str, employee_map=employee_map)
+                if employee and employee.id not in employee_ids:
+                    employee_ids.append(employee.id)
+
+                    user = self.get_user_from_employee(employee)
+                    if user and user.id not in user_ids:
+                        user_ids.append(user.id)
+                        continue
+
+                partner_id = user_map.get(uid_str)
+                if partner_id:
+                    odoo_user = self.env['res.users'].sudo().search(
+                        [('partner_id', '=', partner_id)], limit=1,
+                    )
+                    if odoo_user and odoo_user.id not in user_ids:
+                        user_ids.append(odoo_user.id)
+
+        if 'x_bitrix_responsible_employee_ids' in record._fields and employee_ids:
+            if self.db_table_exists('project_task_bitrix_employee_rel'):
+                current_employee_ids = set(record.x_bitrix_responsible_employee_ids.ids)
+                target_employee_ids = set(employee_ids)
+                if current_employee_ids != target_employee_ids:
+                    record.write({
+                        'x_bitrix_responsible_employee_ids': [(6, 0, sorted(target_employee_ids))],
+                    })
+            else:
+                self.log_once(
+                    'missing_project_task_bitrix_employee_rel',
+                    'Skipping employee task links: relation table '
+                    '"project_task_bitrix_employee_rel" is missing. '
+                    'Upgrade the bitrix_migration module to enable employee-based history.',
+                )
+
+        task_fields = record._fields
+        if 'user_ids' in task_fields:
+            target_user_ids = sorted(set(user_ids))
+            if set(record.user_ids.ids) != set(target_user_ids):
+                record.write({'user_ids': [(6, 0, target_user_ids)]})
+        elif 'user_id' in task_fields:
+            target_user_id = user_ids[0] if user_ids else False
+            if (record.user_id.id if record.user_id else False) != target_user_id:
+                record.write({'user_id': target_user_id})
+
     def run(self, raw_tasks=None):
         """Load tasks. Optionally accepts pre-fetched raw_tasks list."""
         if raw_tasks is None:
@@ -19,39 +129,27 @@ class TaskLoader(BaseLoader):
             raw_tasks = self.extractor.get_tasks()
         self.log(f'Found {len(raw_tasks)} tasks')
 
-        # Pre-load mappings for O(1) lookups
         project_map = self.get_mapping().get_all_mappings('project')
         stage_map = self.get_mapping().get_all_mappings('stage')
         user_map = self.get_mapping().get_all_mappings('user')
+        employee_map = self.get_mapping().get_all_mappings('employee')
         tag_name_map = self._build_tag_name_map()
 
-        # Pre-fetch existing x_bitrix_id to skip already-migrated tasks
-        existing_ids = set()
-        existing_recs = self.env['project.task'].sudo().with_context(active_test=False).search_read(
-            [('x_bitrix_id', '!=', False)], ['x_bitrix_id'],
-        )
-        for r in existing_recs:
-            if r['x_bitrix_id']:
-                existing_ids.add(r['x_bitrix_id'])
-
-        # Checkpoint resume
         checkpoint = self.get_checkpoint()
         skip_until = int(checkpoint) if checkpoint else 0
 
         processed = 0
         for batch in self._batched(raw_tasks, self.batch_size):
+            last_task_id = None
+
             for row in batch:
                 task = BitrixTask(**row)
+                last_task_id = task.external_id
 
                 if task.external_id <= skip_until:
                     continue
 
                 bid = str(task.external_id)
-                if bid in existing_ids:
-                    self.skipped_count += 1
-                    processed += 1
-                    continue
-
                 vals = {
                     'name': task.name,
                     'description': task.description or '',
@@ -59,24 +157,26 @@ class TaskLoader(BaseLoader):
                     'x_bitrix_stage_id': str(task.stage_id) if task.stage_id else '',
                     'x_bitrix_parent_id': str(task.parent_id) if task.parent_id else '',
                 }
+                if 'user_ids' in self.env['project.task']._fields:
+                    vals['user_ids'] = [(6, 0, [])]
+                elif 'user_id' in self.env['project.task']._fields:
+                    vals['user_id'] = False
 
-                # Resolve project
+                odoo_proj_id = False
                 if task.project_external_id:
                     odoo_proj_id = project_map.get(str(task.project_external_id))
                     if odoo_proj_id:
                         vals['project_id'] = odoo_proj_id
 
-                # Resolve stage
-                if task.stage_id:
+                if task.stage_id and odoo_proj_id:
                     odoo_stage_id = stage_map.get(str(task.stage_id))
                     if odoo_stage_id:
                         vals['stage_id'] = odoo_stage_id
 
-                # Resolve deadline
                 if task.date_deadline:
                     vals['date_deadline'] = task.date_deadline.strftime('%Y-%m-%d')
-
-                # parent_id is intentionally NOT set here — done in tasks_relink pass 2
+                if task.date_created and self.db_column_exists('project_task', 'x_bitrix_created_at'):
+                    vals['x_bitrix_created_at'] = task.date_created
 
                 record, created = self.get_or_create(
                     'project.task',
@@ -86,42 +186,18 @@ class TaskLoader(BaseLoader):
                     entity_type='task',
                 )
 
-                if created and record and not self.dry_run:
-                    existing_ids.add(bid)
-
-                    # Resolve tags
-                    if task.tags:
-                        tag_names = [t.strip() for t in task.tags.split(',') if t.strip()]
-                        tag_ids = [tag_name_map[tn.lower()] for tn in tag_names if tn.lower() in tag_name_map]
-                        if tag_ids:
-                            record.write({'tag_ids': [(6, 0, tag_ids)]})
-
-                    # Resolve assignees
-                    if task.responsible_user_ids:
-                        uid_strs = [u.strip() for u in task.responsible_user_ids.split(',') if u.strip()]
-                        partner_ids = []
-                        for uid_str in uid_strs:
-                            pid = user_map.get(uid_str)
-                            if pid:
-                                odoo_user = self.env['res.users'].sudo().search(
-                                    [('partner_id', '=', pid)], limit=1,
-                                )
-                                if odoo_user:
-                                    partner_ids.append(odoo_user.id)
-                        if partner_ids:
-                            # Discover field name for assignees
-                            task_fields = self.env['project.task']._fields
-                            if 'user_ids' in task_fields:
-                                record.write({'user_ids': [(6, 0, partner_ids)]})
-                            elif 'user_id' in task_fields:
-                                record.write({'user_id': partner_ids[0]})
+                if record and not self.dry_run:
+                    self._sync_project_and_stage(record, task, project_map, stage_map)
+                    self._sync_created_at(record, task)
+                    self._sync_tags(record, task, tag_name_map)
+                    self._sync_assignees(record, task, user_map, employee_map)
 
                 processed += 1
 
-            self.commit_checkpoint(processed, last_bitrix_id=task.external_id)
+            self.commit_checkpoint(processed, last_bitrix_id=last_task_id)
 
         self.log_stats()
 
     def _build_tag_name_map(self):
         tags = self.env['project.tags'].sudo().search([])
-        return {t.name.lower(): t.id for t in tags if t.name}
+        return {tag.name.lower(): tag.id for tag in tags if tag.name}

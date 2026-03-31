@@ -28,7 +28,7 @@ services:
       db:
         condition: service_healthy
     ports:
-      - "8069:8069"
+      - "8079:8069"
       - "8072:8072"
     environment:
       HOST: db

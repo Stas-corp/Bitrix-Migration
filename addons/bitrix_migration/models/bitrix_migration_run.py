@@ -1,4 +1,5 @@
 import logging
+import re
 import traceback
 
 from odoo import models, fields, api
@@ -40,10 +41,16 @@ class BitrixMigrationRun(models.Model):
     # Options
     preserve_authorship = fields.Boolean(string='Preserve Authorship', default=True)
     fallback_system_author = fields.Boolean(string='Fallback System Author', default=True)
+    migration_date_from = fields.Date(string='Import From Date')
 
     # Mode-specific
     pilot_project_ids = fields.Char(string='Pilot Project IDs (comma-separated)')
     single_task_bitrix_id = fields.Char(string='Single Task Bitrix ID')
+    test_employee_id = fields.Many2one(
+        'hr.employee',
+        string='Test Employee',
+        domain=[('x_bitrix_id', '!=', 0)],
+    )
 
     # State
     log_output = fields.Text(string='Log Output', readonly=True)
@@ -56,7 +63,15 @@ class BitrixMigrationRun(models.Model):
     progress = fields.Float(string='Progress', default=0.0)
 
     def _append_log(self, message):
-        self.log_output = (self.log_output or '') + '\n' + message
+        self.ensure_one()
+        try:
+            current_log = self.sudo().read(['log_output'])[0].get('log_output') or ''
+        except Exception:
+            self.env.cr.rollback()
+            current_log = self.sudo().read(['log_output'])[0].get('log_output') or ''
+
+        new_log = f'{current_log}\n{message}' if current_log else message
+        self.sudo().write({'log_output': new_log})
         self.env.cr.commit()
 
     def _get_extractor(self):
@@ -67,6 +82,7 @@ class BitrixMigrationRun(models.Model):
             user=self.mysql_user,
             password=self.mysql_password,
             database=self.mysql_database,
+            date_from=self.migration_date_from,
         )
 
     def action_run(self):
@@ -75,7 +91,12 @@ class BitrixMigrationRun(models.Model):
         self.log_output = f'=== Migration started: mode={self.mode} ==='
         self.progress = 0.0
         self.env.cr.commit()
+        if self.migration_date_from:
+            self._append_log(
+                f'=== Active date filter: import from {self.migration_date_from} ==='
+            )
 
+        extractor = None
         try:
             extractor = self._get_extractor()
             dry_run = self.mode == 'dry_run'
@@ -101,15 +122,21 @@ class BitrixMigrationRun(models.Model):
             elif self.mode == 'employees_only':
                 self._run_employees_only(extractor)
 
-            extractor.close()
             self.state = 'done'
             self.progress = 100.0
             self._append_log('=== Migration completed successfully ===')
 
-        except Exception as e:
+        except Exception:
+            self.env.cr.rollback()
             self.state = 'error'
             self._append_log(f'=== ERROR ===\n{traceback.format_exc()}')
             _logger.exception('Migration failed')
+        finally:
+            if extractor:
+                try:
+                    extractor.close()
+                except Exception:
+                    _logger.warning('Could not close Bitrix extractor cleanly', exc_info=True)
 
         self.env.cr.commit()
 
@@ -284,7 +311,10 @@ class BitrixMigrationRun(models.Model):
         stage_id = task_row.get('stage_id')
         if stage_id:
             self._append_log(f'\n--- Stage {stage_id} ---')
-            raw_stages = [s for s in extractor.get_stages() if s['ID'] == stage_id]
+            raw_stages = [
+                s for s in extractor.get_stages()
+                if s.get('id', s.get('ID')) == stage_id
+            ]
             if raw_stages:
                 stage_loader = StageLoader(self.env, extractor, log_callback=self._append_log)
                 for row in raw_stages:
@@ -402,10 +432,12 @@ class BitrixMigrationRun(models.Model):
         from ..services.loaders.users import UserLoader
         from ..services.loaders.departments import DepartmentLoader
 
+        dry_run = self.mode == 'dry_run'
+
         self._append_log('\n--- Users (mapping) ---')
         user_loader = UserLoader(
             self.env, extractor,
-            dry_run=self.dry_run,
+            dry_run=dry_run,
             log_callback=self._append_log,
         )
         user_map = user_loader.run()
@@ -414,7 +446,7 @@ class BitrixMigrationRun(models.Model):
         dept_loader = DepartmentLoader(
             self.env, extractor,
             user_map=user_map or {},
-            dry_run=self.dry_run,
+            dry_run=dry_run,
             log_callback=self._append_log,
         )
         dept_loader.run()
@@ -424,11 +456,13 @@ class BitrixMigrationRun(models.Model):
         from ..services.loaders.users import UserLoader
         from ..services.loaders.employees import EmployeeLoader
 
+        dry_run = self.mode == 'dry_run'
+
         # Build user map (may already be populated; run is idempotent)
         self._append_log('\n--- Users (mapping) ---')
         user_loader = UserLoader(
             self.env, extractor,
-            dry_run=self.dry_run,
+            dry_run=dry_run,
             log_callback=self._append_log,
         )
         user_map = user_loader.run()
@@ -440,7 +474,7 @@ class BitrixMigrationRun(models.Model):
             self.env, extractor,
             user_map=user_map or {},
             dept_map=dept_map,
-            dry_run=self.dry_run,
+            dry_run=dry_run,
             log_callback=self._append_log,
         )
         emp_loader.run()
@@ -471,8 +505,392 @@ class BitrixMigrationRun(models.Model):
         for label, count in checks.items():
             self._append_log(f'  {label}: {count}')
 
+
+
+    def _normalize_login(self, value, fallback='bitrix_user'):
+        value = (value or '').strip().lower()
+        value = re.sub(r'[^a-z0-9@._+-]+', '_', value)
+        value = value.strip('._-')
+        return value or fallback
+
+    def _make_unique_login(self, preferred_login, fallback_login):
+        Users = self.env['res.users'].sudo().with_context(active_test=False)
+        base_login = self._normalize_login(preferred_login, fallback=fallback_login)
+        login = base_login
+        suffix = 1
+        while Users.search_count([('login', '=', login)]):
+            login = f'{base_login}_{suffix}'
+            suffix += 1
+        return login
+
+    def _find_existing_user_for_employee(self, employee):
+        Users = self.env['res.users'].sudo().with_context(active_test=False)
+
+        if employee.user_id:
+            return employee.user_id
+
+        if 'work_contact_id' in employee._fields and employee.work_contact_id:
+            user = Users.search([('partner_id', '=', employee.work_contact_id.id)], limit=1)
+            if user:
+                return user
+
+        email = (employee.work_email or '').strip().lower()
+        if email:
+            user = Users.search([('login', '=ilike', email)], limit=1)
+            if user:
+                return user
+
+        return Users
+
+
+    def action_send_password_reset(self):
+        self.ensure_one()
+        self.state = 'running'
+        self._append_log('=== Password reset mailing started ===')
+        self.progress = 0.0
+        self.env.cr.commit()
+
+        try:
+            if 'action_reset_password' not in self.env['res.users']._fields and not hasattr(type(self.env['res.users']), 'action_reset_password'):
+                raise ValueError('auth_signup reset password flow is not available in this Odoo instance')
+
+            employees = self.env['hr.employee'].sudo().with_context(active_test=False).search([
+                ('x_bitrix_id', '!=', 0),
+                ('user_id', '!=', False),
+            ])
+            users = employees.mapped('user_id').sudo().with_context(active_test=False)
+
+            self._append_log(f'Found {len(users)} employee users linked to imported employees')
+
+            missing_email_users = users.filtered(lambda u: not u.email)
+            archived_users = users.filtered(lambda u: not u.active)
+            ready_users = (users - missing_email_users - archived_users)
+
+            if missing_email_users:
+                self._append_log(
+                    f'Skipping users without email: {len(missing_email_users)}'
+                )
+            if archived_users:
+                self._append_log(
+                    f'Skipping archived users: {len(archived_users)}'
+                )
+
+            sent_count = 0
+            error_count = 0
+            batch_size = 50
+            ready_list = ready_users.ids
+
+            for start in range(0, len(ready_list), batch_size):
+                batch_ids = ready_list[start:start + batch_size]
+                batch_users = self.env['res.users'].sudo().browse(batch_ids).exists()
+                try:
+                    batch_users.action_reset_password()
+                    sent_count += len(batch_users)
+                    self._append_log(
+                        f'Sent password reset emails: {sent_count}/{len(ready_list)}'
+                    )
+                    self.env.cr.commit()
+                except Exception as e:
+                    error_count += len(batch_users)
+                    self._append_log(
+                        f'ERROR sending reset for batch starting with user_id={batch_users[:1].id if batch_users else "n/a"}: {e}'
+                    )
+
+            self.state = 'done'
+            self.progress = 100.0
+            self._append_log(
+                '=== Password reset mailing completed: '
+                f'sent={sent_count}, skipped_no_email={len(missing_email_users)}, '
+                f'skipped_archived={len(archived_users)}, errors={error_count} ==='
+            )
+
+        except Exception:
+            self.env.cr.rollback()
+            self.state = 'error'
+            self._append_log(f'=== PASSWORD RESET ERROR ===\n{traceback.format_exc()}')
+            _logger.exception('Password reset mailing failed')
+
+        self.env.cr.commit()
+
+    def _prepare_employee_user_creation(self):
+        from ..services.loaders.employees import EmployeeLoader
+
+        group_user = self.env.ref('base.group_user')
+        mapping = self.env['bitrix.migration.mapping'].sudo()
+        users_model = self.env['res.users'].sudo().with_context(
+            active_test=False,
+            no_reset_password=True,
+            mail_create_nolog=True,
+            mail_create_nosubscribe=True,
+            tracking_disable=True,
+        )
+        sync_helper = EmployeeLoader(self.env, extractor=None, log_callback=self._append_log)
+        return group_user, mapping, users_model, sync_helper
+
+    def _ensure_user_for_employee(self, employee, group_user, mapping, users_model, sync_helper):
+        existing_user = self._find_existing_user_for_employee(employee)
+
+        if existing_user:
+            if not employee.user_id or employee.user_id != existing_user:
+                employee.write({'user_id': existing_user.id})
+                status = 'linked'
+            else:
+                status = 'skipped'
+
+            mapping.set_mapping(
+                str(employee.x_bitrix_id),
+                'user',
+                'res.partner',
+                existing_user.partner_id.id,
+            )
+            sync_helper._sync_related_records(employee)
+            return status, existing_user
+
+        company_id = employee.company_id.id if 'company_id' in employee._fields and employee.company_id else self.env.company.id
+        preferred_login = (employee.work_email or '').strip().lower()
+        login = self._make_unique_login(preferred_login, f'bitrix_{employee.x_bitrix_id}')
+        user_vals = {
+            'name': employee.name,
+            'login': login,
+            'email': preferred_login or False,
+            'company_id': company_id,
+            'company_ids': [(6, 0, [company_id])],
+            'group_ids': [(6, 0, [group_user.id])],
+            'notification_type': 'inbox',
+            'active': employee.active if 'active' in employee._fields else True,
+        }
+
+        if 'work_contact_id' in employee._fields and employee.work_contact_id:
+            user_vals['partner_id'] = employee.work_contact_id.id
+
+        user = users_model.create(user_vals)
+        employee.write({'user_id': user.id})
+        mapping.set_mapping(
+            str(employee.x_bitrix_id),
+            'user',
+            'res.partner',
+            user.partner_id.id,
+        )
+        sync_helper._sync_related_records(employee)
+        return 'created', user
+
+    def action_create_test_employee_user(self):
+        self.ensure_one()
+        if not self.test_employee_id:
+            self._append_log('ERROR: select a test employee first')
+            return
+
+        employee = self.test_employee_id.sudo().with_context(active_test=False)
+        self.state = 'running'
+        self._append_log(
+            f'=== Test employee user creation started: {employee.name} (bitrix_id={employee.x_bitrix_id}) ==='
+        )
+        self.progress = 0.0
+        self.env.cr.commit()
+
+        try:
+            group_user, mapping, users_model, sync_helper = self._prepare_employee_user_creation()
+            with self.env.cr.savepoint():
+                status, user = self._ensure_user_for_employee(
+                    employee, group_user, mapping, users_model, sync_helper,
+                )
+            self.state = 'done'
+            self.progress = 100.0
+            self._append_log(
+                f'=== Test employee user creation completed: status={status}, user_id={user.id}, login={user.login} ==='
+            )
+        except Exception:
+            self.env.cr.rollback()
+            self.state = 'error'
+            self._append_log(f'=== TEST USER CREATION ERROR ===\n{traceback.format_exc()}')
+            _logger.exception('Test employee user creation failed')
+
+        self.env.cr.commit()
+
+    def action_create_employee_users(self):
+        self.ensure_one()
+        self.state = 'running'
+        self._append_log('=== Employee user creation started ===')
+        self.progress = 0.0
+        self.env.cr.commit()
+
+        try:
+            group_user, mapping, users_model, sync_helper = self._prepare_employee_user_creation()
+            Employee = self.env['hr.employee'].sudo().with_context(active_test=False)
+            employees = Employee.search([('x_bitrix_id', '!=', 0)])
+            self._append_log(f'Found {len(employees)} imported employees')
+
+            created_count = 0
+            linked_count = 0
+            skipped_count = 0
+            error_count = 0
+
+            for index, employee in enumerate(employees, start=1):
+                try:
+                    with self.env.cr.savepoint():
+                        status, _user = self._ensure_user_for_employee(
+                            employee, group_user, mapping, users_model, sync_helper,
+                        )
+                        if status == 'created':
+                            created_count += 1
+                        elif status == 'linked':
+                            linked_count += 1
+                        else:
+                            skipped_count += 1
+
+                    if index % 25 == 0:
+                        self._append_log(
+                            f'Processed {index}/{len(employees)} employees: '
+                            f'created={created_count}, linked={linked_count}, '
+                            f'skipped={skipped_count}, errors={error_count}'
+                        )
+                        self.env.cr.commit()
+
+                except Exception as e:
+                    error_count += 1
+                    self._append_log(
+                        f'ERROR employee bitrix_id={employee.x_bitrix_id} ({employee.name}): {e}'
+                    )
+
+            self.state = 'done'
+            self.progress = 100.0
+            self._append_log(
+                '=== Employee user creation completed: '
+                f'created={created_count}, linked={linked_count}, '
+                f'skipped={skipped_count}, errors={error_count} ==='
+            )
+
+        except Exception:
+            self.env.cr.rollback()
+            self.state = 'error'
+            self._append_log(f'=== USER CREATION ERROR ===\n{traceback.format_exc()}')
+            _logger.exception('Employee user creation failed')
+
+        self.env.cr.commit()
+
+    def _purge_records_by_domain(self, model_name, domain, label, batch_size=500):
+        Model = self.env[model_name].sudo().with_context(active_test=False)
+        deleted = 0
+
+        while True:
+            records = Model.search(domain, limit=batch_size)
+            if not records:
+                break
+
+            batch_count = len(records)
+            records.unlink()
+            deleted += batch_count
+            self._append_log(f'Purged {label}: {deleted}')
+            self.env.cr.commit()
+
+        return deleted
+
+    def _purge_records_by_mapping(self, entity_type, model_name, label, batch_size=500):
+        Mapping = self.env['bitrix.migration.mapping'].sudo()
+        Model = self.env[model_name].sudo().with_context(active_test=False)
+        deleted = 0
+
+        while True:
+            mappings = Mapping.search([
+                ('entity_type', '=', entity_type),
+                ('odoo_model', '=', model_name),
+            ], limit=batch_size)
+            if not mappings:
+                break
+
+            records = Model.browse(mappings.mapped('odoo_id')).exists()
+            if records:
+                batch_count = len(records)
+                records.unlink()
+                deleted += batch_count
+            else:
+                batch_count = 0
+
+            mappings.unlink()
+            if batch_count:
+                self._append_log(f'Purged {label}: {deleted}')
+            self.env.cr.commit()
+
+        return deleted
+
+    def action_purge_data(self):
+        self.ensure_one()
+        self.state = 'running'
+        self.log_output = '=== Purge started ==='
+        self.progress = 0.0
+        self.env.cr.commit()
+
+        try:
+            self._append_log('Removing imported attachments...')
+            self._purge_records_by_mapping('attachment', 'ir.attachment', 'attachments')
+
+            self._append_log('Removing imported comments...')
+            self._purge_records_by_domain(
+                'mail.message',
+                [('x_bitrix_message_id', '!=', False)],
+                'comments',
+            )
+
+            self._append_log('Removing imported meetings...')
+            self._purge_records_by_domain(
+                'calendar.event',
+                [('x_bitrix_id', '!=', False)],
+                'meetings',
+            )
+
+            self._append_log('Removing imported tasks...')
+            self._purge_records_by_domain(
+                'project.task',
+                [('x_bitrix_id', '!=', False)],
+                'tasks',
+            )
+
+            self._append_log('Removing imported stages...')
+            self._purge_records_by_domain(
+                'project.task.type',
+                [('x_bitrix_id', '!=', False)],
+                'stages',
+            )
+
+            self._append_log('Removing imported projects...')
+            self._purge_records_by_domain(
+                'project.project',
+                [('x_bitrix_id', '!=', False)],
+                'projects',
+            )
+
+            self._append_log('Removing imported tags...')
+            self._purge_records_by_mapping('tag', 'project.tags', 'tags')
+
+            self._append_log('Clearing migration mappings and checkpoints...')
+            self.env['bitrix.migration.mapping'].sudo().search([]).unlink()
+            self._clear_checkpoints()
+
+            self.state = 'draft'
+            self.progress = 0.0
+            self._append_log('=== Purge completed successfully ===')
+
+        except Exception:
+            self.env.cr.rollback()
+            self.state = 'error'
+            self._append_log(f'=== PURGE ERROR ===\n{traceback.format_exc()}')
+            _logger.exception('Migration purge failed')
+
+        self.env.cr.commit()
+
+    def _clear_checkpoints(self):
+        checkpoint_keys = [
+            'user', 'tag', 'project', 'stage', 'task', 'task_relink',
+            'comment', 'attachment', 'department', 'employee',
+        ]
+        params = self.env['ir.config_parameter'].sudo()
+        for key in checkpoint_keys:
+            params.set_param(f'bitrix_migration.checkpoint.{key}', '')
+        self.env.cr.commit()
+
     def action_reset(self):
         self.ensure_one()
+        self._clear_checkpoints()
         self.state = 'draft'
         self.log_output = ''
         self.progress = 0.0
