@@ -17,3 +17,9 @@ class ProjectTask(models.Model):
         copy=False,
         help='Employees resolved from Bitrix responsible users, preserved even before linked Odoo users exist.',
     )
+    x_bitrix_creator_employee_id = fields.Many2one(
+        'hr.employee',
+        string='Bitrix Creator (Employee)',
+        copy=False,
+        help='Employee who created this task in Bitrix (постановщик).',
+    )

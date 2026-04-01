@@ -46,7 +46,8 @@ class BitrixMySQLExtractor:
             {task_created_expr},
             t.DESCRIPTION AS description,
             t.STAGE_ID AS stage_id,
-            CASE WHEN t.PARENT_ID > 0 THEN t.PARENT_ID ELSE NULL END AS parent_id
+            CASE WHEN t.PARENT_ID > 0 THEN t.PARENT_ID ELSE NULL END AS parent_id,
+            t.CREATED_BY AS creator_bitrix_id
         FROM b_tasks t
         LEFT JOIN b_tasks_member m ON m.TASK_ID = t.ID AND m.TYPE IN ('R','A')
         WHERE (t.ZOMBIE = 'N' OR t.ZOMBIE IS NULL)
@@ -82,7 +83,8 @@ class BitrixMySQLExtractor:
             {task_created_expr},
             t.DESCRIPTION AS description,
             t.STAGE_ID AS stage_id,
-            CASE WHEN t.PARENT_ID > 0 THEN t.PARENT_ID ELSE NULL END AS parent_id
+            CASE WHEN t.PARENT_ID > 0 THEN t.PARENT_ID ELSE NULL END AS parent_id,
+            t.CREATED_BY AS creator_bitrix_id
         FROM b_tasks t
         LEFT JOIN b_tasks_member m ON m.TASK_ID = t.ID AND m.TYPE IN ('R','A')
         WHERE t.ID = %s

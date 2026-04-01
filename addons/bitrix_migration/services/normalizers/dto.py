@@ -110,13 +110,14 @@ class BitrixTask(BaseModel):
     description: Optional[str] = None
     stage_id: Optional[int] = None
     parent_id: Optional[int] = None
+    creator_bitrix_id: Optional[int] = None
 
     @field_validator('name', mode='before')
     @classmethod
     def clean_name(cls, v):
         return _clean_str(v) or 'Untitled Task'
 
-    @field_validator('project_external_id', 'stage_id', 'parent_id', mode='before')
+    @field_validator('project_external_id', 'stage_id', 'parent_id', 'creator_bitrix_id', mode='before')
     @classmethod
     def clean_int(cls, v):
         return _to_int_or_none(v)

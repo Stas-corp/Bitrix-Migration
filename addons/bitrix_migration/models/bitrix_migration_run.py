@@ -46,6 +46,12 @@ class BitrixMigrationRun(models.Model):
     # Mode-specific
     pilot_project_ids = fields.Char(string='Pilot Project IDs (comma-separated)')
     single_task_bitrix_id = fields.Char(string='Single Task Bitrix ID')
+    fallback_project_id = fields.Many2one(
+        'project.project',
+        string='Fallback Project (no-project tasks)',
+        help='Tasks without a Bitrix project will be assigned here. '
+             'Auto-created as "Bitrix: Без проекта" if left empty.',
+    )
     test_employee_id = fields.Many2one(
         'hr.employee',
         string='Test Employee',
@@ -174,6 +180,30 @@ class BitrixMigrationRun(models.Model):
             odoo_cnt = odoo_counts.get(entity, 0)
             self._append_log(f'{entity:<20} {cnt:>10} {odoo_cnt:>10} {cnt - odoo_cnt:>10}')
 
+    def _ensure_fallback_project(self):
+        """Return the fallback project id, creating it if needed."""
+        self.ensure_one()
+        if self.fallback_project_id:
+            return self.fallback_project_id.id
+
+        Project = self.env['project.project'].sudo()
+        name = 'Bitrix: Без проекта'
+        project = Project.search([('name', '=', name)], limit=1)
+        if not project:
+            project = Project.with_context(
+                mail_create_nolog=True,
+                mail_create_nosubscribe=True,
+                tracking_disable=True,
+            ).create({
+                'name': name,
+                'privacy_visibility': 'followers',
+                'active': True,
+            })
+            self._append_log(f'Auto-created fallback project: "{name}" (id={project.id})')
+        self.fallback_project_id = project
+        self.env.cr.commit()
+        return project.id
+
     def _run_full(self, extractor, dry_run=False):
         """Full migration in correct order."""
         from ..services.loaders.users import UserLoader
@@ -190,7 +220,7 @@ class BitrixMigrationRun(models.Model):
             ('Tags', TagLoader, {}),
             ('Projects', ProjectLoader, {}),
             ('Stages', StageLoader, {}),
-            ('Tasks', TaskLoader, {}),
+            ('Tasks', TaskLoader, {'fallback_project_id': self._ensure_fallback_project()}),
             ('Task Relink', TaskRelinkLoader, {}),
             ('Comments', CommentLoader, {
                 'preserve_authorship': self.preserve_authorship,
@@ -336,7 +366,11 @@ class BitrixMigrationRun(models.Model):
 
         # 6. Task itself
         self._append_log(f'\n--- Task ---')
-        task_loader = TaskLoader(self.env, extractor, log_callback=self._append_log)
+        task_loader = TaskLoader(
+            self.env, extractor,
+            log_callback=self._append_log,
+            fallback_project_id=self._ensure_fallback_project(),
+        )
         task_loader.run(raw_tasks=raw_tasks)
 
         # 7. Comments
@@ -502,10 +536,15 @@ class BitrixMigrationRun(models.Model):
             'Employees': self.env['hr.employee'].sudo().with_context(active_test=False).search_count(
                 [('x_bitrix_id', '!=', 0)]),
         }
+        if self.fallback_project_id:
+            checks['Tasks in fallback project'] = self.env['project.task'].sudo().with_context(
+                active_test=False,
+            ).search_count([
+                ('x_bitrix_id', '!=', False),
+                ('project_id', '=', self.fallback_project_id.id),
+            ])
         for label, count in checks.items():
             self._append_log(f'  {label}: {count}')
-
-
 
     def _normalize_login(self, value, fallback='bitrix_user'):
         value = (value or '').strip().lower()

@@ -12,10 +12,17 @@ class TaskLoader(BaseLoader):
     entity_type = 'task'
     batch_size = 1000
 
+    def __init__(self, env, extractor, fallback_project_id=None, **kwargs):
+        super().__init__(env, extractor, **kwargs)
+        self.fallback_project_id = fallback_project_id
+        self.fallback_count = 0
+
     def _sync_project_and_stage(self, record, task, project_map, stage_map):
         target_project_id = False
         if task.project_external_id:
             target_project_id = project_map.get(str(task.project_external_id)) or False
+        if not target_project_id and self.fallback_project_id:
+            target_project_id = self.fallback_project_id
 
         target_stage_id = False
         if target_project_id and task.stage_id:
@@ -122,6 +129,28 @@ class TaskLoader(BaseLoader):
             if (record.user_id.id if record.user_id else False) != target_user_id:
                 record.write({'user_id': target_user_id})
 
+    def _sync_creator(self, record, task, employee_map):
+        """Set x_bitrix_creator_employee_id from task.creator_bitrix_id."""
+        if not task.creator_bitrix_id:
+            return
+        if 'x_bitrix_creator_employee_id' not in record._fields:
+            self.log_once(
+                'missing_x_bitrix_creator_employee_id',
+                'Skipping creator storage: field x_bitrix_creator_employee_id is missing. '
+                'Upgrade the bitrix_migration module.',
+            )
+            return
+
+        employee = self.find_employee_by_bitrix_id(
+            str(task.creator_bitrix_id), employee_map=employee_map,
+        )
+        if not employee:
+            return
+
+        current_id = record.x_bitrix_creator_employee_id.id if record.x_bitrix_creator_employee_id else False
+        if current_id != employee.id:
+            record.write({'x_bitrix_creator_employee_id': employee.id})
+
     def run(self, raw_tasks=None):
         """Load tasks. Optionally accepts pre-fetched raw_tasks list."""
         if raw_tasks is None:
@@ -165,8 +194,11 @@ class TaskLoader(BaseLoader):
                 odoo_proj_id = False
                 if task.project_external_id:
                     odoo_proj_id = project_map.get(str(task.project_external_id))
-                    if odoo_proj_id:
-                        vals['project_id'] = odoo_proj_id
+                if odoo_proj_id:
+                    vals['project_id'] = odoo_proj_id
+                elif self.fallback_project_id:
+                    vals['project_id'] = self.fallback_project_id
+                    self.fallback_count += 1
 
                 if task.stage_id and odoo_proj_id:
                     odoo_stage_id = stage_map.get(str(task.stage_id))
@@ -191,11 +223,14 @@ class TaskLoader(BaseLoader):
                     self._sync_created_at(record, task)
                     self._sync_tags(record, task, tag_name_map)
                     self._sync_assignees(record, task, user_map, employee_map)
+                    self._sync_creator(record, task, employee_map)
 
                 processed += 1
 
             self.commit_checkpoint(processed, last_bitrix_id=last_task_id)
 
+        if self.fallback_count:
+            self.log(f'Tasks assigned to fallback project: {self.fallback_count}')
         self.log_stats()
 
     def _build_tag_name_map(self):
