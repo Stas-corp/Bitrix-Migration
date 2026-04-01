@@ -1,3 +1,5 @@
 id,name,model_id:id,group_id:id,perm_read,perm_write,perm_create,perm_unlink
 access_bitrix_mapping_admin,bitrix.migration.mapping admin,model_bitrix_migration_mapping,base.group_system,1,1,1,1
 access_bitrix_migration_run_admin,bitrix.migration.run admin,model_bitrix_migration_run,base.group_system,1,1,1,1
+access_project_task_bitrix_task_employee,project.task.bitrix.task.employee,model_project_task,bitrix_migration.group_bitrix_task_employee,1,1,0,0
+access_project_project_bitrix_task_employee,project.project.bitrix.task.employee,model_project_project,bitrix_migration.group_bitrix_task_employee,1,0,0,0

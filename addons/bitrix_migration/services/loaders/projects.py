@@ -32,6 +32,7 @@ class ProjectLoader(BaseLoader):
                     'x_bitrix_type': proj.type,
                     'x_bitrix_closed': proj.closed,
                     'x_bitrix_owner_bitrix_id': str(proj.owner_bitrix_id) if proj.owner_bitrix_id else '',
+                    'privacy_visibility': 'followers',
                     'active': True,
                 }
 
@@ -57,6 +58,9 @@ class ProjectLoader(BaseLoader):
                     bitrix_id=proj.external_id,
                     entity_type='project',
                 )
+
+                if record and not self.dry_run and record.privacy_visibility != 'followers':
+                    record.write({'privacy_visibility': 'followers'})
 
                 # Resolve tags
                 if created and record and proj.tags:

@@ -354,6 +354,7 @@ class BitrixMigrationRun(models.Model):
                         'name': stg.name,
                         'x_bitrix_id': str(stg.id),
                         'x_bitrix_entity_id': str(stg.entity_id),
+                        'user_id': False,
                     }
                     stage_loader.get_or_create(
                         'project.task.type',
@@ -655,6 +656,9 @@ class BitrixMigrationRun(models.Model):
         from ..services.loaders.employees import EmployeeLoader
 
         group_user = self.env.ref('base.group_user')
+        task_employee_group = self.env.ref('bitrix_migration.group_bitrix_task_employee')
+        project_group_user = self.env.ref('project.group_project_user')
+        project_group_manager = self.env.ref('project.group_project_manager')
         mapping = self.env['bitrix.migration.mapping'].sudo()
         users_model = self.env['res.users'].sudo().with_context(
             active_test=False,
@@ -664,12 +668,55 @@ class BitrixMigrationRun(models.Model):
             tracking_disable=True,
         )
         sync_helper = EmployeeLoader(self.env, extractor=None, log_callback=self._append_log)
-        return group_user, mapping, users_model, sync_helper
+        return group_user, task_employee_group, project_group_user, project_group_manager, mapping, users_model, sync_helper
 
-    def _ensure_user_for_employee(self, employee, group_user, mapping, users_model, sync_helper):
+    def _sync_imported_project_visibility(self):
+        Project = self.env['project.project'].sudo().with_context(active_test=False)
+        projects = Project.search([
+            ('x_bitrix_id', '!=', False),
+            ('privacy_visibility', '!=', 'followers'),
+        ])
+        if projects:
+            projects.write({'privacy_visibility': 'followers'})
+            self._append_log(
+                f'Set follower-only visibility on imported projects: {len(projects)}'
+            )
+
+    def _sync_imported_stage_ownership(self):
+        Stage = self.env['project.task.type'].sudo().with_context(active_test=False)
+        stages = Stage.search([
+            ('x_bitrix_id', '!=', False),
+            ('user_id', '!=', False),
+        ])
+        if stages:
+            stages.write({'user_id': False})
+            self._append_log(
+                f'Reset stage owners for imported Bitrix stages: {len(stages)}'
+            )
+
+    def _ensure_user_access_groups(self, user, group_user, task_employee_group, project_group_user, project_group_manager):
+        target_group_ids = {group_user.id, task_employee_group.id}
+        current_group_ids = set(user.group_ids.ids)
+        commands = []
+
+        for group_id in sorted(target_group_ids - current_group_ids):
+            commands.append((4, group_id))
+
+        if (
+            project_group_user.id in current_group_ids
+            and project_group_manager.id not in current_group_ids
+        ):
+            commands.append((3, project_group_user.id))
+
+        if commands:
+            user.write({'group_ids': commands})
+
+    def _ensure_user_for_employee(self, employee, group_user, task_employee_group, project_group_user, project_group_manager, mapping, users_model, sync_helper):
         existing_user = self._find_existing_user_for_employee(employee)
 
         if existing_user:
+            self._ensure_user_access_groups(existing_user, group_user, task_employee_group, project_group_user, project_group_manager)
+
             if not employee.user_id or employee.user_id != existing_user:
                 employee.write({'user_id': existing_user.id})
                 status = 'linked'
@@ -694,7 +741,7 @@ class BitrixMigrationRun(models.Model):
             'email': preferred_login or False,
             'company_id': company_id,
             'company_ids': [(6, 0, [company_id])],
-            'group_ids': [(6, 0, [group_user.id])],
+            'group_ids': [(6, 0, [group_user.id, task_employee_group.id])],
             'notification_type': 'inbox',
             'active': employee.active if 'active' in employee._fields else True,
         }
@@ -703,6 +750,7 @@ class BitrixMigrationRun(models.Model):
             user_vals['partner_id'] = employee.work_contact_id.id
 
         user = users_model.create(user_vals)
+        self._ensure_user_access_groups(user, group_user, task_employee_group, project_group_user, project_group_manager)
         employee.write({'user_id': user.id})
         mapping.set_mapping(
             str(employee.x_bitrix_id),
@@ -728,10 +776,12 @@ class BitrixMigrationRun(models.Model):
         self.env.cr.commit()
 
         try:
-            group_user, mapping, users_model, sync_helper = self._prepare_employee_user_creation()
+            self._sync_imported_project_visibility()
+            self._sync_imported_stage_ownership()
+            group_user, task_employee_group, project_group_user, project_group_manager, mapping, users_model, sync_helper = self._prepare_employee_user_creation()
             with self.env.cr.savepoint():
                 status, user = self._ensure_user_for_employee(
-                    employee, group_user, mapping, users_model, sync_helper,
+                    employee, group_user, task_employee_group, project_group_user, project_group_manager, mapping, users_model, sync_helper,
                 )
             self.state = 'done'
             self.progress = 100.0
@@ -754,7 +804,9 @@ class BitrixMigrationRun(models.Model):
         self.env.cr.commit()
 
         try:
-            group_user, mapping, users_model, sync_helper = self._prepare_employee_user_creation()
+            self._sync_imported_project_visibility()
+            self._sync_imported_stage_ownership()
+            group_user, task_employee_group, project_group_user, project_group_manager, mapping, users_model, sync_helper = self._prepare_employee_user_creation()
             Employee = self.env['hr.employee'].sudo().with_context(active_test=False)
             employees = Employee.search([('x_bitrix_id', '!=', 0)])
             self._append_log(f'Found {len(employees)} imported employees')
@@ -768,7 +820,7 @@ class BitrixMigrationRun(models.Model):
                 try:
                     with self.env.cr.savepoint():
                         status, _user = self._ensure_user_for_employee(
-                            employee, group_user, mapping, users_model, sync_helper,
+                            employee, group_user, task_employee_group, project_group_user, project_group_manager, mapping, users_model, sync_helper,
                         )
                         if status == 'created':
                             created_count += 1

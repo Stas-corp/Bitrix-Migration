@@ -30,6 +30,7 @@ class StageLoader(BaseLoader):
                     'name': stage.name,
                     'x_bitrix_id': str(stage.id),
                     'x_bitrix_entity_id': str(stage.entity_id),
+                    'user_id': False,
                 }
 
                 record, created = self.get_or_create(
@@ -42,6 +43,8 @@ class StageLoader(BaseLoader):
 
                 # Link stage to project
                 if record and not self.dry_run:
+                    if record.user_id:
+                        record.write({'user_id': False})
                     project_odoo_id = project_mapping.get(str(stage.entity_id))
                     if project_odoo_id:
                         try:

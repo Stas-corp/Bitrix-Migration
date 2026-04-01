@@ -22,11 +22,11 @@
                     <button name="action_create_employee_users" string="Create Employee Users"
                             type="object" class="btn-secondary"
                             invisible="state == 'running'"
-                            confirm="Create Odoo users for imported Bitrix employees with the lowest internal access level?"/>
+                            confirm="Create or update Odoo users for imported Bitrix employees with restricted access to assigned Bitrix tasks only?"/>
                     <button name="action_create_test_employee_user" string="Create Test Employee User"
                             type="object" class="btn-secondary"
                             invisible="state == 'running' or not test_employee_id"
-                            confirm="Create or link an Odoo user for the selected test employee?"/>
+                            confirm="Create or link an Odoo user for the selected test employee and grant restricted access to assigned Bitrix tasks only?"/>
                     <button name="action_send_password_reset" string="Send Password Reset"
                             type="object" class="btn-secondary"
                             invisible="state == 'running'"
