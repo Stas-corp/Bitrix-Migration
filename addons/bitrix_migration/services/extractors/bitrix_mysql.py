@@ -37,7 +37,8 @@ class BitrixMySQLExtractor:
             t.ID AS external_id,
             t.TITLE AS name,
             CASE WHEN t.GROUP_ID > 0 THEN t.GROUP_ID ELSE NULL END AS project_external_id,
-            GROUP_CONCAT(DISTINCT m.USER_ID SEPARATOR ', ') AS responsible_user_ids,
+            GROUP_CONCAT(DISTINCT CASE WHEN m.TYPE IN ('R', 'A') THEN m.USER_ID END SEPARATOR ', ') AS responsible_user_ids,
+            GROUP_CONCAT(DISTINCT CASE WHEN m.TYPE = 'U' THEN m.USER_ID END SEPARATOR ', ') AS auditor_user_ids,
             (SELECT GROUP_CONCAT(DISTINCT tl.NAME SEPARATOR ', ')
              FROM b_tasks_task_tag tt
              JOIN b_tasks_label tl ON tl.ID = tt.TAG_ID
@@ -49,7 +50,7 @@ class BitrixMySQLExtractor:
             CASE WHEN t.PARENT_ID > 0 THEN t.PARENT_ID ELSE NULL END AS parent_id,
             t.CREATED_BY AS creator_bitrix_id
         FROM b_tasks t
-        LEFT JOIN b_tasks_member m ON m.TASK_ID = t.ID AND m.TYPE IN ('R','A')
+        LEFT JOIN b_tasks_member m ON m.TASK_ID = t.ID AND m.TYPE IN ('R', 'A', 'U')
         WHERE (t.ZOMBIE = 'N' OR t.ZOMBIE IS NULL)
           AND {task_where_clause}
         GROUP BY t.ID
@@ -74,7 +75,8 @@ class BitrixMySQLExtractor:
             t.ID AS external_id,
             t.TITLE AS name,
             CASE WHEN t.GROUP_ID > 0 THEN t.GROUP_ID ELSE NULL END AS project_external_id,
-            GROUP_CONCAT(DISTINCT m.USER_ID SEPARATOR ', ') AS responsible_user_ids,
+            GROUP_CONCAT(DISTINCT CASE WHEN m.TYPE IN ('R', 'A') THEN m.USER_ID END SEPARATOR ', ') AS responsible_user_ids,
+            GROUP_CONCAT(DISTINCT CASE WHEN m.TYPE = 'U' THEN m.USER_ID END SEPARATOR ', ') AS auditor_user_ids,
             (SELECT GROUP_CONCAT(DISTINCT tl.NAME SEPARATOR ', ')
              FROM b_tasks_task_tag tt
              JOIN b_tasks_label tl ON tl.ID = tt.TAG_ID
@@ -86,7 +88,7 @@ class BitrixMySQLExtractor:
             CASE WHEN t.PARENT_ID > 0 THEN t.PARENT_ID ELSE NULL END AS parent_id,
             t.CREATED_BY AS creator_bitrix_id
         FROM b_tasks t
-        LEFT JOIN b_tasks_member m ON m.TASK_ID = t.ID AND m.TYPE IN ('R','A')
+        LEFT JOIN b_tasks_member m ON m.TASK_ID = t.ID AND m.TYPE IN ('R', 'A', 'U')
         WHERE t.ID = %s
         GROUP BY t.ID
     """
@@ -212,7 +214,7 @@ class BitrixMySQLExtractor:
     SQL_TASK_MEMBERS = """
         SELECT TASK_ID, USER_ID, TYPE
         FROM b_tasks_member
-        WHERE TYPE IN ('R', 'A')
+        WHERE TYPE IN ('R', 'A', 'U', 'O')
         ORDER BY TASK_ID
     """
 

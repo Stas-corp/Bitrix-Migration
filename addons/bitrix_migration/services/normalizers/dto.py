@@ -104,6 +104,7 @@ class BitrixTask(BaseModel):
     name: str
     project_external_id: Optional[int] = None
     responsible_user_ids: Optional[str] = None
+    auditor_user_ids: Optional[str] = None
     tags: Optional[str] = None
     date_deadline: Optional[datetime] = None
     date_created: Optional[datetime] = None
@@ -122,7 +123,7 @@ class BitrixTask(BaseModel):
     def clean_int(cls, v):
         return _to_int_or_none(v)
 
-    @field_validator('responsible_user_ids', 'tags', 'description', mode='before')
+    @field_validator('responsible_user_ids', 'auditor_user_ids', 'tags', 'description', mode='before')
     @classmethod
     def clean_str(cls, v):
         return _clean_str(v)

@@ -178,18 +178,49 @@ class EmployeeLoader(BaseLoader):
 
     def _sync_task_assignees(self, employee, user_id):
         Task = self.env['project.task'].sudo().with_context(active_test=False)
-        if 'x_bitrix_responsible_employee_ids' not in Task._fields:
-            return
-        if not self.db_table_exists('project_task_bitrix_employee_rel'):
+
+        has_participant_field = (
+            'x_bitrix_participant_employee_ids' in Task._fields
+            and self.db_table_exists('project_task_bitrix_participant_rel')
+        )
+        has_responsible_field = (
+            'x_bitrix_responsible_employee_ids' in Task._fields
+            and self.db_table_exists('project_task_bitrix_employee_rel')
+        )
+        has_creator_field = 'x_bitrix_creator_employee_id' in Task._fields
+
+        if not has_participant_field and not has_responsible_field and not has_creator_field:
             return
 
-        tasks = Task.search([('x_bitrix_responsible_employee_ids', 'in', employee.id)])
+        if has_participant_field and has_creator_field:
+            domain = ['|', ('x_bitrix_participant_employee_ids', 'in', employee.id), ('x_bitrix_creator_employee_id', '=', employee.id)]
+        elif has_participant_field:
+            domain = [('x_bitrix_participant_employee_ids', 'in', employee.id)]
+        elif has_responsible_field and has_creator_field:
+            domain = ['|', ('x_bitrix_responsible_employee_ids', 'in', employee.id), ('x_bitrix_creator_employee_id', '=', employee.id)]
+        elif has_responsible_field:
+            domain = [('x_bitrix_responsible_employee_ids', 'in', employee.id)]
+        else:
+            domain = [('x_bitrix_creator_employee_id', '=', employee.id)]
+
+        tasks = Task.search(domain)
         for task in tasks:
+            participant_employees = (
+                task.x_bitrix_participant_employee_ids if has_participant_field
+                else task.x_bitrix_responsible_employee_ids if has_responsible_field
+                else self.env['hr.employee']
+            )
+
             target_user_ids = []
-            for responsible_employee in task.x_bitrix_responsible_employee_ids:
-                responsible_user = self.get_user_from_employee(responsible_employee)
-                if responsible_user and responsible_user.id not in target_user_ids:
-                    target_user_ids.append(responsible_user.id)
+            for participant_employee in participant_employees:
+                participant_user = self.get_user_from_employee(participant_employee)
+                if participant_user and participant_user.id not in target_user_ids:
+                    target_user_ids.append(participant_user.id)
+
+            if has_creator_field and task.x_bitrix_creator_employee_id:
+                creator_user = self.get_user_from_employee(task.x_bitrix_creator_employee_id)
+                if creator_user and creator_user.id not in target_user_ids:
+                    target_user_ids.append(creator_user.id)
 
             if 'user_ids' in task._fields:
                 if set(task.user_ids.ids) != set(target_user_ids):

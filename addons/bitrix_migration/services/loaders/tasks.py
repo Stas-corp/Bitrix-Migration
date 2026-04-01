@@ -79,45 +79,96 @@ class TaskLoader(BaseLoader):
         )
         record.invalidate_recordset(['create_date'])
 
-    def _sync_assignees(self, record, task, user_map, employee_map):
+    @staticmethod
+    def _split_bitrix_user_ids(raw_ids):
+        if not raw_ids:
+            return []
+        return [uid.strip() for uid in raw_ids.split(',') if uid and uid.strip()]
+
+    @staticmethod
+    def _merge_bitrix_user_ids(*groups):
+        merged = []
+        for group in groups:
+            for uid in group:
+                if uid not in merged:
+                    merged.append(uid)
+        return merged
+
+    def _resolve_task_users(self, bitrix_user_ids, user_map, employee_map):
         employee_ids = []
         user_ids = []
 
-        if task.responsible_user_ids:
-            uid_strs = [uid.strip() for uid in task.responsible_user_ids.split(',') if uid.strip()]
-            for uid_str in uid_strs:
-                employee = self.find_employee_by_bitrix_id(uid_str, employee_map=employee_map)
-                if employee and employee.id not in employee_ids:
-                    employee_ids.append(employee.id)
+        for uid_str in bitrix_user_ids:
+            employee = self.find_employee_by_bitrix_id(uid_str, employee_map=employee_map)
+            if employee and employee.id not in employee_ids:
+                employee_ids.append(employee.id)
 
-                    user = self.get_user_from_employee(employee)
-                    if user and user.id not in user_ids:
-                        user_ids.append(user.id)
-                        continue
+                user = self.get_user_from_employee(employee)
+                if user and user.id not in user_ids:
+                    user_ids.append(user.id)
+                    continue
 
-                partner_id = user_map.get(uid_str)
-                if partner_id:
-                    odoo_user = self.env['res.users'].sudo().search(
-                        [('partner_id', '=', partner_id)], limit=1,
-                    )
-                    if odoo_user and odoo_user.id not in user_ids:
-                        user_ids.append(odoo_user.id)
-
-        if 'x_bitrix_responsible_employee_ids' in record._fields and employee_ids:
-            if self.db_table_exists('project_task_bitrix_employee_rel'):
-                current_employee_ids = set(record.x_bitrix_responsible_employee_ids.ids)
-                target_employee_ids = set(employee_ids)
-                if current_employee_ids != target_employee_ids:
-                    record.write({
-                        'x_bitrix_responsible_employee_ids': [(6, 0, sorted(target_employee_ids))],
-                    })
-            else:
-                self.log_once(
-                    'missing_project_task_bitrix_employee_rel',
-                    'Skipping employee task links: relation table '
-                    '"project_task_bitrix_employee_rel" is missing. '
-                    'Upgrade the bitrix_migration module to enable employee-based history.',
+            partner_id = user_map.get(uid_str)
+            if partner_id:
+                odoo_user = self.env['res.users'].sudo().search(
+                    [('partner_id', '=', partner_id)], limit=1,
                 )
+                if odoo_user and odoo_user.id not in user_ids:
+                    user_ids.append(odoo_user.id)
+
+        return employee_ids, user_ids
+
+    def _sync_employee_links(self, record, field_name, rel_table_name, employee_ids, warning_key, warning_message):
+        if field_name not in record._fields:
+            return
+
+        if not self.db_table_exists(rel_table_name):
+            self.log_once(warning_key, warning_message)
+            return
+
+        current_employee_ids = set(record[field_name].ids)
+        target_employee_ids = set(employee_ids)
+        if current_employee_ids != target_employee_ids:
+            record.write({field_name: [(6, 0, sorted(target_employee_ids))]})
+
+    def _sync_assignees(self, record, task, user_map, employee_map):
+        responsible_bitrix_ids = self._split_bitrix_user_ids(task.responsible_user_ids)
+        auditor_bitrix_ids = self._split_bitrix_user_ids(task.auditor_user_ids)
+        creator_bitrix_ids = [str(task.creator_bitrix_id)] if task.creator_bitrix_id else []
+
+        participant_bitrix_ids = self._merge_bitrix_user_ids(
+            responsible_bitrix_ids,
+            auditor_bitrix_ids,
+            creator_bitrix_ids,
+        )
+
+        responsible_employee_ids, _ = self._resolve_task_users(
+            responsible_bitrix_ids, user_map, employee_map,
+        )
+        participant_employee_ids, user_ids = self._resolve_task_users(
+            participant_bitrix_ids, user_map, employee_map,
+        )
+
+        self._sync_employee_links(
+            record,
+            'x_bitrix_responsible_employee_ids',
+            'project_task_bitrix_employee_rel',
+            responsible_employee_ids,
+            'missing_project_task_bitrix_employee_rel',
+            'Skipping employee task links: relation table '
+            '"project_task_bitrix_employee_rel" is missing. '
+            'Upgrade the bitrix_migration module to enable employee-based history.',
+        )
+        self._sync_employee_links(
+            record,
+            'x_bitrix_participant_employee_ids',
+            'project_task_bitrix_participant_rel',
+            participant_employee_ids,
+            'missing_project_task_bitrix_participant_rel',
+            'Skipping participant task links: relation table '
+            '"project_task_bitrix_participant_rel" is missing. '
+            'Upgrade the bitrix_migration module to enable full participant sync.',
+        )
 
         task_fields = record._fields
         if 'user_ids' in task_fields:

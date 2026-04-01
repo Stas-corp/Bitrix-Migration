@@ -1,4 +1,4 @@
-from odoo import models, fields
+from odoo import fields, models
 
 
 class ProjectTask(models.Model):
@@ -17,9 +17,18 @@ class ProjectTask(models.Model):
         copy=False,
         help='Employees resolved from Bitrix responsible users, preserved even before linked Odoo users exist.',
     )
+    x_bitrix_participant_employee_ids = fields.Many2many(
+        'hr.employee',
+        'project_task_bitrix_participant_rel',
+        'task_id',
+        'employee_id',
+        string='Bitrix Participants',
+        copy=False,
+        help='All Bitrix task participants included in Odoo assignees: responsible users, accomplices, auditors, and creator.',
+    )
     x_bitrix_creator_employee_id = fields.Many2one(
         'hr.employee',
         string='Bitrix Creator (Employee)',
         copy=False,
-        help='Employee who created this task in Bitrix (постановщик).',
+        help='Employee who created this task in Bitrix.',
     )
