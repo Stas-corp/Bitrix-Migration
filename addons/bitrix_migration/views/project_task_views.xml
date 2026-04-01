@@ -6,8 +6,9 @@
         <field name="inherit_id" ref="project.view_task_form2"/>
         <field name="arch" type="xml">
             <xpath expr="//div[@id='date_deadline_and_recurring_task']" position="after">
-                <label for="x_bitrix_created_at"/>
-                <field name="x_bitrix_created_at" readonly="1"/>
+                <group>
+                    <field name="x_bitrix_created_at" readonly="1"/>
+                </group>
             </xpath>
             <xpath expr="//field[@name='user_ids']" position="after">
                 <field name="x_bitrix_responsible_employee_ids"
