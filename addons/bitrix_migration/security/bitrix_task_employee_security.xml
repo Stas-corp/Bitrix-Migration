@@ -25,4 +25,14 @@
         <field name="perm_create" eval="False"/>
         <field name="perm_unlink" eval="False"/>
     </record>
+
+    <record id="rule_project_collaborator_bitrix_task_employee_guard" model="ir.rule">
+        <field name="name">Bitrix task employee: guard collaborator visibility</field>
+        <field name="model_id" ref="project.model_project_collaborator"/>
+        <field name="domain_force">[(1, '=', 1)] if (not user.has_group('bitrix_migration.group_bitrix_task_employee') or user.has_group('project.group_project_manager') or user.has_group('base.group_system')) else [('project_id.task_ids.user_ids', 'in', user.id)]</field>
+        <field name="perm_read" eval="True"/>
+        <field name="perm_write" eval="False"/>
+        <field name="perm_create" eval="False"/>
+        <field name="perm_unlink" eval="False"/>
+    </record>
 </odoo>

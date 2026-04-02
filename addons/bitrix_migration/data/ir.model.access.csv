@@ -3,3 +3,4 @@ access_bitrix_mapping_admin,bitrix.migration.mapping admin,model_bitrix_migratio
 access_bitrix_migration_run_admin,bitrix.migration.run admin,model_bitrix_migration_run,base.group_system,1,1,1,1
 access_project_task_bitrix_task_employee,project.task.bitrix.task.employee,model_project_task,bitrix_migration.group_bitrix_task_employee,1,1,0,0
 access_project_project_bitrix_task_employee,project.project.bitrix.task.employee,model_project_project,bitrix_migration.group_bitrix_task_employee,1,0,0,0
+access_project_collaborator_bitrix_task_employee,project.collaborator.bitrix.task.employee,project.model_project_collaborator,bitrix_migration.group_bitrix_task_employee,1,0,0,0
