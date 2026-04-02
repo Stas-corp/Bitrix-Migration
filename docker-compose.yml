@@ -18,6 +18,29 @@ services:
       timeout: 5s
       retries: 5
 
+  odoo-init:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: bitrix_migration_odoo_init
+    profiles: ["init"]
+    restart: "no"
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      HOST: db
+      PORT: 5432
+      USER: ${POSTGRES_USER:-odoo}
+      PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+    volumes:
+      - odoo_filestore:/var/lib/odoo
+      - ./odoo.conf:/etc/odoo/odoo.conf
+      - ./addons:/mnt/extra-addons:ro
+    command: odoo -c /etc/odoo/odoo.conf -d odoo -i base --without-demo=all --stop-after-init
+    networks:
+      - odoo_net
+
   odoo:
     build:
       context: .

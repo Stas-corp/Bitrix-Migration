@@ -140,7 +140,7 @@ class BitrixMySQLExtractor:
             s.ENTITY_TYPE AS entity_type,
             s.ENTITY_ID AS entity_id
         FROM b_tasks_stages s
-        WHERE s.ENTITY_TYPE = 'G'
+        WHERE s.ENTITY_TYPE IN ('G', 'U')
           AND s.TITLE IS NOT NULL AND s.TITLE != ''
         ORDER BY s.ID
     """
@@ -395,7 +395,7 @@ class BitrixMySQLExtractor:
               AND gt.NAME != ''
         ) tags
     """
-    SQL_COUNT_STAGES = "SELECT COUNT(*) AS cnt FROM b_tasks_stages WHERE ENTITY_TYPE = 'G' AND TITLE IS NOT NULL AND TITLE != ''"
+    SQL_COUNT_STAGES = "SELECT COUNT(*) AS cnt FROM b_tasks_stages WHERE ENTITY_TYPE IN ('G', 'U') AND TITLE IS NOT NULL AND TITLE != ''"
     SQL_COUNT_MEETINGS = "SELECT COUNT(*) AS cnt FROM b_calendar_event WHERE IS_MEETING = '1' AND DELETED = 'N' AND ID = PARENT_ID"
 
     def __init__(self, host, port, user, password, database, date_from=None):

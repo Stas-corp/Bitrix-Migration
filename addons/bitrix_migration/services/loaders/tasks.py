@@ -17,16 +17,104 @@ class TaskLoader(BaseLoader):
         self.fallback_project_id = fallback_project_id
         self.fallback_count = 0
 
-    def _sync_project_and_stage(self, record, task, project_map, stage_map):
+    def _build_personal_project_name(self, owner_bitrix_id, user_map, employee_map):
+        bid = str(owner_bitrix_id)
+        employee = self.find_employee_by_bitrix_id(bid, employee_map=employee_map)
+        if employee and employee.name:
+            return f'Bitrix: Личные ({employee.name})'
+
+        partner_id = user_map.get(bid)
+        if partner_id:
+            user = self.env['res.users'].sudo().search([('partner_id', '=', partner_id)], limit=1)
+            if user and user.name:
+                return f'Bitrix: Личные ({user.name})'
+
+        return f'Bitrix: Личные ({bid})'
+
+    def _ensure_personal_project(self, owner_bitrix_id, user_map, employee_map):
+        Project = self.env['project.project'].sudo().with_context(active_test=False)
+        owner_bid = str(owner_bitrix_id)
+        project = Project.search([
+            ('x_bitrix_type', '=', 'personal'),
+            ('x_bitrix_owner_bitrix_id', '=', owner_bid),
+        ], limit=1)
+        if project:
+            vals = {}
+            if project.privacy_visibility != 'followers':
+                vals['privacy_visibility'] = 'followers'
+            if not project.active:
+                vals['active'] = True
+            if vals:
+                project.write(vals)
+            return project.id
+
+        vals = {
+            'name': self._build_personal_project_name(owner_bid, user_map, employee_map),
+            'x_bitrix_type': 'personal',
+            'x_bitrix_owner_bitrix_id': owner_bid,
+            'privacy_visibility': 'followers',
+            'active': True,
+        }
+        employee = self.find_employee_by_bitrix_id(owner_bid, employee_map=employee_map)
+        user = self.get_user_from_employee(employee)
+        if not user:
+            partner_id = user_map.get(owner_bid)
+            if partner_id:
+                user = self.env['res.users'].sudo().search([('partner_id', '=', partner_id)], limit=1)
+        if user:
+            vals['user_id'] = user.id
+
+        project = Project.with_context(
+            mail_create_nolog=True,
+            mail_create_nosubscribe=True,
+            tracking_disable=True,
+        ).create(vals)
+        return project.id
+
+    def _build_stage_meta_map(self):
+        Stage = self.env['project.task.type'].sudo().with_context(active_test=False)
+        stage_meta_map = {}
+        for stage in Stage.search([('x_bitrix_id', '!=', False)]):
+            entity_type = 'G'
+            if 'x_bitrix_entity_type' in stage._fields and stage.x_bitrix_entity_type:
+                entity_type = stage.x_bitrix_entity_type
+            stage_meta_map[str(stage.x_bitrix_id)] = {
+                'id': stage.id,
+                'entity_type': entity_type,
+                'entity_id': str(stage.x_bitrix_entity_id or ''),
+                'project_ids': set(stage.project_ids.ids),
+            }
+        return stage_meta_map
+
+    def _resolve_project_and_stage(self, task, project_map, stage_meta_map, user_map, employee_map):
         target_project_id = False
+        target_stage_id = False
+
+        stage_meta = stage_meta_map.get(str(task.stage_id)) if task.stage_id else None
+
         if task.project_external_id:
             target_project_id = project_map.get(str(task.project_external_id)) or False
-        if not target_project_id and self.fallback_project_id:
-            target_project_id = self.fallback_project_id
+            if target_project_id and stage_meta and stage_meta['entity_type'] == 'G':
+                if target_project_id in stage_meta['project_ids']:
+                    target_stage_id = stage_meta['id']
+            return target_project_id, target_stage_id
 
-        target_stage_id = False
-        if target_project_id and task.stage_id:
-            target_stage_id = stage_map.get(str(task.stage_id)) or False
+        if stage_meta and stage_meta['entity_type'] == 'U':
+            owner_bitrix_id = stage_meta['entity_id']
+            if owner_bitrix_id:
+                target_project_id = self._ensure_personal_project(owner_bitrix_id, user_map, employee_map)
+                target_stage_id = stage_meta['id']
+                return target_project_id, target_stage_id
+
+        if self.fallback_project_id:
+            return self.fallback_project_id, False
+
+        return False, False
+
+    def _sync_project_and_stage(self, record, task, project_map, stage_meta_map, user_map, employee_map):
+        target_project_id, target_stage_id = self._resolve_project_and_stage(
+            task, project_map, stage_meta_map, user_map, employee_map,
+        )
 
         vals = {}
         current_project_id = record.project_id.id if record.project_id else False
@@ -210,10 +298,10 @@ class TaskLoader(BaseLoader):
         self.log(f'Found {len(raw_tasks)} tasks')
 
         project_map = self.get_mapping().get_all_mappings('project')
-        stage_map = self.get_mapping().get_all_mappings('stage')
         user_map = self.get_mapping().get_all_mappings('user')
         employee_map = self.get_mapping().get_all_mappings('employee')
         tag_name_map = self._build_tag_name_map()
+        stage_meta_map = self._build_stage_meta_map()
 
         checkpoint = self.get_checkpoint()
         skip_until = int(checkpoint) if checkpoint else 0
@@ -242,19 +330,25 @@ class TaskLoader(BaseLoader):
                 elif 'user_id' in self.env['project.task']._fields:
                     vals['user_id'] = False
 
-                odoo_proj_id = False
-                if task.project_external_id:
-                    odoo_proj_id = project_map.get(str(task.project_external_id))
+                odoo_proj_id, odoo_stage_id = self._resolve_project_and_stage(
+                    task, project_map, stage_meta_map, user_map, employee_map,
+                )
                 if odoo_proj_id:
                     vals['project_id'] = odoo_proj_id
+                    stage_meta = stage_meta_map.get(str(task.stage_id)) if task.stage_id else None
+                    if (
+                        self.fallback_project_id
+                        and odoo_proj_id == self.fallback_project_id
+                        and not task.project_external_id
+                        and not (stage_meta and stage_meta.get('entity_type') == 'U')
+                    ):
+                        self.fallback_count += 1
                 elif self.fallback_project_id:
                     vals['project_id'] = self.fallback_project_id
                     self.fallback_count += 1
 
-                if task.stage_id and odoo_proj_id:
-                    odoo_stage_id = stage_map.get(str(task.stage_id))
-                    if odoo_stage_id:
-                        vals['stage_id'] = odoo_stage_id
+                if odoo_stage_id:
+                    vals['stage_id'] = odoo_stage_id
 
                 if task.date_deadline:
                     vals['date_deadline'] = task.date_deadline.strftime('%Y-%m-%d')
@@ -270,7 +364,9 @@ class TaskLoader(BaseLoader):
                 )
 
                 if record and not self.dry_run:
-                    self._sync_project_and_stage(record, task, project_map, stage_map)
+                    self._sync_project_and_stage(
+                        record, task, project_map, stage_meta_map, user_map, employee_map,
+                    )
                     self._sync_created_at(record, task)
                     self._sync_tags(record, task, tag_name_map)
                     self._sync_assignees(record, task, user_map, employee_map)

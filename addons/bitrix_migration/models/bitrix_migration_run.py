@@ -153,7 +153,7 @@ class BitrixMigrationRun(models.Model):
             'Projects': extractor.count_projects(),
             'Tasks': extractor.count_tasks(),
             'Tags': extractor.count_tags(),
-            'Stages (G)': extractor.count_stages(),
+            'Stages (G+U)': extractor.count_stages(),
             'Comments (real)': extractor.count_comments(),
             'Meetings': extractor.count_meetings(),
             'Departments': extractor.count_departments(),
@@ -347,22 +347,7 @@ class BitrixMigrationRun(models.Model):
             ]
             if raw_stages:
                 stage_loader = StageLoader(self.env, extractor, log_callback=self._append_log)
-                for row in raw_stages:
-                    from ..normalizers.dto import BitrixStage
-                    stg = BitrixStage(**row)
-                    vals = {
-                        'name': stg.name,
-                        'x_bitrix_id': str(stg.id),
-                        'x_bitrix_entity_id': str(stg.entity_id),
-                        'user_id': False,
-                    }
-                    stage_loader.get_or_create(
-                        'project.task.type',
-                        [('x_bitrix_id', '=', str(stg.id))],
-                        vals,
-                        bitrix_id=stg.id,
-                        entity_type='stage',
-                    )
+                stage_loader.run(raw_stages=raw_stages)
                 stage_loader.commit_checkpoint(1)
 
         # 6. Task itself

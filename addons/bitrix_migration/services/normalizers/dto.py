@@ -145,6 +145,12 @@ class BitrixStage(BaseModel):
     def clean_name(cls, v):
         return _clean_str(v) or 'Untitled Stage'
 
+    @field_validator('entity_type', mode='before')
+    @classmethod
+    def clean_entity_type(cls, v):
+        val = (_clean_str(v) or 'G').upper()
+        return val if val in ('G', 'U') else 'G'
+
 
 class BitrixTag(BaseModel):
     id: int
