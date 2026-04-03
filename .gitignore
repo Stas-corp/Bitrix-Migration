@@ -209,3 +209,10 @@ __marimo__/
 # Claude Code
 .claude/
 .env
+FileMigration.md
+MigrationPlan.md
+tmp_hr_view_arch.xml
+tranquil-scribbling-plum.md
+DEPLOY.md
+odoo.conf
+.vscode/settings.json
