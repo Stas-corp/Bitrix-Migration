@@ -48,19 +48,27 @@
                             <field name="pilot_project_ids"
                                    invisible="mode != 'pilot'"
                                    placeholder="e.g. 1,2,3"/>
-                            <div invisible="mode not in ('hr', 'departments_only', 'employees_only')"
-                                 class="alert alert-info" role="alert">
-                                <strong>HR modes:</strong>
-                                <ul style="margin-bottom:0">
-                                    <li><b>Departments Only</b> — creates hr.department hierarchy with managers</li>
-                                    <li><b>Employees Only</b> — creates hr.employee (departments must be migrated first)</li>
-                                    <li><b>Departments + Employees</b> — runs both in order</li>
-                                </ul>
-                            </div>
+                            <group invisible="mode not in ('hr', 'departments_only', 'employees_only')"
+                                   colspan="2">
+                                <div class="alert alert-info" role="alert">
+                                    <strong>HR режими:</strong>
+                                    <p style="margin:8px 0 4px 0;">
+                                        <b>Departments Only</b> — створює ієрархію підрозділів
+                                        hr.department із керівниками.
+                                    </p>
+                                    <p style="margin:0 0 4px 0;">
+                                        <b>Employees Only</b> — створює hr.employee
+                                        (підрозділи мають бути імпортовані раніше).
+                                    </p>
+                                    <p style="margin:0;">
+                                        <b>Departments + Employees</b> — запускає обидва кроки
+                                        в правильному порядку.
+                                    </p>
+                                </div>
+                            </group>
                         </group>
                         <group string="Options">
                             <field name="preserve_authorship"/>
-                            <field name="fallback_system_author"/>
                             <field name="migration_date_from"
                                    invisible="mode in ('relink', 'comments', 'single_task', 'hr', 'departments_only', 'employees_only')"/>
                             <field name="fallback_project_id"
@@ -104,6 +112,48 @@
                             <field name="log_output" readonly="1"
                                    widget="text" nolabel="1"
                                    placeholder="Migration log will appear here..."/>
+                        </page>
+                        <page string="Help">
+                            <div class="o_bitrix_help" style="width:100%;">
+                                <div class="alert alert-info" role="alert" style="margin-bottom:16px;">
+                                    <strong>Швидкий сценарій запуску</strong>
+                                    <ol style="margin:8px 0 0 18px;">
+                                        <li>Заповніть MySQL Connection (та SFTP, якщо переносите вкладення).</li>
+                                        <li>Для HR-міграції спочатку оберіть <b>HR: Departments + Employees</b> або потрібний HR-режим.</li>
+                                        <li>Далі використовуйте інші режими: <b>Dry Run</b>, <b>Full Migration</b>, <b>Pilot</b> тощо.</li>
+                                        <li>Виконайте <b>Create Employee Users</b> і <b>Send Password Reset</b> для створення користувачів співробітникам.</li>
+                                    </ol>
+                                </div>
+
+                                <h4 style="margin:0 0 8px 0;">Режими</h4>
+                                <ul class="text-muted" style="margin:0 0 16px 18px;">
+                                    <li><b>HR: Departments + Employees</b> — спочатку імпортує підрозділи, потім співробітників.</li>
+                                    <li><b>HR: Departments Only</b> — тільки структура підрозділів і керівники.</li>
+                                    <li><b>HR: Employees Only</b> — тільки співробітники (після імпорту підрозділів).</li>
+                                    <li><b>Dry Run</b> — лише підрахунок сутностей без запису в Odoo.</li>
+                                    <li><b>Full Migration</b> — повна міграція користувачів, проєктів, задач, коментарів і вкладень.</li>
+                                    <li><b>Pilot</b> — обмежений запуск для перевірки на вибіркових проєктах.</li>
+                                    <li><b>Projects Only</b> — тільки користувачі, теги, проєкти та стадії.</li>
+                                    <li><b>Relink Parents</b> — лише перев'язка батьківських задач.</li>
+                                    <li><b>Comments Only</b> — лише імпорт коментарів.</li>
+                                    <li><b>Single Task Test</b> — точковий імпорт однієї задачі.</li>
+                                </ul>
+
+                                <h4 style="margin:0 0 8px 0;">Ключові опції</h4>
+                                <ul class="text-muted" style="margin:0 0 16px 18px;">
+                                    <li><b>Preserve Authorship</b> — зберігає авторів коментарів, якщо їх можна зіставити в Odoo.</li>
+                                    <li><b>Import From Date</b> — обмежує імпорт датою початку.</li>
+                                    <li><b>Fallback Project</b> — проєкт для задач без проєкту в Bitrix; якщо порожньо, створиться автоматично.</li>
+                                    <li><b>Test Employee</b> — співробітник для перевірочного створення користувача і доступів.</li>
+                                </ul>
+
+                                <h4 style="margin:0 0 8px 0;">Troubleshooting</h4>
+                                <ul class="text-muted" style="margin:0 0 0 18px;">
+                                    <li>Усі деталі виконання дивіться на вкладці <b>Log Output</b>.</li>
+                                    <li>Якщо вкладення не потрібні, поля SFTP можна залишити порожніми.</li>
+                                    <li>Якщо міграція завершилась з <b>Error</b>, перевірте останні рядки логу та параметри підключення.</li>
+                                </ul>
+                            </div>
                         </page>
                     </notebook>
                 </sheet>

@@ -12,6 +12,9 @@ class BitrixMigrationRun(models.Model):
     _description = 'Bitrix Migration Runner'
 
     mode = fields.Selection([
+        ('hr', 'HR: Departments + Employees'),
+        ('departments_only', 'HR: Departments Only'),
+        ('employees_only', 'HR: Employees Only'),
         ('full', 'Full Migration'),
         ('dry_run', 'Dry Run'),
         ('pilot', 'Pilot (3-5 projects)'),
@@ -19,10 +22,9 @@ class BitrixMigrationRun(models.Model):
         ('relink', 'Relink Parents'),
         ('comments', 'Comments Only'),
         ('single_task', 'Single Task Test'),
-        ('hr', 'HR: Departments + Employees'),
-        ('departments_only', 'HR: Departments Only'),
-        ('employees_only', 'HR: Employees Only'),
-    ], required=True, default='dry_run', string='Mode')
+    ], required=True, default='dry_run', string='Mode',
+        help='Режим виконання міграції. Для першого запуску рекомендовано Dry Run, '
+             'далі Full або Pilot.')
 
     # MySQL connection
     mysql_host = fields.Char(string='MySQL Host', default='localhost')
@@ -39,23 +41,45 @@ class BitrixMigrationRun(models.Model):
     sftp_base_path = fields.Char(string='SFTP Base Path', default='/home/bitrix/www')
 
     # Options
-    preserve_authorship = fields.Boolean(string='Preserve Authorship', default=True)
+    preserve_authorship = fields.Boolean(
+        string='Preserve Authorship',
+        default=True,
+        help='Зберігати автора коментаря з Bitrix, якщо в Odoo знайдено відповідного '
+             'користувача/контакт. Якщо збіг не знайдено, у коментарі зберігається '
+             'Bitrix Author ID.',
+    )
     fallback_system_author = fields.Boolean(string='Fallback System Author', default=True)
-    migration_date_from = fields.Date(string='Import From Date')
+    migration_date_from = fields.Date(
+        string='Import From Date',
+        help='Імпортувати дані починаючи з цієї дати. Порожнє значення означає '
+             'імпорт без обмеження за датою.',
+    )
 
     # Mode-specific
-    pilot_project_ids = fields.Char(string='Pilot Project IDs (comma-separated)')
-    single_task_bitrix_id = fields.Char(string='Single Task Bitrix ID')
+    pilot_project_ids = fields.Char(
+        string='Pilot Project IDs (comma-separated)',
+        help='Список ID проєктів Bitrix через кому для пілотного запуску '
+             '(наприклад: 1,2,3).',
+    )
+    single_task_bitrix_id = fields.Char(
+        string='Single Task Bitrix ID',
+        help='ID однієї задачі Bitrix для точкового тестового імпорту разом із '
+             'коментарями та вкладеннями.',
+    )
     fallback_project_id = fields.Many2one(
         'project.project',
         string='Fallback Project (no-project tasks)',
-        help='Tasks without a Bitrix project will be assigned here. '
-             'Auto-created as "Bitrix: Без проекта" if left empty.',
+        help='Сюди потрапляють задачі Bitrix без проєкту (GROUP_ID=0/NULL). '
+             'Якщо не вказано, проєкт створюється автоматично як '
+             '"Bitrix: Без проекта".',
     )
     test_employee_id = fields.Many2one(
         'hr.employee',
         string='Test Employee',
         domain=[('x_bitrix_id', '!=', 0)],
+        help='Імпортований співробітник для кнопки "Create Test Employee User". '
+             'Використовуйте для перевірки доступів перед масовим створенням '
+             'користувачів.',
     )
 
     # State
