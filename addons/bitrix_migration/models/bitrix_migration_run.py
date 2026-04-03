@@ -153,7 +153,7 @@ class BitrixMigrationRun(models.Model):
             'Projects': extractor.count_projects(),
             'Tasks': extractor.count_tasks(),
             'Tags': extractor.count_tags(),
-            'Stages (G+U)': extractor.count_stages(),
+            'Stages (G)': extractor.count_stages(),
             'Comments (real)': extractor.count_comments(),
             'Meetings': extractor.count_meetings(),
             'Departments': extractor.count_departments(),
@@ -204,6 +204,75 @@ class BitrixMigrationRun(models.Model):
         self.env.cr.commit()
         return project.id
 
+    def _ensure_fallback_project_stages(self, fallback_project_id=None):
+        """Ensure fallback project has exactly the fixed 6 task stages."""
+        from ..services.loaders.tasks import TaskLoader
+
+        self.ensure_one()
+        project_id = fallback_project_id or self._ensure_fallback_project()
+        Stage = self.env['project.task.type'].sudo().with_context(active_test=False)
+
+        stage_ids_by_name = {}
+        target_stage_ids = []
+
+        for stage_name, sequence, folded in TaskLoader.FALLBACK_STAGE_SPECS:
+            stages = Stage.search([
+                ('name', '=', stage_name),
+                ('project_ids', 'in', project_id),
+            ], order='id asc')
+            primary_stage = stages[:1]
+            duplicate_stages = stages[1:]
+
+            if not primary_stage:
+                primary_stage = Stage.create({
+                    'name': stage_name,
+                    'sequence': sequence,
+                    'fold': folded,
+                    'user_id': False,
+                    'project_ids': [(4, project_id)],
+                })
+                self._append_log(
+                    f'Created fallback stage "{stage_name}" for project_id={project_id} '
+                    f'(stage_id={primary_stage.id})'
+                )
+
+            vals = {}
+            if primary_stage.sequence != sequence:
+                vals['sequence'] = sequence
+            if primary_stage.fold != folded:
+                vals['fold'] = folded
+            if 'user_id' in primary_stage._fields and primary_stage.user_id:
+                vals['user_id'] = False
+            if project_id not in primary_stage.project_ids.ids:
+                vals.setdefault('project_ids', [])
+                vals['project_ids'].append((4, project_id))
+            if vals:
+                primary_stage.write(vals)
+
+            if duplicate_stages:
+                for dup in duplicate_stages:
+                    dup.write({'project_ids': [(3, project_id)]})
+                self._append_log(
+                    f'Removed duplicate fallback stage links for "{stage_name}": '
+                    f'{len(duplicate_stages)}'
+                )
+
+            stage_ids_by_name[stage_name] = primary_stage.id
+            target_stage_ids.append(primary_stage.id)
+
+        extra_project_stages = Stage.search([
+            ('project_ids', 'in', project_id),
+            ('id', 'not in', target_stage_ids),
+        ])
+        if extra_project_stages:
+            for stage in extra_project_stages:
+                stage.write({'project_ids': [(3, project_id)]})
+            self._append_log(
+                f'Removed non-fallback stage links from fallback project: {len(extra_project_stages)}'
+            )
+
+        return stage_ids_by_name
+
     def _run_full(self, extractor, dry_run=False):
         """Full migration in correct order."""
         from ..services.loaders.users import UserLoader
@@ -214,13 +283,18 @@ class BitrixMigrationRun(models.Model):
         from ..services.loaders.tasks_relink import TaskRelinkLoader
         from ..services.loaders.comments import CommentLoader
         from ..services.loaders.attachments import AttachmentLoader
+        fallback_project_id = self._ensure_fallback_project()
+        fallback_stage_ids = self._ensure_fallback_project_stages(fallback_project_id)
 
         steps = [
             ('Users', UserLoader, {}),
             ('Tags', TagLoader, {}),
             ('Projects', ProjectLoader, {}),
             ('Stages', StageLoader, {}),
-            ('Tasks', TaskLoader, {'fallback_project_id': self._ensure_fallback_project()}),
+            ('Tasks', TaskLoader, {
+                'fallback_project_id': fallback_project_id,
+                'fallback_stage_ids': fallback_stage_ids,
+            }),
             ('Task Relink', TaskRelinkLoader, {}),
             ('Comments', CommentLoader, {
                 'preserve_authorship': self.preserve_authorship,
@@ -352,10 +426,13 @@ class BitrixMigrationRun(models.Model):
 
         # 6. Task itself
         self._append_log(f'\n--- Task ---')
+        fallback_project_id = self._ensure_fallback_project()
+        fallback_stage_ids = self._ensure_fallback_project_stages(fallback_project_id)
         task_loader = TaskLoader(
             self.env, extractor,
             log_callback=self._append_log,
-            fallback_project_id=self._ensure_fallback_project(),
+            fallback_project_id=fallback_project_id,
+            fallback_stage_ids=fallback_stage_ids,
         )
         task_loader.run(raw_tasks=raw_tasks)
 
@@ -637,6 +714,104 @@ class BitrixMigrationRun(models.Model):
 
         self.env.cr.commit()
 
+    def action_merge_personal_projects_to_fallback(self):
+        """One-off migration: merge personal Bitrix projects into fallback project."""
+        from ..services.loaders.tasks import TaskLoader
+
+        self.ensure_one()
+        self.state = 'running'
+        self._append_log('=== Merge personal projects -> fallback started ===')
+        self.progress = 0.0
+        self.env.cr.commit()
+
+        try:
+            fallback_project_id = self._ensure_fallback_project()
+            fallback_stage_ids = self._ensure_fallback_project_stages(fallback_project_id)
+            default_stage_id = fallback_stage_ids.get(TaskLoader.DEFAULT_FALLBACK_STAGE_NAME)
+
+            Project = self.env['project.project'].sudo().with_context(active_test=False)
+            Task = self.env['project.task'].sudo().with_context(active_test=False)
+
+            personal_projects = Project.search([('x_bitrix_type', '=', 'personal')])
+            if not personal_projects:
+                self.state = 'done'
+                self.progress = 100.0
+                self._append_log('No personal projects found. Nothing to merge.')
+                self.env.cr.commit()
+                return
+
+            tasks = Task.search([('project_id', 'in', personal_projects.ids)])
+            self._append_log(
+                f'Found personal projects: {len(personal_projects)}; tasks to migrate: {len(tasks)}'
+            )
+
+            status_map = {}
+            bitrix_task_ids = []
+            for task in tasks:
+                if not task.x_bitrix_id:
+                    continue
+                try:
+                    bitrix_task_ids.append(int(task.x_bitrix_id))
+                except (TypeError, ValueError):
+                    continue
+
+            extractor = None
+            if bitrix_task_ids:
+                try:
+                    extractor = self._get_extractor()
+                    status_map = extractor.get_task_status_map(bitrix_task_ids)
+                    self._append_log(
+                        f'Loaded Bitrix statuses for personal-project tasks: {len(status_map)}'
+                    )
+                except Exception as e:
+                    self._append_log(
+                        f'WARNING: could not load Bitrix statuses, using fallback stage defaults: {e}'
+                    )
+                finally:
+                    if extractor:
+                        try:
+                            extractor.close()
+                        except Exception:
+                            _logger.warning('Could not close Bitrix extractor cleanly', exc_info=True)
+
+            stage_to_task_ids = {}
+            unresolved_stage_count = 0
+            for task in tasks:
+                status_code = status_map.get(str(task.x_bitrix_id)) if task.x_bitrix_id else None
+                stage_name = TaskLoader.get_fallback_stage_name_for_status(status_code)
+                stage_id = fallback_stage_ids.get(stage_name) or default_stage_id
+                if not stage_id:
+                    unresolved_stage_count += 1
+                    continue
+                stage_to_task_ids.setdefault(stage_id, []).append(task.id)
+
+            moved_tasks = 0
+            for stage_id, task_ids in stage_to_task_ids.items():
+                batch = Task.browse(task_ids).exists()
+                if not batch:
+                    continue
+                batch.write({'project_id': fallback_project_id, 'stage_id': stage_id})
+                moved_tasks += len(batch)
+
+            personal_projects.write({'active': False})
+
+            self.state = 'done'
+            self.progress = 100.0
+            self._append_log(
+                '=== Merge personal projects -> fallback completed: '
+                f'projects_deactivated={len(personal_projects)}, '
+                f'tasks_moved={moved_tasks}, '
+                f'tasks_without_target_stage={unresolved_stage_count} ==='
+            )
+
+        except Exception:
+            self.env.cr.rollback()
+            self.state = 'error'
+            self._append_log(f'=== MERGE PERSONAL PROJECTS ERROR ===\n{traceback.format_exc()}')
+            _logger.exception('Merge personal projects failed')
+
+        self.env.cr.commit()
+
     def _prepare_employee_user_creation(self):
         from ..services.loaders.employees import EmployeeLoader
 
@@ -680,18 +855,12 @@ class BitrixMigrationRun(models.Model):
             )
 
     def _ensure_user_access_groups(self, user, group_user, task_employee_group, project_group_user, project_group_manager):
-        target_group_ids = {group_user.id, task_employee_group.id}
+        target_group_ids = {group_user.id, task_employee_group.id, project_group_user.id}
         current_group_ids = set(user.group_ids.ids)
         commands = []
 
         for group_id in sorted(target_group_ids - current_group_ids):
             commands.append((4, group_id))
-
-        if (
-            project_group_user.id in current_group_ids
-            and project_group_manager.id not in current_group_ids
-        ):
-            commands.append((3, project_group_user.id))
 
         if commands:
             user.write({'group_ids': commands})

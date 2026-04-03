@@ -31,6 +31,10 @@
                             type="object" class="btn-secondary"
                             invisible="state == 'running'"
                             confirm="Send password reset emails to employee users linked to imported Bitrix employees?"/>
+                    <button name="action_merge_personal_projects_to_fallback" string="Merge Personal Projects"
+                            type="object" class="btn-secondary"
+                            invisible="state == 'running'"
+                            confirm="Move tasks from personal Bitrix projects into fallback project with fixed status stages and deactivate personal projects?"/>
                     <field name="state" widget="statusbar"
                            statusbar_visible="draft,running,done,error"/>
                 </header>

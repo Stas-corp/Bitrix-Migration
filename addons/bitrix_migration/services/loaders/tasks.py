@@ -11,65 +11,47 @@ class TaskLoader(BaseLoader):
 
     entity_type = 'task'
     batch_size = 1000
+    FALLBACK_STAGE_SPECS = (
+        ('Чекає виконання', 0, False),
+        ('Виконується', 1, False),
+        ('Чекає контролю', 2, False),
+        ('Відкладене', 3, False),
+        ('Завершене', 4, True),
+        ('Скасована', 5, True),
+    )
+    DEFAULT_FALLBACK_STAGE_NAME = 'Чекає виконання'
+    STATUS_TO_FALLBACK_STAGE = {
+        1: 'Чекає виконання',
+        2: 'Чекає виконання',
+        3: 'Виконується',
+        4: 'Чекає контролю',
+        5: 'Завершене',
+        6: 'Відкладене',
+        7: 'Скасована',
+    }
 
-    def __init__(self, env, extractor, fallback_project_id=None, **kwargs):
+    def __init__(self, env, extractor, fallback_project_id=None, fallback_stage_ids=None, **kwargs):
         super().__init__(env, extractor, **kwargs)
         self.fallback_project_id = fallback_project_id
+        self.fallback_stage_ids = fallback_stage_ids or {}
         self.fallback_count = 0
+        self._project_follower_cache = {}
 
-    def _build_personal_project_name(self, owner_bitrix_id, user_map, employee_map):
-        bid = str(owner_bitrix_id)
-        employee = self.find_employee_by_bitrix_id(bid, employee_map=employee_map)
-        if employee and employee.name:
-            return f'Bitrix: Личные ({employee.name})'
+    @classmethod
+    def get_fallback_stage_name_for_status(cls, status_code):
+        try:
+            status_int = int(status_code)
+        except (TypeError, ValueError):
+            return cls.DEFAULT_FALLBACK_STAGE_NAME
+        return cls.STATUS_TO_FALLBACK_STAGE.get(status_int, cls.DEFAULT_FALLBACK_STAGE_NAME)
 
-        partner_id = user_map.get(bid)
-        if partner_id:
-            user = self.env['res.users'].sudo().search([('partner_id', '=', partner_id)], limit=1)
-            if user and user.name:
-                return f'Bitrix: Личные ({user.name})'
-
-        return f'Bitrix: Личные ({bid})'
-
-    def _ensure_personal_project(self, owner_bitrix_id, user_map, employee_map):
-        Project = self.env['project.project'].sudo().with_context(active_test=False)
-        owner_bid = str(owner_bitrix_id)
-        project = Project.search([
-            ('x_bitrix_type', '=', 'personal'),
-            ('x_bitrix_owner_bitrix_id', '=', owner_bid),
-        ], limit=1)
-        if project:
-            vals = {}
-            if project.privacy_visibility != 'followers':
-                vals['privacy_visibility'] = 'followers'
-            if not project.active:
-                vals['active'] = True
-            if vals:
-                project.write(vals)
-            return project.id
-
-        vals = {
-            'name': self._build_personal_project_name(owner_bid, user_map, employee_map),
-            'x_bitrix_type': 'personal',
-            'x_bitrix_owner_bitrix_id': owner_bid,
-            'privacy_visibility': 'followers',
-            'active': True,
-        }
-        employee = self.find_employee_by_bitrix_id(owner_bid, employee_map=employee_map)
-        user = self.get_user_from_employee(employee)
-        if not user:
-            partner_id = user_map.get(owner_bid)
-            if partner_id:
-                user = self.env['res.users'].sudo().search([('partner_id', '=', partner_id)], limit=1)
-        if user:
-            vals['user_id'] = user.id
-
-        project = Project.with_context(
-            mail_create_nolog=True,
-            mail_create_nosubscribe=True,
-            tracking_disable=True,
-        ).create(vals)
-        return project.id
+    def _resolve_no_project_stage_id(self, task):
+        if not self.fallback_stage_ids:
+            return False
+        stage_name = self.get_fallback_stage_name_for_status(task.status_code)
+        return self.fallback_stage_ids.get(stage_name) or self.fallback_stage_ids.get(
+            self.DEFAULT_FALLBACK_STAGE_NAME
+        )
 
     def _build_stage_meta_map(self):
         Stage = self.env['project.task.type'].sudo().with_context(active_test=False)
@@ -86,7 +68,7 @@ class TaskLoader(BaseLoader):
             }
         return stage_meta_map
 
-    def _resolve_project_and_stage(self, task, project_map, stage_meta_map, user_map, employee_map):
+    def _resolve_project_and_stage(self, task, project_map, stage_meta_map):
         target_project_id = False
         target_stage_id = False
 
@@ -99,21 +81,14 @@ class TaskLoader(BaseLoader):
                     target_stage_id = stage_meta['id']
             return target_project_id, target_stage_id
 
-        if stage_meta and stage_meta['entity_type'] == 'U':
-            owner_bitrix_id = stage_meta['entity_id']
-            if owner_bitrix_id:
-                target_project_id = self._ensure_personal_project(owner_bitrix_id, user_map, employee_map)
-                target_stage_id = stage_meta['id']
-                return target_project_id, target_stage_id
-
         if self.fallback_project_id:
-            return self.fallback_project_id, False
+            return self.fallback_project_id, self._resolve_no_project_stage_id(task)
 
         return False, False
 
-    def _sync_project_and_stage(self, record, task, project_map, stage_meta_map, user_map, employee_map):
+    def _sync_project_and_stage(self, record, task, project_map, stage_meta_map):
         target_project_id, target_stage_id = self._resolve_project_and_stage(
-            task, project_map, stage_meta_map, user_map, employee_map,
+            task, project_map, stage_meta_map,
         )
 
         vals = {}
@@ -206,12 +181,8 @@ class TaskLoader(BaseLoader):
 
         return employee_ids, user_ids
 
-    def _sync_employee_links(self, record, field_name, rel_table_name, employee_ids, warning_key, warning_message):
+    def _sync_employee_links(self, record, field_name, employee_ids):
         if field_name not in record._fields:
-            return
-
-        if not self.db_table_exists(rel_table_name):
-            self.log_once(warning_key, warning_message)
             return
 
         current_employee_ids = set(record[field_name].ids)
@@ -240,22 +211,12 @@ class TaskLoader(BaseLoader):
         self._sync_employee_links(
             record,
             'x_bitrix_responsible_employee_ids',
-            'project_task_bitrix_employee_rel',
             responsible_employee_ids,
-            'missing_project_task_bitrix_employee_rel',
-            'Skipping employee task links: relation table '
-            '"project_task_bitrix_employee_rel" is missing. '
-            'Upgrade the bitrix_migration module to enable employee-based history.',
         )
         self._sync_employee_links(
             record,
             'x_bitrix_participant_employee_ids',
-            'project_task_bitrix_participant_rel',
             participant_employee_ids,
-            'missing_project_task_bitrix_participant_rel',
-            'Skipping participant task links: relation table '
-            '"project_task_bitrix_participant_rel" is missing. '
-            'Upgrade the bitrix_migration module to enable full participant sync.',
         )
 
         task_fields = record._fields
@@ -263,10 +224,34 @@ class TaskLoader(BaseLoader):
             target_user_ids = sorted(set(user_ids))
             if set(record.user_ids.ids) != set(target_user_ids):
                 record.write({'user_ids': [(6, 0, target_user_ids)]})
+            self._subscribe_project_followers(record.project_id, target_user_ids)
         elif 'user_id' in task_fields:
             target_user_id = user_ids[0] if user_ids else False
             if (record.user_id.id if record.user_id else False) != target_user_id:
                 record.write({'user_id': target_user_id})
+            self._subscribe_project_followers(
+                record.project_id,
+                [target_user_id] if target_user_id else [],
+            )
+
+    def _subscribe_project_followers(self, project, user_ids):
+        if not project or not user_ids:
+            return
+
+        users = self.env['res.users'].sudo().browse(user_ids).exists()
+        partner_ids = set(users.mapped('partner_id').ids)
+        if not partner_ids:
+            return
+
+        cached = self._project_follower_cache.get(project.id)
+        if cached is None:
+            cached = set(project.sudo().message_partner_ids.ids)
+            self._project_follower_cache[project.id] = cached
+
+        missing_partner_ids = sorted(partner_ids - cached)
+        if missing_partner_ids:
+            project.sudo().message_subscribe(partner_ids=missing_partner_ids)
+            cached.update(missing_partner_ids)
 
     def _sync_creator(self, record, task, employee_map):
         """Set x_bitrix_creator_employee_id from task.creator_bitrix_id."""
@@ -331,17 +316,11 @@ class TaskLoader(BaseLoader):
                     vals['user_id'] = False
 
                 odoo_proj_id, odoo_stage_id = self._resolve_project_and_stage(
-                    task, project_map, stage_meta_map, user_map, employee_map,
+                    task, project_map, stage_meta_map,
                 )
                 if odoo_proj_id:
                     vals['project_id'] = odoo_proj_id
-                    stage_meta = stage_meta_map.get(str(task.stage_id)) if task.stage_id else None
-                    if (
-                        self.fallback_project_id
-                        and odoo_proj_id == self.fallback_project_id
-                        and not task.project_external_id
-                        and not (stage_meta and stage_meta.get('entity_type') == 'U')
-                    ):
+                    if self.fallback_project_id and odoo_proj_id == self.fallback_project_id and not task.project_external_id:
                         self.fallback_count += 1
                 elif self.fallback_project_id:
                     vals['project_id'] = self.fallback_project_id
@@ -365,7 +344,7 @@ class TaskLoader(BaseLoader):
 
                 if record and not self.dry_run:
                     self._sync_project_and_stage(
-                        record, task, project_map, stage_meta_map, user_map, employee_map,
+                        record, task, project_map, stage_meta_map,
                     )
                     self._sync_created_at(record, task)
                     self._sync_tags(record, task, tag_name_map)

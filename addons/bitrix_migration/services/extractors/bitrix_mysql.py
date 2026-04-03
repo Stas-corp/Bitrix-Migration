@@ -48,7 +48,8 @@ class BitrixMySQLExtractor:
             t.DESCRIPTION AS description,
             t.STAGE_ID AS stage_id,
             CASE WHEN t.PARENT_ID > 0 THEN t.PARENT_ID ELSE NULL END AS parent_id,
-            t.CREATED_BY AS creator_bitrix_id
+            t.CREATED_BY AS creator_bitrix_id,
+            t.STATUS AS status_code
         FROM b_tasks t
         LEFT JOIN b_tasks_member m ON m.TASK_ID = t.ID AND m.TYPE IN ('R', 'A', 'U')
         WHERE (t.ZOMBIE = 'N' OR t.ZOMBIE IS NULL)
@@ -86,7 +87,8 @@ class BitrixMySQLExtractor:
             t.DESCRIPTION AS description,
             t.STAGE_ID AS stage_id,
             CASE WHEN t.PARENT_ID > 0 THEN t.PARENT_ID ELSE NULL END AS parent_id,
-            t.CREATED_BY AS creator_bitrix_id
+            t.CREATED_BY AS creator_bitrix_id,
+            t.STATUS AS status_code
         FROM b_tasks t
         LEFT JOIN b_tasks_member m ON m.TASK_ID = t.ID AND m.TYPE IN ('R', 'A', 'U')
         WHERE t.ID = %s
@@ -140,7 +142,7 @@ class BitrixMySQLExtractor:
             s.ENTITY_TYPE AS entity_type,
             s.ENTITY_ID AS entity_id
         FROM b_tasks_stages s
-        WHERE s.ENTITY_TYPE IN ('G', 'U')
+        WHERE s.ENTITY_TYPE = 'G'
           AND s.TITLE IS NOT NULL AND s.TITLE != ''
         ORDER BY s.ID
     """
@@ -216,6 +218,11 @@ class BitrixMySQLExtractor:
         FROM b_tasks_member
         WHERE TYPE IN ('R', 'A', 'U', 'O')
         ORDER BY TASK_ID
+    """
+    SQL_TASK_STATUS_BY_IDS_TEMPLATE = """
+        SELECT t.ID AS task_external_id, t.STATUS AS status_code
+        FROM b_tasks t
+        WHERE t.ID IN ({placeholders})
     """
 
     # ── Task Attachments ──────────────────────────────────────────────
@@ -395,7 +402,7 @@ class BitrixMySQLExtractor:
               AND gt.NAME != ''
         ) tags
     """
-    SQL_COUNT_STAGES = "SELECT COUNT(*) AS cnt FROM b_tasks_stages WHERE ENTITY_TYPE IN ('G', 'U') AND TITLE IS NOT NULL AND TITLE != ''"
+    SQL_COUNT_STAGES = "SELECT COUNT(*) AS cnt FROM b_tasks_stages WHERE ENTITY_TYPE = 'G' AND TITLE IS NOT NULL AND TITLE != ''"
     SQL_COUNT_MEETINGS = "SELECT COUNT(*) AS cnt FROM b_calendar_event WHERE IS_MEETING = '1' AND DELETED = 'N' AND ID = PARENT_ID"
 
     def __init__(self, host, port, user, password, database, date_from=None):
@@ -558,6 +565,28 @@ class BitrixMySQLExtractor:
 
     def get_task_members(self):
         return self._execute(self.SQL_TASK_MEMBERS)
+
+    def get_task_status_map(self, task_ids, chunk_size=1000):
+        if not task_ids:
+            return {}
+
+        unique_ids = sorted({int(task_id) for task_id in task_ids if task_id})
+        result = {}
+        for start in range(0, len(unique_ids), chunk_size):
+            chunk = unique_ids[start:start + chunk_size]
+            placeholders = ', '.join(['%s'] * len(chunk))
+            sql = self.SQL_TASK_STATUS_BY_IDS_TEMPLATE.format(placeholders=placeholders)
+            rows = self._execute(sql, tuple(chunk))
+            for row in rows:
+                task_external_id = row.get('task_external_id')
+                if task_external_id is None:
+                    continue
+                try:
+                    status_code = int(row.get('status_code')) if row.get('status_code') is not None else None
+                except (TypeError, ValueError):
+                    status_code = None
+                result[str(task_external_id)] = status_code
+        return result
 
     def get_task_attachments(self):
         sql = self.SQL_TASK_ATTACHMENTS_TEMPLATE.format(

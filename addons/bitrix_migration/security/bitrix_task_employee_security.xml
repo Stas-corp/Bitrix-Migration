@@ -3,13 +3,20 @@
     <record id="group_bitrix_task_employee" model="res.groups">
         <field name="name">Bitrix Task Employee</field>
         <field name="comment">Restricted internal access to Bitrix tasks explicitly assigned to the employee.</field>
-        <field name="implied_ids" eval="[(4, ref('base.group_user'))]"/>
+        <field name="implied_ids" eval="[(4, ref('base.group_user')), (4, ref('project.group_project_user'))]"/>
     </record>
+
+    <function model="res.groups" name="write">
+        <function model="res.groups" name="search">
+            <value eval="[('id', '=', ref('bitrix_migration.group_bitrix_task_employee'))]"/>
+        </function>
+        <value eval="{'implied_ids': [(4, ref('base.group_user')), (4, ref('project.group_project_user'))]}"/>
+    </function>
 
     <record id="rule_project_task_bitrix_task_employee_guard" model="ir.rule">
         <field name="name">Bitrix task employee: guard task visibility</field>
         <field name="model_id" ref="project.model_project_task"/>
-        <field name="domain_force">[(1, '=', 1)] if (not user.has_group('bitrix_migration.group_bitrix_task_employee') or user.has_group('project.group_project_manager') or user.has_group('base.group_system')) else [('user_ids', 'in', user.id)]</field>
+        <field name="domain_force">[(1, '=', 1)] if (not user.has_group('bitrix_migration.group_bitrix_task_employee') or user.has_group('project.group_project_manager') or user.has_group('base.group_system')) else ['|', '|', ('user_ids', 'in', user.id), ('project_id.user_id', '=', user.id), ('project_id.create_uid', '=', user.id)]</field>
         <field name="perm_read" eval="True"/>
         <field name="perm_write" eval="True"/>
         <field name="perm_create" eval="False"/>
@@ -19,7 +26,7 @@
     <record id="rule_project_project_bitrix_task_employee_guard" model="ir.rule">
         <field name="name">Bitrix task employee: guard project visibility</field>
         <field name="model_id" ref="project.model_project_project"/>
-        <field name="domain_force">[(1, '=', 1)] if (not user.has_group('bitrix_migration.group_bitrix_task_employee') or user.has_group('project.group_project_manager') or user.has_group('base.group_system')) else [('task_ids.user_ids', 'in', user.id)]</field>
+        <field name="domain_force">[(1, '=', 1)] if (not user.has_group('bitrix_migration.group_bitrix_task_employee') or user.has_group('project.group_project_manager') or user.has_group('base.group_system')) else ['|', '|', '|', ('user_id', '=', user.id), ('create_uid', '=', user.id), ('task_ids.user_ids', 'in', user.id), ('collaborator_ids.partner_id', '=', user.partner_id.id)]</field>
         <field name="perm_read" eval="True"/>
         <field name="perm_write" eval="False"/>
         <field name="perm_create" eval="False"/>
@@ -29,7 +36,7 @@
     <record id="rule_project_collaborator_bitrix_task_employee_guard" model="ir.rule">
         <field name="name">Bitrix task employee: guard collaborator visibility</field>
         <field name="model_id" ref="project.model_project_collaborator"/>
-        <field name="domain_force">[(1, '=', 1)] if (not user.has_group('bitrix_migration.group_bitrix_task_employee') or user.has_group('project.group_project_manager') or user.has_group('base.group_system')) else [('project_id.task_ids.user_ids', 'in', user.id)]</field>
+        <field name="domain_force">[(1, '=', 1)] if (not user.has_group('bitrix_migration.group_bitrix_task_employee') or user.has_group('project.group_project_manager') or user.has_group('base.group_system')) else ['|', ('partner_id', '=', user.partner_id.id), '|', '|', '|', ('project_id.user_id', '=', user.id), ('project_id.create_uid', '=', user.id), ('project_id.task_ids.user_ids', 'in', user.id), ('project_id.collaborator_ids.partner_id', '=', user.partner_id.id)]</field>
         <field name="perm_read" eval="True"/>
         <field name="perm_write" eval="False"/>
         <field name="perm_create" eval="False"/>

@@ -181,11 +181,9 @@ class EmployeeLoader(BaseLoader):
 
         has_participant_field = (
             'x_bitrix_participant_employee_ids' in Task._fields
-            and self.db_table_exists('project_task_bitrix_participant_rel')
         )
         has_responsible_field = (
             'x_bitrix_responsible_employee_ids' in Task._fields
-            and self.db_table_exists('project_task_bitrix_employee_rel')
         )
         has_creator_field = 'x_bitrix_creator_employee_id' in Task._fields
 

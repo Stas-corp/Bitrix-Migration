@@ -1,5 +1,6 @@
 from . import bitrix_mapping
 from . import bitrix_migration_run
+from . import bitrix_task_employee_link
 from . import project_project
 from . import project_task
 from . import project_task_type
