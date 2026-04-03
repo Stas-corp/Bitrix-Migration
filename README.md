@@ -1,32 +1,42 @@
 # Deploy
 
 ## Первый запуск
+### Для запуска в существующем Odoo нужно только перенести каталог `bitrix_migration` в дерикторию `addons` проекта Odoo, взять `Dockerfile` из корня проекта (он ставит нужные зависимости в окружение) и перейти к пункту №3
 
-```bash
-# 1. Клонировать репозиторий
+1. Клонировать репозиторий
+```
 git clone <repo-url>
 cd Bitrix-Migration
+```
 
-# 2. Создать .env (или отредактировать существующий)
+2. Создать .env (или отредактировать существующий)
+```
 # Обязательно задать POSTGRES_PASSWORD
 cat .env
 # POSTGRES_DB=odoo
 # POSTGRES_USER=odoo
 # POSTGRES_PASSWORD=<your_password>
-
-# 3. Собрать образ и инициализировать базу данных
-docker compose up -d --build db
-docker compose --profile init run --rm odoo-init
-
-# 4. Запустить Odoo
-docker compose up -d odoo
-
-# 5. Дождаться готовности
-docker compose logs -f odoo
-# Ждать строку: "odoo.service.server: HTTP service (werkzeug) running on ..."
 ```
 
-Odoo UI: [http://localhost:8079](http://localhost:8079)
+3. Собрать образ и инициализировать базу данных
+```
+docker compose up -d --build db
+docker compose --profile init run --rm odoo-init
+```
+
+4. Запустить Odoo
+```
+docker compose up -d odoo
+```
+
+5. В случае ошибок, возможно, нужно будет инициализировать модуль вручную в контейнере и перезапустить контейнер.
+```
+docker compose run --rm odoo odoo -d odoo -u bitrix_migration --stop-after-init
+
+docker compose odoo restart
+```
+
+Odoo UI: [http://localhost:8069](http://localhost:8069)
 
 ## Установка модуля
 
