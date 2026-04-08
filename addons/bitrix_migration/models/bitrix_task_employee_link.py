@@ -22,6 +22,10 @@ class BitrixTaskEmployeeLink(models.Model):
     role = fields.Selection(
         [
             ('responsible', 'Responsible'),
+            ('accomplice', 'Accomplice'),
+            ('auditor', 'Auditor'),
+            ('originator', 'Originator'),
+            ('creator', 'Creator'),
             ('participant', 'Participant'),
         ],
         string='Role',

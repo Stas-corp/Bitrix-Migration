@@ -37,8 +37,10 @@ class BitrixMySQLExtractor:
             t.ID AS external_id,
             t.TITLE AS name,
             CASE WHEN t.GROUP_ID > 0 THEN t.GROUP_ID ELSE NULL END AS project_external_id,
-            GROUP_CONCAT(DISTINCT CASE WHEN m.TYPE IN ('R', 'A') THEN m.USER_ID END SEPARATOR ', ') AS responsible_user_ids,
+            GROUP_CONCAT(DISTINCT CASE WHEN m.TYPE = 'R' THEN m.USER_ID END SEPARATOR ', ') AS responsible_user_ids,
+            GROUP_CONCAT(DISTINCT CASE WHEN m.TYPE = 'A' THEN m.USER_ID END SEPARATOR ', ') AS accomplice_user_ids,
             GROUP_CONCAT(DISTINCT CASE WHEN m.TYPE = 'U' THEN m.USER_ID END SEPARATOR ', ') AS auditor_user_ids,
+            GROUP_CONCAT(DISTINCT CASE WHEN m.TYPE = 'O' THEN m.USER_ID END SEPARATOR ', ') AS originator_user_ids,
             (SELECT GROUP_CONCAT(DISTINCT tl.NAME SEPARATOR ', ')
              FROM b_tasks_task_tag tt
              JOIN b_tasks_label tl ON tl.ID = tt.TAG_ID
@@ -51,7 +53,7 @@ class BitrixMySQLExtractor:
             t.CREATED_BY AS creator_bitrix_id,
             t.STATUS AS status_code
         FROM b_tasks t
-        LEFT JOIN b_tasks_member m ON m.TASK_ID = t.ID AND m.TYPE IN ('R', 'A', 'U')
+        LEFT JOIN b_tasks_member m ON m.TASK_ID = t.ID AND m.TYPE IN ('R', 'A', 'U', 'O')
         WHERE (t.ZOMBIE = 'N' OR t.ZOMBIE IS NULL)
           AND {task_where_clause}
         GROUP BY t.ID
@@ -76,8 +78,10 @@ class BitrixMySQLExtractor:
             t.ID AS external_id,
             t.TITLE AS name,
             CASE WHEN t.GROUP_ID > 0 THEN t.GROUP_ID ELSE NULL END AS project_external_id,
-            GROUP_CONCAT(DISTINCT CASE WHEN m.TYPE IN ('R', 'A') THEN m.USER_ID END SEPARATOR ', ') AS responsible_user_ids,
+            GROUP_CONCAT(DISTINCT CASE WHEN m.TYPE = 'R' THEN m.USER_ID END SEPARATOR ', ') AS responsible_user_ids,
+            GROUP_CONCAT(DISTINCT CASE WHEN m.TYPE = 'A' THEN m.USER_ID END SEPARATOR ', ') AS accomplice_user_ids,
             GROUP_CONCAT(DISTINCT CASE WHEN m.TYPE = 'U' THEN m.USER_ID END SEPARATOR ', ') AS auditor_user_ids,
+            GROUP_CONCAT(DISTINCT CASE WHEN m.TYPE = 'O' THEN m.USER_ID END SEPARATOR ', ') AS originator_user_ids,
             (SELECT GROUP_CONCAT(DISTINCT tl.NAME SEPARATOR ', ')
              FROM b_tasks_task_tag tt
              JOIN b_tasks_label tl ON tl.ID = tt.TAG_ID
@@ -90,7 +94,7 @@ class BitrixMySQLExtractor:
             t.CREATED_BY AS creator_bitrix_id,
             t.STATUS AS status_code
         FROM b_tasks t
-        LEFT JOIN b_tasks_member m ON m.TASK_ID = t.ID AND m.TYPE IN ('R', 'A', 'U')
+        LEFT JOIN b_tasks_member m ON m.TASK_ID = t.ID AND m.TYPE IN ('R', 'A', 'U', 'O')
         WHERE t.ID = %s
         GROUP BY t.ID
     """
@@ -349,6 +353,20 @@ class BitrixMySQLExtractor:
         WHERE u.ACTIVE = 'Y'
           AND uu.UF_DEPARTMENT IS NOT NULL
           AND uu.UF_DEPARTMENT != ''
+        ORDER BY u.ID
+    """
+
+    # ── Employee Avatars ───────────────────────────────────────────────
+    SQL_EMPLOYEE_AVATARS = """
+        SELECT
+            u.ID AS user_id,
+            CONCAT('/upload/', bf.SUBDIR, '/', bf.FILE_NAME) AS photo_path,
+            bf.CONTENT_TYPE AS content_type
+        FROM b_user u
+        JOIN b_file bf ON bf.ID = u.PERSONAL_PHOTO
+        WHERE u.ACTIVE = 'Y'
+          AND u.PERSONAL_PHOTO IS NOT NULL
+          AND u.PERSONAL_PHOTO > 0
         ORDER BY u.ID
     """
 
@@ -614,6 +632,14 @@ class BitrixMySQLExtractor:
 
     def get_employees(self):
         return self._execute(self.SQL_EMPLOYEES)
+
+    def get_employee_avatars(self):
+        """Returns list of {user_id, photo_path, content_type}."""
+        try:
+            return self._execute(self.SQL_EMPLOYEE_AVATARS)
+        except Exception as e:
+            _logger.warning('Could not fetch employee avatars: %s', e)
+            return []
 
     def get_employee_telegrams(self):
         """Returns {user_id: telegram} dict.

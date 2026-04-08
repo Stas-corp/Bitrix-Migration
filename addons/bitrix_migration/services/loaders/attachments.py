@@ -85,14 +85,19 @@ class AttachmentLoader(BaseLoader):
         self.log(f'Found {len(raw_attachments)} {attachment_type} attachments')
 
         task_map = self.get_mapping().get_all_mappings('task')
-        comment_map = self.get_mapping().get_all_mappings('comment') if attachment_type == 'comment' else {}
 
-        # Pre-load existing attachment paths for idempotency
-        existing_paths = set()
-        existing_atts = self.env['ir.attachment'].sudo().search_read(
-            [('name', '!=', False)], ['name', 'res_model', 'res_id'],
-        )
-        # We'll use (file_path) as uniqueness check via mapping table
+        # Build message_id lookup for comment attachments
+        message_map = {}
+        if attachment_type == 'comment':
+            msg_recs = self.env['mail.message'].sudo().search_read(
+                [('x_bitrix_message_id', '!=', False)],
+                ['id', 'x_bitrix_message_id'],
+            )
+            for rec in msg_recs:
+                if rec['x_bitrix_message_id']:
+                    message_map[str(rec['x_bitrix_message_id'])] = rec['id']
+
+        # Use compound key for idempotency: entity_type:entity_id:file_path
         existing_att_mappings = self.get_mapping().get_all_mappings('attachment')
 
         processed = 0
@@ -112,8 +117,9 @@ class AttachmentLoader(BaseLoader):
                         attached_at=row.get('attached_at'),
                     )
 
-                    # Use file_path as unique key
-                    if att.file_path in existing_att_mappings:
+                    # Compound uniqueness key: type:entity_id:file_path
+                    compound_key = f'{attachment_type}:{att.entity_id}:{att.file_path}'
+                    if compound_key in existing_att_mappings or att.file_path in existing_att_mappings:
                         self.skipped_count += 1
                         processed += 1
                         continue
@@ -123,8 +129,15 @@ class AttachmentLoader(BaseLoader):
                         res_model = 'project.task'
                         res_id = task_map.get(str(att.entity_id))
                     elif attachment_type == 'comment':
-                        res_model = 'project.task'
-                        res_id = task_map.get(str(att.entity_id))
+                        # Link to mail.message if we can find it
+                        msg_id = message_map.get(str(att.forum_message_id)) if att.forum_message_id else None
+                        if msg_id:
+                            res_model = 'mail.message'
+                            res_id = msg_id
+                        else:
+                            # Fallback: link to task
+                            res_model = 'project.task'
+                            res_id = task_map.get(str(att.entity_id))
                     else:
                         res_model = None
                         res_id = None
@@ -155,7 +168,7 @@ class AttachmentLoader(BaseLoader):
                                 'mimetype': att.content_type,
                             })
                             self.get_mapping().set_mapping(
-                                att.file_path, 'attachment', 'ir.attachment', ir_att.id,
+                                compound_key, 'attachment', 'ir.attachment', ir_att.id,
                             )
                             self.created_count += 1
                         except Exception as e:

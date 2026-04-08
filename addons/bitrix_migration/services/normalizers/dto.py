@@ -104,7 +104,9 @@ class BitrixTask(BaseModel):
     name: str
     project_external_id: Optional[int] = None
     responsible_user_ids: Optional[str] = None
+    accomplice_user_ids: Optional[str] = None
     auditor_user_ids: Optional[str] = None
+    originator_user_ids: Optional[str] = None
     tags: Optional[str] = None
     date_deadline: Optional[datetime] = None
     date_created: Optional[datetime] = None
@@ -124,7 +126,8 @@ class BitrixTask(BaseModel):
     def clean_int(cls, v):
         return _to_int_or_none(v)
 
-    @field_validator('responsible_user_ids', 'auditor_user_ids', 'tags', 'description', mode='before')
+    @field_validator('responsible_user_ids', 'accomplice_user_ids', 'auditor_user_ids',
+                     'originator_user_ids', 'tags', 'description', mode='before')
     @classmethod
     def clean_str(cls, v):
         return _clean_str(v)
@@ -262,6 +265,36 @@ class BitrixEmployee(BaseModel):
     @classmethod
     def clean_login(cls, v):
         return _clean_str(v) or ''
+
+
+class BitrixMeeting(BaseModel):
+    external_id: int
+    name: str
+    date_start: Optional[datetime] = None
+    date_end: Optional[datetime] = None
+    participant_bitrix_ids: Optional[str] = None
+    organizer_bitrix_id: Optional[int] = None
+    description: Optional[str] = None
+
+    @field_validator('name', mode='before')
+    @classmethod
+    def clean_name(cls, v):
+        return _clean_str(v) or 'Untitled Meeting'
+
+    @field_validator('organizer_bitrix_id', mode='before')
+    @classmethod
+    def clean_int(cls, v):
+        return _to_int_or_none(v)
+
+    @field_validator('participant_bitrix_ids', 'description', mode='before')
+    @classmethod
+    def clean_str(cls, v):
+        return _clean_str(v)
+
+    @field_validator('date_start', 'date_end', mode='before')
+    @classmethod
+    def clean_date(cls, v):
+        return _to_datetime(v)
 
 
 class BitrixAttachment(BaseModel):

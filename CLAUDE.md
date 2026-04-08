@@ -31,12 +31,14 @@ addons/bitrix_migration/
 │   │   ├── tasks.py
 │   │   ├── tasks_relink.py       # Второй проход: parent_id + cycle detection
 │   │   ├── comments.py
-│   │   ├── attachments.py        # SFTP → Odoo ir.attachment
+│   │   ├── attachments.py        # SFTP → Odoo ir.attachment (compound key, comment linking)
 │   │   ├── users.py
 │   │   ├── departments.py
-│   │   └── employees.py
+│   │   ├── employees.py          # + SFTP avatar sync
+│   │   └── meetings.py           # MeetingLoader → calendar.event
 │   └── normalizers/
-│       └── dto.py                # Pydantic DTOs: BitrixProject, BitrixTask, BitrixEmployee, ...
+│       ├── dto.py                # Pydantic DTOs: BitrixProject, BitrixTask, BitrixMeeting, ...
+│       └── bitrix_markup.py      # BBCode → HTML конвертер для Bitrix markup
 └── views/
     ├── bitrix_migration_run_views.xml
     ├── hr_employee_views.xml
@@ -75,6 +77,8 @@ addons/bitrix_migration/
 | `hr` | Отделы + сотрудники |
 | `departments_only` | Только отделы |
 | `employees_only` | Только сотрудники |
+| `fix_roles` | Пересинхронизация ролей у уже импортированных задач |
+| `meetings` | Только зустрічі (calendar.event) |
 
 ### Создание пользователей
 После импорта сотрудников: кнопки на форме `BitrixMigrationRun`:
@@ -93,14 +97,64 @@ Pydantic v2. Все поля валидируются через `field_validato
 | `project.project` | `x_bitrix_id` | Integer | Bitrix ID проекта |
 | `project.task` | `x_bitrix_id` | Integer | Bitrix ID задачи |
 | `project.task` | `x_bitrix_created_at` | Datetime | Оригинальная дата создания |
-| `project.task` | `x_bitrix_responsible_employee_ids` | Many2many hr.employee | Исполнители-сотрудники |
+| `project.task` | `x_bitrix_responsible_employee_ids` | Many2many hr.employee (computed) | Відповідальний (Bitrix TYPE='R') |
+| `project.task` | `x_bitrix_accomplice_employee_ids` | Many2many hr.employee (computed) | Співвиконавці (Bitrix TYPE='A') |
+| `project.task` | `x_bitrix_auditor_employee_ids` | Many2many hr.employee (computed) | Наглядачі (Bitrix TYPE='U') |
+| `project.task` | `x_bitrix_originator_employee_id` | Many2one hr.employee (computed) | Постановник (Bitrix TYPE='O') |
+| `project.task` | `x_bitrix_creator_employee_id` | Many2one hr.employee | Автор (CREATED_BY) |
 | `project.task.type` | `x_bitrix_id` | Integer | Bitrix ID стадии |
 | `hr.employee` | `x_bitrix_id` | Integer | Bitrix user ID |
 | `hr.employee` | `x_bitrix_telegram` | Char | Telegram-логин |
 | `hr.department` | `x_bitrix_id` | Integer | Bitrix dept ID |
 | `mail.message` | `x_bitrix_id` | Integer | Bitrix comment ID |
+| `mail.message` | `x_bitrix_message_id` | Integer | Bitrix forum_message_id (для прив'язки вкладень) |
 | `mail.message` | `x_bitrix_author_employee_id` | Many2one hr.employee | Автор-сотрудник |
 | `calendar.event` | `x_bitrix_id` | Integer | Bitrix meeting ID |
+
+## Маппинг ролей Bitrix → Odoo
+
+| Bitrix TYPE | Bitrix роль | Odoo поле | role в link-таблице | Попадает в user_ids? |
+|---|---|---|---|---|
+| `R` | Відповідальний | `x_bitrix_responsible_employee_ids` | `responsible` | Да |
+| `A` | Співвиконавець | `x_bitrix_accomplice_employee_ids` | `accomplice` | Да |
+| `U` | Наглядач | `x_bitrix_auditor_employee_ids` | `auditor` | Нет |
+| `O` | Постановник | `x_bitrix_originator_employee_id` | `originator` | Нет |
+| `CREATED_BY` | Автор/Creator | `x_bitrix_creator_employee_id` | — (прямое Many2one) | Нет |
+
+Все роли хранятся в `bitrix.task.employee.link` (task_id, employee_id, role) с UNIQUE constraint.
+В Odoo `user_ids` содержит **только** відповідального + співвиконавців. Наглядачі, постановник и автор туда не попадают.
+
+## Нормализация Bitrix markup
+
+Модуль `services/normalizers/bitrix_markup.py` конвертирует BBCode-подобную разметку Bitrix в HTML для Odoo.
+Применяется к: описаниям задач, описаниям проектов, телам комментариев, описаниям зустрічей.
+
+Основные преобразования:
+- `[USER=ID]Name[/USER]` → `<strong>Resolved Name</strong>` (через маппинг hr.employee.x_bitrix_id → name)
+- `[B]`, `[I]`, `[U]`, `[S]` → `<strong>`, `<em>`, `<u>`, `<s>`
+- `[URL=href]text[/URL]` → `<a href="href">text</a>`
+- `[LIST][*]item[/LIST]` → `<ul><li>item</li></ul>`
+- `[CODE]...[/CODE]` → `<pre><code>...</code></pre>`
+- `[DISK FILE ID=N]` → удаляется (файлы обрабатываются через attachments)
+- Переносы строк → `<br/>` (кроме блоков `<pre>`)
+
+`build_employee_name_map(env)` строит словарь `{str(bitrix_user_id): name}` из hr.employee для резолва `[USER=]` тегов.
+
+## Вкладення (attachments)
+
+Ключ ідемпотентності: `{entity_type}:{entity_id}:{file_path}` (compound key).
+Вкладення коментарів прив'язуються до `mail.message` через `x_bitrix_message_id = forum_message_id`.
+Якщо відповідний `mail.message` не знайдено — fallback на `project.task`.
+
+## Аватарки співробітників
+
+`EmployeeLoader.sync_avatars()` завантажує фото через SFTP з `b_user.PERSONAL_PHOTO → b_file`.
+Політика: фото встановлюється тільки якщо `image_1920` порожнє (безпечний rerun).
+
+## Архівування закритих проєктів
+
+Проєкти з `x_bitrix_closed=True` автоматично отримують `active=False` в Odoo (архівування).
+Це відбувається в `ProjectLoader` після створення/оновлення запису.
 
 ## Важные нюансы
 
@@ -129,3 +183,16 @@ docker compose exec odoo odoo shell -d odoo
 
 Odoo UI: http://localhost:8079
 Модуль обновляется через Settings → Apps → Upgrade или `-u bitrix_migration`.
+
+## Тесты
+
+```bash
+# Запуск тестов модуля
+docker compose exec odoo odoo --test-enable -d odoo -u bitrix_migration --stop-after-init
+```
+
+Тесты находятся в `tests/`:
+- `test_role_mapping.py` — маппинг ролей Bitrix → Odoo (Этап 1)
+- `test_markup_normalizer.py` — BBCode → HTML конвертация (Этап 2)
+- `test_attachments.py` — ідемпотентність вкладень, прив'язка до коментарів (Этап 2)
+- `test_meetings.py` — створення calendar.event з даними зустрічей (Этап 2)

@@ -9,3 +9,4 @@ from . import comments
 from . import attachments
 from . import departments
 from . import employees
+from . import meetings

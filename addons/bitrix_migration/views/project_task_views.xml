@@ -16,16 +16,34 @@
                 <attribute name="groups">project.group_project_user,project.group_project_manager</attribute>
             </xpath>
             <xpath expr="//field[@name='user_ids']" position="after">
-                <field name="x_bitrix_creator_employee_id"
-                       readonly="1"
-                       optional="show"
-                       invisible="not x_bitrix_creator_employee_id"
-                       string="Bitrix Creator"/>
                 <field name="x_bitrix_responsible_employee_ids"
                        widget="many2many_tags"
                        readonly="1"
                        optional="show"
-                       invisible="not x_bitrix_responsible_employee_ids"/>
+                       invisible="not x_bitrix_responsible_employee_ids"
+                       string="Відповідальний"/>
+                <field name="x_bitrix_accomplice_employee_ids"
+                       widget="many2many_tags"
+                       readonly="1"
+                       optional="show"
+                       invisible="not x_bitrix_accomplice_employee_ids"
+                       string="Співвиконавці"/>
+                <field name="x_bitrix_auditor_employee_ids"
+                       widget="many2many_tags"
+                       readonly="1"
+                       optional="show"
+                       invisible="not x_bitrix_auditor_employee_ids"
+                       string="Наглядачі"/>
+                <field name="x_bitrix_originator_employee_id"
+                       readonly="1"
+                       optional="show"
+                       invisible="not x_bitrix_originator_employee_id"
+                       string="Постановник"/>
+                <field name="x_bitrix_creator_employee_id"
+                       readonly="1"
+                       optional="show"
+                       invisible="not x_bitrix_creator_employee_id"
+                       string="Автор"/>
             </xpath>
             <xpath expr="//page[@name='extra_info']/group/group[2]" position="inside">
                 <field name="x_bitrix_created_at"

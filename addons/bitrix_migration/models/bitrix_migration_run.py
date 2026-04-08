@@ -22,6 +22,8 @@ class BitrixMigrationRun(models.Model):
         ('relink', 'Relink Parents'),
         ('comments', 'Comments Only'),
         ('single_task', 'Single Task Test'),
+        ('fix_roles', 'Fix Roles (re-sync task roles)'),
+        ('meetings', 'Meetings Only'),
     ], required=True, default='dry_run', string='Mode',
         help='Режим виконання міграції. Для першого запуску рекомендовано Dry Run, '
              'далі Full або Pilot.')
@@ -151,6 +153,10 @@ class BitrixMigrationRun(models.Model):
                 self._run_departments_only(extractor)
             elif self.mode == 'employees_only':
                 self._run_employees_only(extractor)
+            elif self.mode == 'fix_roles':
+                self._run_fix_roles(extractor)
+            elif self.mode == 'meetings':
+                self._run_meetings(extractor)
 
             self.state = 'done'
             self.progress = 100.0
@@ -307,6 +313,7 @@ class BitrixMigrationRun(models.Model):
         from ..services.loaders.tasks_relink import TaskRelinkLoader
         from ..services.loaders.comments import CommentLoader
         from ..services.loaders.attachments import AttachmentLoader
+        from ..services.loaders.meetings import MeetingLoader
         fallback_project_id = self._ensure_fallback_project()
         fallback_stage_ids = self._ensure_fallback_project_stages(fallback_project_id)
 
@@ -324,6 +331,7 @@ class BitrixMigrationRun(models.Model):
                 'preserve_authorship': self.preserve_authorship,
                 'fallback_system_author': self.fallback_system_author,
             }),
+            ('Meetings', MeetingLoader, {}),
         ]
 
         # Add attachment steps only if SFTP is configured
@@ -590,6 +598,16 @@ class BitrixMigrationRun(models.Model):
 
         dept_map = self.env['bitrix.migration.mapping'].sudo().get_all_mappings('department')
 
+        sftp_kwargs = {}
+        if self.sftp_host:
+            sftp_kwargs = {
+                'sftp_host': self.sftp_host,
+                'sftp_port': self.sftp_port,
+                'sftp_user': self.sftp_user,
+                'sftp_key_path': self.sftp_key_path,
+                'sftp_base_path': self.sftp_base_path or '/home/bitrix/www',
+            }
+
         self._append_log('\n--- Employees ---')
         emp_loader = EmployeeLoader(
             self.env, extractor,
@@ -597,8 +615,74 @@ class BitrixMigrationRun(models.Model):
             dept_map=dept_map,
             dry_run=dry_run,
             log_callback=self._append_log,
+            **sftp_kwargs,
         )
         emp_loader.run()
+
+        if self.sftp_host and not dry_run:
+            self._append_log('\n--- Employee Avatars ---')
+            emp_loader.sync_avatars()
+
+    def _run_meetings(self, extractor):
+        """Migrate Bitrix meetings into calendar.event."""
+        from ..services.loaders.meetings import MeetingLoader
+
+        self._append_log('\n--- Meetings ---')
+        loader = MeetingLoader(
+            env=self.env,
+            extractor=extractor,
+            dry_run=False,
+            log_callback=self._append_log,
+        )
+        loader.run()
+
+    def _run_fix_roles(self, extractor):
+        """Re-sync roles for already imported tasks without re-creating them."""
+        from ..services.loaders.tasks import TaskLoader
+
+        self._append_log('\n--- Fix Roles: re-syncing task participant roles ---')
+        user_map = self.env['bitrix.migration.mapping'].sudo().get_all_mappings('user')
+        employee_map = self.env['bitrix.migration.mapping'].sudo().get_all_mappings('employee')
+
+        raw_tasks = extractor.get_tasks()
+        self._append_log(f'Fetched {len(raw_tasks)} tasks from Bitrix')
+
+        from ..services.normalizers.dto import BitrixTask
+        loader = TaskLoader(
+            env=self.env,
+            extractor=extractor,
+            dry_run=False,
+            log_callback=self._append_log,
+        )
+
+        Task = self.env['project.task'].sudo().with_context(active_test=False)
+        updated = 0
+        skipped = 0
+
+        for row in raw_tasks:
+            task = BitrixTask(**row)
+            bid = str(task.external_id)
+            record = Task.search([('x_bitrix_id', '=', bid)], limit=1)
+            if not record:
+                skipped += 1
+                continue
+
+            # Clear old link records for this task before re-syncing
+            self.env['bitrix.task.employee.link'].sudo().search([
+                ('task_id', '=', record.id),
+            ]).unlink()
+
+            loader._sync_assignees(record, task, user_map, employee_map)
+            loader._sync_creator(record, task, employee_map)
+            updated += 1
+
+            if updated % 500 == 0:
+                self.env.cr.commit()
+                self._append_log(f'  ... processed {updated} tasks')
+
+        self.env.cr.commit()
+        self._append_log(f'Fix Roles complete: updated={updated}, skipped (not found)={skipped}')
+        self._run_reconciliation()
 
     def _run_reconciliation(self):
         """Print reconciliation report."""
@@ -632,6 +716,82 @@ class BitrixMigrationRun(models.Model):
             ])
         for label, count in checks.items():
             self._append_log(f'  {label}: {count}')
+
+        # Role quality checks
+        self._append_log('\n--- ROLE QUALITY ---')
+        Link = self.env['bitrix.task.employee.link'].sudo()
+        Task = self.env['project.task'].sudo().with_context(active_test=False)
+        bitrix_tasks = Task.search([('x_bitrix_id', '!=', False)])
+        bitrix_task_ids = bitrix_tasks.ids
+
+        # Tasks without any responsible
+        tasks_with_responsible = set(
+            Link.search([('role', '=', 'responsible'), ('task_id', 'in', bitrix_task_ids)])
+            .mapped('task_id').ids
+        )
+        no_responsible = len(bitrix_task_ids) - len(tasks_with_responsible)
+        self._append_log(f'  Tasks without responsible: {no_responsible}')
+
+        # Tasks with >1 responsible
+        self.env.cr.execute("""
+            SELECT task_id, COUNT(*) AS cnt
+            FROM bitrix_task_employee_link
+            WHERE role = 'responsible' AND task_id = ANY(%s)
+            GROUP BY task_id
+            HAVING COUNT(*) > 1
+        """, (bitrix_task_ids,))
+        multi_responsible = len(self.env.cr.fetchall())
+        self._append_log(f'  Tasks with >1 responsible: {multi_responsible}')
+
+        # Role distribution
+        for role in ('responsible', 'accomplice', 'auditor', 'originator', 'creator'):
+            count = Link.search_count([('role', '=', role), ('task_id', 'in', bitrix_task_ids)])
+            self._append_log(f'  Link records ({role}): {count}')
+
+        # Stage 2 quality checks
+        self._append_log('\n--- CONTENT QUALITY ---')
+
+        # Comments with raw Bitrix markup
+        Message = self.env['mail.message'].sudo()
+        raw_markup_patterns = ['[USER=', '[B]', '[/B]', '[URL=', '[I]', '[/I]']
+        raw_markup_count = 0
+        for pattern in raw_markup_patterns:
+            raw_markup_count += Message.search_count([
+                ('x_bitrix_message_id', '!=', False),
+                ('body', 'like', pattern),
+            ])
+        self._append_log(f'  Comments with raw Bitrix markup: {raw_markup_count}')
+
+        # Employees without photo
+        Employee = self.env['hr.employee'].sudo().with_context(active_test=False)
+        emp_total = Employee.search_count([('x_bitrix_id', '!=', 0)])
+        emp_with_photo = Employee.search_count([
+            ('x_bitrix_id', '!=', 0),
+            ('image_1920', '!=', False),
+        ])
+        self._append_log(f'  Employees: {emp_total} total, {emp_with_photo} with photo')
+
+        # Tasks without stage
+        tasks_no_stage = Task.search_count([
+            ('x_bitrix_id', '!=', False),
+            ('stage_id', '=', False),
+        ])
+        self._append_log(f'  Tasks without stage: {tasks_no_stage}')
+
+        # Meetings imported
+        meetings_count = self.env['calendar.event'].sudo().search_count([
+            ('x_bitrix_id', '!=', False),
+        ])
+        self._append_log(f'  Meetings imported: {meetings_count}')
+
+        # Archived (closed) projects
+        archived_projects = self.env['project.project'].sudo().with_context(
+            active_test=False,
+        ).search_count([
+            ('x_bitrix_id', '!=', False),
+            ('active', '=', False),
+        ])
+        self._append_log(f'  Archived (closed) projects: {archived_projects}')
 
     def _normalize_login(self, value, fallback='bitrix_user'):
         value = (value or '').strip().lower()

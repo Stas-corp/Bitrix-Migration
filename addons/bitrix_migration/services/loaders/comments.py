@@ -1,6 +1,7 @@
 import logging
 
 from ..normalizers.dto import BitrixComment
+from ..normalizers.bitrix_markup import normalize_bitrix_markup, build_employee_name_map
 from .base import BaseLoader
 
 _logger = logging.getLogger(__name__)
@@ -108,6 +109,7 @@ class CommentLoader(BaseLoader):
         task_map = self.get_mapping().get_all_mappings('task')
         user_map = self.get_mapping().get_all_mappings('user')
         employee_map = self.get_mapping().get_all_mappings('employee')
+        employee_name_map = build_employee_name_map(self.env)
         can_store_employee_author = self.db_column_exists(
             'mail_message', 'x_bitrix_author_employee_id',
         )
@@ -179,7 +181,9 @@ class CommentLoader(BaseLoader):
                     vals = {
                         'model': 'project.task',
                         'res_id': odoo_task_id,
-                        'body': comment.body or '',
+                        'body': normalize_bitrix_markup(
+                            comment.body or '', employee_name_map,
+                        ),
                         'message_type': 'comment',
                         'author_id': author_data['author_id'] or system_partner_id,
                         'x_bitrix_message_id': msg_id_str,

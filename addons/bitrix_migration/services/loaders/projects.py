@@ -1,6 +1,7 @@
 import logging
 
 from ..normalizers.dto import BitrixProject
+from ..normalizers.bitrix_markup import normalize_bitrix_markup, build_employee_name_map
 from .base import BaseLoader
 
 _logger = logging.getLogger(__name__)
@@ -18,6 +19,7 @@ class ProjectLoader(BaseLoader):
         self.log(f'Found {len(raw)} projects')
 
         user_mapping = self.get_mapping().get_all_mappings('user')
+        employee_name_map = build_employee_name_map(self.env)
         tag_name_to_id = self._build_tag_name_map()
 
         processed = 0
@@ -27,7 +29,9 @@ class ProjectLoader(BaseLoader):
 
                 vals = {
                     'name': proj.name,
-                    'description': proj.description or '',
+                    'description': normalize_bitrix_markup(
+                        proj.description or '', employee_name_map,
+                    ),
                     'x_bitrix_id': str(proj.external_id),
                     'x_bitrix_type': proj.type,
                     'x_bitrix_closed': proj.closed,
@@ -59,8 +63,15 @@ class ProjectLoader(BaseLoader):
                     entity_type='project',
                 )
 
-                if record and not self.dry_run and record.privacy_visibility != 'followers':
-                    record.write({'privacy_visibility': 'followers'})
+                if record and not self.dry_run:
+                    update_vals = {}
+                    if record.privacy_visibility != 'followers':
+                        update_vals['privacy_visibility'] = 'followers'
+                    # Archive closed Bitrix projects
+                    if proj.closed and record.active:
+                        update_vals['active'] = False
+                    if update_vals:
+                        record.write(update_vals)
 
                 # Resolve tags
                 if created and record and proj.tags:

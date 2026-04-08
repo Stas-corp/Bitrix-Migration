@@ -1,6 +1,7 @@
 import logging
 
 from ..normalizers.dto import BitrixTask
+from ..normalizers.bitrix_markup import normalize_bitrix_markup, build_employee_name_map
 from .base import BaseLoader
 
 _logger = logging.getLogger(__name__)
@@ -190,33 +191,63 @@ class TaskLoader(BaseLoader):
         if current_employee_ids != target_employee_ids:
             record.write({field_name: [(6, 0, sorted(target_employee_ids))]})
 
+    def _sync_employee_m2o_link(self, record, field_name, employee_id):
+        if field_name not in record._fields:
+            return
+        current_id = record[field_name].id if record[field_name] else False
+        if current_id != (employee_id or False):
+            record.write({field_name: employee_id or False})
+
     def _sync_assignees(self, record, task, user_map, employee_map):
+        # Parse each role separately
         responsible_bitrix_ids = self._split_bitrix_user_ids(task.responsible_user_ids)
+        accomplice_bitrix_ids = self._split_bitrix_user_ids(task.accomplice_user_ids)
         auditor_bitrix_ids = self._split_bitrix_user_ids(task.auditor_user_ids)
-        creator_bitrix_ids = [str(task.creator_bitrix_id)] if task.creator_bitrix_id else []
+        originator_bitrix_ids = self._split_bitrix_user_ids(task.originator_user_ids)
 
-        participant_bitrix_ids = self._merge_bitrix_user_ids(
-            responsible_bitrix_ids,
-            auditor_bitrix_ids,
-            creator_bitrix_ids,
-        )
-
-        responsible_employee_ids, _ = self._resolve_task_users(
+        # Resolve employees and users per role
+        responsible_employee_ids, responsible_user_ids = self._resolve_task_users(
             responsible_bitrix_ids, user_map, employee_map,
         )
-        participant_employee_ids, user_ids = self._resolve_task_users(
-            participant_bitrix_ids, user_map, employee_map,
+        accomplice_employee_ids, accomplice_user_ids = self._resolve_task_users(
+            accomplice_bitrix_ids, user_map, employee_map,
+        )
+        auditor_employee_ids, _ = self._resolve_task_users(
+            auditor_bitrix_ids, user_map, employee_map,
+        )
+        originator_employee_ids, _ = self._resolve_task_users(
+            originator_bitrix_ids, user_map, employee_map,
         )
 
+        # Sync employee links per role
         self._sync_employee_links(
-            record,
-            'x_bitrix_responsible_employee_ids',
-            responsible_employee_ids,
+            record, 'x_bitrix_responsible_employee_ids', responsible_employee_ids,
         )
         self._sync_employee_links(
-            record,
-            'x_bitrix_participant_employee_ids',
-            participant_employee_ids,
+            record, 'x_bitrix_accomplice_employee_ids', accomplice_employee_ids,
+        )
+        self._sync_employee_links(
+            record, 'x_bitrix_auditor_employee_ids', auditor_employee_ids,
+        )
+        # Originator is Many2one — take first
+        originator_eid = originator_employee_ids[0] if originator_employee_ids else False
+        self._sync_employee_m2o_link(
+            record, 'x_bitrix_originator_employee_id', originator_eid,
+        )
+
+        # Warn if multiple responsible
+        if len(responsible_employee_ids) > 1:
+            self.log_once(
+                f'multi_responsible_{record.x_bitrix_id}',
+                f'Task {record.x_bitrix_id} has {len(responsible_employee_ids)} responsible employees',
+            )
+
+        # user_ids = only responsible + accomplice (not auditors, originator, creator)
+        assignee_user_ids = self._merge_bitrix_user_ids(
+            responsible_bitrix_ids, accomplice_bitrix_ids,
+        )
+        _, user_ids = self._resolve_task_users(
+            assignee_user_ids, user_map, employee_map,
         )
 
         task_fields = record._fields
@@ -285,6 +316,7 @@ class TaskLoader(BaseLoader):
         project_map = self.get_mapping().get_all_mappings('project')
         user_map = self.get_mapping().get_all_mappings('user')
         employee_map = self.get_mapping().get_all_mappings('employee')
+        employee_name_map = build_employee_name_map(self.env)
         tag_name_map = self._build_tag_name_map()
         stage_meta_map = self._build_stage_meta_map()
 
@@ -305,7 +337,9 @@ class TaskLoader(BaseLoader):
                 bid = str(task.external_id)
                 vals = {
                     'name': task.name,
-                    'description': task.description or '',
+                    'description': normalize_bitrix_markup(
+                        task.description or '', employee_name_map,
+                    ),
                     'x_bitrix_id': bid,
                     'x_bitrix_stage_id': str(task.stage_id) if task.stage_id else '',
                     'x_bitrix_parent_id': str(task.parent_id) if task.parent_id else '',

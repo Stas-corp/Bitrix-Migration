@@ -1,3 +1,4 @@
+import base64
 import logging
 
 from .base import BaseLoader
@@ -11,12 +12,22 @@ class EmployeeLoader(BaseLoader):
     entity_type = 'employee'
     batch_size = 200
 
-    def __init__(self, env, extractor, user_map=None, dept_map=None, **kwargs):
+    def __init__(self, env, extractor, user_map=None, dept_map=None,
+                 sftp_host=None, sftp_port=22, sftp_user=None,
+                 sftp_key_path=None, sftp_base_path='/home/bitrix/www',
+                 **kwargs):
         super().__init__(env, extractor, **kwargs)
         # user_map: {str(bitrix_user_id): odoo_partner_id}
         self.user_map = user_map or {}
         # dept_map: {str(bitrix_dept_id): odoo_dept_id}
         self.dept_map = dept_map or {}
+        # SFTP for avatar downloads
+        self.sftp_host = sftp_host
+        self.sftp_port = sftp_port
+        self.sftp_user = sftp_user
+        self.sftp_key_path = sftp_key_path
+        self.sftp_base_path = (sftp_base_path or '/home/bitrix/www').rstrip('/')
+        self._sftp = None
 
     def run(self):
         self.log('Extracting Bitrix employees...')
@@ -245,3 +256,98 @@ class EmployeeLoader(BaseLoader):
             [('partner_id', '=', partner_id)], limit=1
         )
         return user.id if user else None
+
+    # ── Avatar support ───────────────────────────────────────────────
+
+    def _get_sftp(self):
+        if self._sftp is not None:
+            return self._sftp
+        if not self.sftp_host:
+            return None
+        try:
+            import paramiko
+            ssh = paramiko.SSHClient()
+            ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            connect_kwargs = {
+                'hostname': self.sftp_host,
+                'port': self.sftp_port,
+                'username': self.sftp_user,
+            }
+            if self.sftp_key_path:
+                connect_kwargs['key_filename'] = self.sftp_key_path
+            ssh.connect(**connect_kwargs)
+            self._sftp = ssh.open_sftp()
+            return self._sftp
+        except Exception as e:
+            self.log(f'SFTP connection failed for avatars: {e}')
+            return None
+
+    def _close_sftp(self):
+        if self._sftp:
+            try:
+                self._sftp.close()
+            except Exception:
+                pass
+            self._sftp = None
+
+    def sync_avatars(self):
+        """Download and set employee avatars from Bitrix.
+
+        Policy: only set image if employee has no image yet (safe rerun).
+        """
+        if not self.sftp_host:
+            self.log('Skipping avatars: SFTP not configured')
+            return
+
+        avatar_rows = self.extractor.get_employee_avatars()
+        if not avatar_rows:
+            self.log('No employee avatars found in Bitrix')
+            return
+
+        self.log(f'Found {len(avatar_rows)} employee avatars in Bitrix')
+        Employee = self.env['hr.employee'].sudo().with_context(active_test=False)
+        sftp = self._get_sftp()
+        if not sftp:
+            return
+
+        imported = 0
+        skipped = 0
+        errors = 0
+
+        try:
+            for row in avatar_rows:
+                user_id = str(row['user_id'])
+                photo_path = row.get('photo_path', '')
+                if not photo_path:
+                    continue
+
+                employee = Employee.search([('x_bitrix_id', '=', int(user_id))], limit=1)
+                if not employee:
+                    skipped += 1
+                    continue
+
+                # Safe rerun: skip if employee already has an image
+                if employee.image_1920:
+                    skipped += 1
+                    continue
+
+                full_path = self.sftp_base_path + photo_path
+                try:
+                    with sftp.open(full_path, 'rb') as f:
+                        data = f.read()
+                    employee.write({'image_1920': base64.b64encode(data)})
+                    imported += 1
+                except FileNotFoundError:
+                    errors += 1
+                except Exception as e:
+                    errors += 1
+                    _logger.warning('Avatar download error for user %s: %s', user_id, e)
+
+                if imported % 50 == 0 and imported > 0:
+                    self.env.cr.commit()
+
+        finally:
+            self._close_sftp()
+
+        self.env.cr.commit()
+        self.log(f'Avatars: imported={imported}, skipped={skipped}, errors={errors}')
