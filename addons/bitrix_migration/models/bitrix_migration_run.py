@@ -121,6 +121,20 @@ class BitrixMigrationRun(models.Model):
     ], default='draft', string='State')
     progress = fields.Float(string='Progress', default=0.0)
 
+    # Avatar background-stage progress (read-only, managed by cron worker)
+    avatar_sync_state = fields.Selection([
+        ('pending', 'Pending'),
+        ('running', 'Running'),
+        ('done', 'Done'),
+        ('error', 'Error'),
+    ], string='Avatar Sync State', readonly=True)
+    avatar_last_user_id = fields.Integer(string='Avatar Last User ID', readonly=True, default=0)
+    avatar_total_count = fields.Integer(string='Avatar Total Count', readonly=True, default=0)
+    avatar_processed_count = fields.Integer(string='Avatar Processed', readonly=True, default=0)
+    avatar_imported_count = fields.Integer(string='Avatar Imported', readonly=True, default=0)
+    avatar_propagated_count = fields.Integer(string='Avatar Propagated', readonly=True, default=0)
+    avatar_error_count = fields.Integer(string='Avatar Errors', readonly=True, default=0)
+
     def _append_log(self, message):
         self.ensure_one()
         try:
@@ -658,8 +672,145 @@ class BitrixMigrationRun(models.Model):
         emp_loader.run()
 
         if not dry_run:
-            self._append_log('\n--- Employee Avatars ---')
-            emp_loader.sync_avatars()
+            self._schedule_avatar_sync(extractor)
+
+    def _schedule_avatar_sync(self, extractor):
+        """Count available avatars and arm the background avatar stage."""
+        sources_available = bool(
+            self.sftp_host or self.avatar_local_root or self.avatar_http_base_url
+        )
+        if not sources_available:
+            self._append_log('Skipping avatar sync: no avatar source configured')
+            return
+
+        try:
+            total = extractor.count_employee_avatars()
+        except Exception as e:
+            self._append_log(f'WARNING: could not count avatars: {e}')
+            total = 0
+
+        self.sudo().write({
+            'avatar_sync_state': 'pending',
+            'avatar_last_user_id': 0,
+            'avatar_total_count': total,
+            'avatar_processed_count': 0,
+            'avatar_imported_count': 0,
+            'avatar_propagated_count': 0,
+            'avatar_error_count': 0,
+        })
+        self.env.cr.commit()
+        self._append_log(
+            f'Avatar sync scheduled: {total} avatars queued for background processing'
+        )
+
+    def _build_employee_loader(self):
+        """Instantiate an EmployeeLoader with this run's connection settings."""
+        from ..services.loaders.employees import EmployeeLoader
+
+        sftp_kwargs = {}
+        if self.sftp_host:
+            sftp_kwargs = {
+                'sftp_host': self.sftp_host,
+                'sftp_port': self.sftp_port,
+                'sftp_user': self.sftp_user,
+                'sftp_key_path': self.sftp_key_path,
+                'sftp_base_path': self.sftp_base_path or '/home/bitrix/www',
+            }
+        extractor = self._get_extractor()
+        loader = EmployeeLoader(
+            self.env, extractor,
+            log_callback=self._append_log,
+            avatar_download_mode=self.avatar_download_mode or 'auto',
+            avatar_local_root=self.avatar_local_root,
+            avatar_http_base_url=self.avatar_http_base_url,
+            avatar_http_headers=self.avatar_http_headers,
+            **sftp_kwargs,
+        )
+        return loader, extractor
+
+    @api.model
+    def _cron_process_avatar_batch(self):
+        """Background cron: process one batch of avatars for the active migration run.
+
+        Processes up to 20 avatars or 45 seconds per cron tick, then commits
+        progress.  Reschedules itself implicitly by the cron interval until
+        all avatars are processed or an error occurs.
+        """
+        import time as _time
+        BATCH_SIZE = 20
+        MAX_SECONDS = 45
+
+        run = self.search(
+            [('avatar_sync_state', 'in', ('pending', 'running'))],
+            limit=1, order='id asc',
+        )
+        if not run:
+            return
+
+        run.sudo().write({'avatar_sync_state': 'running'})
+        run.env.cr.commit()
+
+        loader = extractor = None
+        try:
+            loader, extractor = run._build_employee_loader()
+            deadline = _time.monotonic() + MAX_SECONDS
+            result = loader.sync_avatars_batch(
+                last_user_id=run.avatar_last_user_id or 0,
+                batch_size=BATCH_SIZE,
+                deadline=deadline,
+            )
+
+            new_processed = (run.avatar_processed_count or 0) + result['imported'] + result['propagated'] + result['skipped']
+            new_imported = (run.avatar_imported_count or 0) + result['imported']
+            new_propagated = (run.avatar_propagated_count or 0) + result['propagated']
+            new_errors = (run.avatar_error_count or 0) + result['errors']
+
+            if result['done']:
+                run.sudo().write({
+                    'avatar_sync_state': 'done',
+                    'avatar_last_user_id': result['last_user_id'],
+                    'avatar_processed_count': new_processed,
+                    'avatar_imported_count': new_imported,
+                    'avatar_propagated_count': new_propagated,
+                    'avatar_error_count': new_errors,
+                    'state': 'done',
+                    'progress': 100.0,
+                })
+                run._append_log(
+                    f'Avatars: imported={new_imported}, propagated={new_propagated}, '
+                    f'skipped={new_processed - new_imported - new_propagated}, '
+                    f'errors={new_errors}'
+                )
+                run._append_log('=== Migration completed successfully ===')
+            else:
+                run.sudo().write({
+                    'avatar_sync_state': 'running',
+                    'avatar_last_user_id': result['last_user_id'],
+                    'avatar_processed_count': new_processed,
+                    'avatar_imported_count': new_imported,
+                    'avatar_propagated_count': new_propagated,
+                    'avatar_error_count': new_errors,
+                })
+
+            run.env.cr.commit()
+
+        except Exception:
+            run.env.cr.rollback()
+            run.sudo().write({
+                'avatar_sync_state': 'error',
+                'state': 'error',
+            })
+            run._append_log(
+                f'=== AVATAR SYNC ERROR ===\n{traceback.format_exc()}'
+            )
+            _logger.exception('Avatar background sync failed for run %s', run.id)
+            run.env.cr.commit()
+        finally:
+            if extractor:
+                try:
+                    extractor.close()
+                except Exception:
+                    pass
 
     def _run_meetings(self, extractor):
         """Migrate Bitrix meetings into calendar.event."""
@@ -1584,6 +1735,15 @@ class BitrixMigrationRun(models.Model):
         self.state = 'draft'
         self.log_output = ''
         self.progress = 0.0
+        self.sudo().write({
+            'avatar_sync_state': False,
+            'avatar_last_user_id': 0,
+            'avatar_total_count': 0,
+            'avatar_processed_count': 0,
+            'avatar_imported_count': 0,
+            'avatar_propagated_count': 0,
+            'avatar_error_count': 0,
+        })
 
     @api.model
     def get_singleton_action(self):

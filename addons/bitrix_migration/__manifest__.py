@@ -8,6 +8,7 @@
     'data': [
         'security/bitrix_task_employee_security.xml',
         'data/ir.model.access.csv',
+        'data/ir_cron_data.xml',
         'views/bitrix_migration_run_views.xml',
         'views/hr_employee_views.xml',
         'views/project_task_views.xml',

@@ -81,6 +81,19 @@
                             <field name="progress" widget="progressbar"/>
                         </group>
                     </group>
+                    <group string="Avatar Sync"
+                           invisible="not avatar_sync_state">
+                        <group>
+                            <field name="avatar_sync_state" readonly="1"/>
+                            <field name="avatar_total_count" readonly="1"/>
+                            <field name="avatar_processed_count" readonly="1"/>
+                        </group>
+                        <group>
+                            <field name="avatar_imported_count" readonly="1"/>
+                            <field name="avatar_propagated_count" readonly="1"/>
+                            <field name="avatar_error_count" readonly="1"/>
+                        </group>
+                    </group>
                     <notebook>
                         <page string="MySQL Connection">
                             <group>

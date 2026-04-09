@@ -361,17 +361,51 @@ class BitrixMySQLExtractor:
     """
 
     # ── Employee Avatars ───────────────────────────────────────────────
+    # Filtered to the same population as SQL_EMPLOYEES (active + has department).
     SQL_EMPLOYEE_AVATARS = """
         SELECT
             u.ID AS user_id,
             CONCAT('/upload/', bf.SUBDIR, '/', bf.FILE_NAME) AS photo_path,
             bf.CONTENT_TYPE AS content_type
         FROM b_user u
+        JOIN b_uts_user uu ON uu.VALUE_ID = u.ID
         JOIN b_file bf ON bf.ID = u.PERSONAL_PHOTO
         WHERE u.ACTIVE = 'Y'
+          AND uu.UF_DEPARTMENT IS NOT NULL
+          AND uu.UF_DEPARTMENT != ''
           AND u.PERSONAL_PHOTO IS NOT NULL
           AND u.PERSONAL_PHOTO > 0
         ORDER BY u.ID
+    """
+
+    SQL_EMPLOYEE_AVATARS_AFTER = """
+        SELECT
+            u.ID AS user_id,
+            CONCAT('/upload/', bf.SUBDIR, '/', bf.FILE_NAME) AS photo_path,
+            bf.CONTENT_TYPE AS content_type
+        FROM b_user u
+        JOIN b_uts_user uu ON uu.VALUE_ID = u.ID
+        JOIN b_file bf ON bf.ID = u.PERSONAL_PHOTO
+        WHERE u.ACTIVE = 'Y'
+          AND uu.UF_DEPARTMENT IS NOT NULL
+          AND uu.UF_DEPARTMENT != ''
+          AND u.PERSONAL_PHOTO IS NOT NULL
+          AND u.PERSONAL_PHOTO > 0
+          AND u.ID > %s
+        ORDER BY u.ID
+        LIMIT %s
+    """
+
+    SQL_COUNT_EMPLOYEE_AVATARS = """
+        SELECT COUNT(*) AS cnt
+        FROM b_user u
+        JOIN b_uts_user uu ON uu.VALUE_ID = u.ID
+        JOIN b_file bf ON bf.ID = u.PERSONAL_PHOTO
+        WHERE u.ACTIVE = 'Y'
+          AND uu.UF_DEPARTMENT IS NOT NULL
+          AND uu.UF_DEPARTMENT != ''
+          AND u.PERSONAL_PHOTO IS NOT NULL
+          AND u.PERSONAL_PHOTO > 0
     """
 
     # Telegram хранится в отдельной таблице мессенджеров Битрикс24
@@ -644,6 +678,23 @@ class BitrixMySQLExtractor:
         except Exception as e:
             _logger.warning('Could not fetch employee avatars: %s', e)
             return []
+
+    def get_employee_avatars_after(self, last_user_id, limit):
+        """Return up to *limit* avatar rows for users with ID > last_user_id."""
+        try:
+            return self._execute(self.SQL_EMPLOYEE_AVATARS_AFTER, (last_user_id, limit))
+        except Exception as e:
+            _logger.warning('Could not fetch employee avatars (paginated): %s', e)
+            return []
+
+    def count_employee_avatars(self):
+        """Total avatar rows matching the HR-import filter."""
+        try:
+            result = self._execute(self.SQL_COUNT_EMPLOYEE_AVATARS)
+            return result[0]['cnt'] if result else 0
+        except Exception as e:
+            _logger.warning('Could not count employee avatars: %s', e)
+            return 0
 
     def get_employee_telegrams(self):
         """Returns {user_id: telegram} dict.

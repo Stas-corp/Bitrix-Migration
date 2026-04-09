@@ -2,8 +2,9 @@ import base64
 import json
 import logging
 import os
+import time
 from urllib.error import HTTPError, URLError
-from urllib.parse import urljoin
+from urllib.parse import quote, urljoin
 from urllib.request import Request, urlopen
 
 from .base import BaseLoader
@@ -389,6 +390,96 @@ class EmployeeLoader(BaseLoader):
             f'skipped={skipped}, errors={errors}'
         )
 
+    def sync_avatars_batch(self, last_user_id=0, batch_size=20, deadline=None):
+        """Process one batch of avatars starting after *last_user_id*.
+
+        Returns a dict::
+
+            {
+                'imported': int,
+                'propagated': int,
+                'skipped': int,
+                'errors': int,
+                'last_user_id': int,   # highest user_id processed in this batch
+                'done': bool,          # True when no more rows remain
+            }
+
+        *deadline* is an optional ``time.monotonic()`` value; the loop stops
+        early if the wall-clock exceeds it (before starting a new row).
+        """
+        sources = self._get_avatar_sources()
+        if not sources:
+            return {'imported': 0, 'propagated': 0, 'skipped': 0, 'errors': 0,
+                    'last_user_id': last_user_id, 'done': True}
+
+        avatar_rows = self.extractor.get_employee_avatars_after(last_user_id, batch_size)
+        if not avatar_rows:
+            return {'imported': 0, 'propagated': 0, 'skipped': 0, 'errors': 0,
+                    'last_user_id': last_user_id, 'done': True}
+
+        Employee = self.env['hr.employee'].sudo().with_context(active_test=False)
+        imported = propagated = skipped = errors = 0
+        current_last_user_id = last_user_id
+
+        try:
+            for row in avatar_rows:
+                if deadline is not None and time.monotonic() > deadline:
+                    break
+
+                user_id = int(row['user_id'])
+                photo_path = row.get('photo_path', '')
+                current_last_user_id = user_id
+
+                if not photo_path:
+                    skipped += 1
+                    continue
+
+                employee = Employee.search([('x_bitrix_id', '=', user_id)], limit=1)
+                if not employee:
+                    skipped += 1
+                    continue
+
+                partner_targets = self._get_avatar_partner_targets(employee)
+                existing_real_image = self._get_existing_real_avatar(employee, partner_targets)
+                if existing_real_image:
+                    if self._write_avatar_targets(employee, existing_real_image, partner_targets):
+                        propagated += 1
+                    else:
+                        skipped += 1
+                    continue
+
+                try:
+                    data = self._download_avatar(photo_path)
+                    encoded = base64.b64encode(data)
+                    if self._write_avatar_targets(employee, encoded, partner_targets):
+                        imported += 1
+                    else:
+                        skipped += 1
+                except FileNotFoundError:
+                    errors += 1
+                    _logger.warning('Avatar file not found for user %s: %s', user_id, photo_path)
+                except (HTTPError, URLError) as e:
+                    errors += 1
+                    _logger.warning('Avatar HTTP error for user %s: %s', user_id, e)
+                except Exception as e:
+                    errors += 1
+                    _logger.warning('Avatar download error for user %s: %s', user_id, e)
+
+        finally:
+            self._close_sftp()
+
+        # A batch is exhausted when we received fewer rows than requested.
+        done = len(avatar_rows) < batch_size
+
+        return {
+            'imported': imported,
+            'propagated': propagated,
+            'skipped': skipped,
+            'errors': errors,
+            'last_user_id': current_last_user_id,
+            'done': done,
+        }
+
     def _get_avatar_partner_targets(self, employee):
         partners = self.env['res.partner']
         partner = self.get_partner_from_employee(employee)
@@ -583,4 +674,7 @@ class EmployeeLoader(BaseLoader):
             return normalized_path
         if not self.avatar_http_base_url:
             return ''
-        return urljoin(f'{self.avatar_http_base_url}/', normalized_path.lstrip('/'))
+        # Encode each path segment to handle spaces, Cyrillic, and special chars;
+        # keep '/' as the separator so directory structure is preserved.
+        encoded_path = quote(normalized_path.lstrip('/'), safe='/')
+        return urljoin(f'{self.avatar_http_base_url}/', encoded_path)
