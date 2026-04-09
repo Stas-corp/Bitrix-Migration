@@ -95,7 +95,7 @@
                                 </group>
                             </group>
                         </page>
-                        <page string="SFTP Settings">
+                        <page string="Files &amp; Avatars">
                             <group>
                                 <group>
                                     <field name="sftp_host" placeholder="bitrix-server.local"/>
@@ -105,6 +105,17 @@
                                 <group>
                                     <field name="sftp_key_path" placeholder="/path/to/key"/>
                                     <field name="sftp_base_path" placeholder="/home/bitrix/www"/>
+                                </group>
+                            </group>
+                            <group string="Employee Avatars">
+                                <group>
+                                    <field name="avatar_download_mode"/>
+                                    <field name="avatar_local_root" placeholder="/var/www/bitrix/upload"/>
+                                </group>
+                                <group>
+                                    <field name="avatar_http_base_url" placeholder="https://bitrix.example.com"/>
+                                    <field name="avatar_http_headers"
+                                           placeholder='{"Cookie": "PHPSESSID=...", "User-Agent": "Mozilla/5.0"}'/>
                                 </group>
                             </group>
                         </page>
@@ -118,7 +129,7 @@
                                 <div class="alert alert-info" role="alert" style="margin-bottom:16px;">
                                     <strong>Швидкий сценарій запуску</strong>
                                     <ol style="margin:8px 0 0 18px;">
-                                        <li>Заповніть MySQL Connection (та SFTP, якщо переносите вкладення).</li>
+                                        <li>Заповніть MySQL Connection, а для вкладень або фото — налаштування Files &amp; Avatars.</li>
                                         <li>Для HR-міграції спочатку оберіть <b>HR: Departments + Employees</b> або потрібний HR-режим.</li>
                                         <li>Далі використовуйте інші режими: <b>Dry Run</b>, <b>Full Migration</b>, <b>Pilot</b> тощо.</li>
                                         <li>Виконайте <b>Create Employee Users</b> і <b>Send Password Reset</b> для створення користувачів співробітникам.</li>
@@ -127,7 +138,7 @@
 
                                 <h4 style="margin:0 0 8px 0;">Режими</h4>
                                 <ul class="text-muted" style="margin:0 0 16px 18px;">
-                                    <li><b>HR: Departments + Employees</b> — спочатку імпортує підрозділи, потім співробітників.</li>
+                                    <li><b>HR: Departments + Employees</b> — спочатку імпортує підрозділи, потім співробітників і їх фото.</li>
                                     <li><b>HR: Departments Only</b> — тільки структура підрозділів і керівники.</li>
                                     <li><b>HR: Employees Only</b> — тільки співробітники (після імпорту підрозділів).</li>
                                     <li><b>Dry Run</b> — лише підрахунок сутностей без запису в Odoo.</li>
@@ -150,7 +161,8 @@
                                 <h4 style="margin:0 0 8px 0;">Troubleshooting</h4>
                                 <ul class="text-muted" style="margin:0 0 0 18px;">
                                     <li>Усі деталі виконання дивіться на вкладці <b>Log Output</b>.</li>
-                                    <li>Якщо вкладення не потрібні, поля SFTP можна залишити порожніми.</li>
+                                    <li>Фото співробітників можна тягнути через SFTP, локальну папку upload або HTTP, залежно від Avatar Source.</li>
+                                    <li>Якщо вкладення не потрібні, SFTP можна не заповнювати, але для фото має бути хоча б одне джерело.</li>
                                     <li>Якщо міграція завершилась з <b>Error</b>, перевірте останні рядки логу та параметри підключення.</li>
                                 </ul>
                             </div>

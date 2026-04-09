@@ -39,7 +39,15 @@ class DepartmentLoader(BaseLoader):
                 self.log(f'ERROR parsing department row {row}: {e}')
 
         mapping = self.get_mapping()
-        existing = mapping.get_all_mappings('department')
+        removed_stale = 0
+        if not self.dry_run:
+            removed_stale = mapping.purge_stale_mappings('department', 'hr.department')
+        existing = mapping.get_all_mappings(
+            'department', model_name='hr.department', only_existing=True,
+        )
+
+        if removed_stale:
+            self.log(f'Removed {removed_stale} stale department mappings before import')
 
         # ── Pass 1: create departments (no parent_id yet) ─────────────
         self.log('Pass 1: creating departments...')
@@ -75,7 +83,10 @@ class DepartmentLoader(BaseLoader):
 
         # ── Pass 2: link parent_id ────────────────────────────────────
         self.log('Pass 2: linking parent departments...')
-        fresh_mapping = mapping.get_all_mappings('department')
+        fresh_mapping = mapping.get_all_mappings(
+            'department', model_name='hr.department', only_existing=True,
+        )
+        Department = self.env['hr.department'].sudo().with_context(active_test=False)
         linked = 0
         errors = 0
 
@@ -92,9 +103,14 @@ class DepartmentLoader(BaseLoader):
 
             if not self.dry_run:
                 try:
-                    self.env['hr.department'].sudo().browse(child_odoo_id).write(
-                        {'parent_id': parent_odoo_id}
-                    )
+                    child = Department.browse(child_odoo_id).exists()
+                    parent = Department.browse(parent_odoo_id).exists()
+                    if not child or not parent:
+                        errors += 1
+                        continue
+
+                    if child.parent_id.id != parent.id:
+                        child.write({'parent_id': parent.id})
                     linked += 1
                 except Exception as e:
                     errors += 1

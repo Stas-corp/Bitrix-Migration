@@ -41,7 +41,33 @@ class BitrixMigrationRun(models.Model):
     sftp_port = fields.Integer(string='SFTP Port', default=22)
     sftp_user = fields.Char(string='SFTP User')
     sftp_key_path = fields.Char(string='SFTP Key Path')
-    sftp_base_path = fields.Char(string='SFTP Base Path', default='/home/bitrix/www')
+    sftp_base_path = fields.Char(
+        string='SFTP Base Path',
+        default='/home/bitrix/www',
+        help='Корінь Bitrix веб-директорії для SFTP вкладень або локального читання '
+             'аватарів (наприклад /home/bitrix/www).',
+    )
+    avatar_download_mode = fields.Selection([
+        ('auto', 'Auto'),
+        ('sftp', 'SFTP only'),
+        ('local', 'Local files only'),
+        ('http', 'HTTP only'),
+    ], string='Avatar Source', default='auto')
+    avatar_local_root = fields.Char(
+        string='Avatar Local Upload Root',
+        help='Необовʼязково. Корінь локальної папки Bitrix upload '
+             '(наприклад /var/www/bitrix/upload).',
+    )
+    avatar_http_base_url = fields.Char(
+        string='Avatar HTTP Base URL',
+        help='Необовʼязково. Базовий URL Bitrix для фото співробітників '
+             '(наприклад https://bitrix.example.com).',
+    )
+    avatar_http_headers = fields.Text(
+        string='Avatar HTTP Headers',
+        help='Необовʼязково. Додаткові HTTP headers для фото у форматі JSON '
+             'або Key: Value по рядках.',
+    )
 
     # Options
     preserve_authorship = fields.Boolean(
@@ -599,7 +625,9 @@ class BitrixMigrationRun(models.Model):
         )
         user_map = user_loader.run()
 
-        dept_map = self.env['bitrix.migration.mapping'].sudo().get_all_mappings('department')
+        dept_map = self.env['bitrix.migration.mapping'].sudo().get_all_mappings(
+            'department', model_name='hr.department', only_existing=True,
+        )
 
         sftp_kwargs = {}
         if self.sftp_host:
@@ -610,6 +638,12 @@ class BitrixMigrationRun(models.Model):
                 'sftp_key_path': self.sftp_key_path,
                 'sftp_base_path': self.sftp_base_path or '/home/bitrix/www',
             }
+        avatar_kwargs = {
+            'avatar_download_mode': self.avatar_download_mode or 'auto',
+            'avatar_local_root': self.avatar_local_root,
+            'avatar_http_base_url': self.avatar_http_base_url,
+            'avatar_http_headers': self.avatar_http_headers,
+        }
 
         self._append_log('\n--- Employees ---')
         emp_loader = EmployeeLoader(
@@ -619,10 +653,11 @@ class BitrixMigrationRun(models.Model):
             dry_run=dry_run,
             log_callback=self._append_log,
             **sftp_kwargs,
+            **avatar_kwargs,
         )
         emp_loader.run()
 
-        if self.sftp_host and not dry_run:
+        if not dry_run:
             self._append_log('\n--- Employee Avatars ---')
             emp_loader.sync_avatars()
 
@@ -976,14 +1011,26 @@ class BitrixMigrationRun(models.Model):
         raw_markup_count = len(raw_markup_msg_ids)
         self._append_log(f'  Comments with raw Bitrix markup: {raw_markup_count}')
 
-        # Employees without photo
+        # Employees with real photos vs generated SVG placeholders
+        from ..services.loaders.employees import (
+            has_real_photo_image,
+            is_svg_placeholder_image,
+        )
+
         Employee = self.env['hr.employee'].sudo().with_context(active_test=False)
-        emp_total = Employee.search_count([('x_bitrix_id', '!=', 0)])
-        emp_with_photo = Employee.search_count([
-            ('x_bitrix_id', '!=', 0),
-            ('image_1920', '!=', False),
-        ])
-        self._append_log(f'  Employees: {emp_total} total, {emp_with_photo} with photo')
+        employees = Employee.search([('x_bitrix_id', '!=', 0)])
+        emp_total = len(employees)
+        emp_with_real_photo = sum(
+            1 for employee in employees if has_real_photo_image(employee.image_1920)
+        )
+        emp_with_svg_placeholder = sum(
+            1 for employee in employees if is_svg_placeholder_image(employee.image_1920)
+        )
+        self._append_log(
+            '  Employees: '
+            f'{emp_total} total, {emp_with_real_photo} with real photo, '
+            f'{emp_with_svg_placeholder} with generated avatar'
+        )
 
         # Tasks without stage
         tasks_no_stage = Task.search_count([

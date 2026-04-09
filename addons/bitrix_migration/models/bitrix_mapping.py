@@ -51,6 +51,34 @@ class BitrixMigrationMapping(models.Model):
             'odoo_id': odoo_id,
         })
 
-    def get_all_mappings(self, entity_type):
+    def get_all_mappings(self, entity_type, model_name=None, only_existing=False):
         recs = self.search([('entity_type', '=', entity_type)])
-        return {r.bitrix_id: r.odoo_id for r in recs}
+        if not only_existing or not model_name:
+            return {r.bitrix_id: r.odoo_id for r in recs}
+
+        Model = self.env[model_name].sudo().with_context(active_test=False)
+        result = {}
+        for rec in recs:
+            if rec.odoo_model and rec.odoo_model != model_name:
+                continue
+            target = Model.browse(rec.odoo_id).exists()
+            if target:
+                result[rec.bitrix_id] = target.id
+        return result
+
+    def purge_stale_mappings(self, entity_type, model_name):
+        recs = self.search([('entity_type', '=', entity_type)])
+        Model = self.env[model_name].sudo().with_context(active_test=False)
+        stale = self.browse()
+
+        for rec in recs:
+            if rec.odoo_model and rec.odoo_model != model_name:
+                stale |= rec
+                continue
+            if not Model.browse(rec.odoo_id).exists():
+                stale |= rec
+
+        count = len(stale)
+        if count:
+            stale.unlink()
+        return count

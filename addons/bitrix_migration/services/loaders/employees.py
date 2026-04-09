@@ -1,9 +1,36 @@
 import base64
+import json
 import logging
+import os
+from urllib.error import HTTPError, URLError
+from urllib.parse import urljoin
+from urllib.request import Request, urlopen
 
 from .base import BaseLoader
 
 _logger = logging.getLogger(__name__)
+
+
+def is_svg_placeholder_image(image_value):
+    """Return True when the stored avatar is an SVG placeholder, not a real photo."""
+    if not image_value:
+        return False
+
+    if isinstance(image_value, str):
+        image_value = image_value.encode()
+
+    try:
+        raw = base64.b64decode(image_value, validate=False)
+    except Exception:
+        return False
+
+    raw = raw.lstrip()
+    return raw.startswith(b'<?xml') or raw.startswith(b'<svg')
+
+
+def has_real_photo_image(image_value):
+    """Return True when the stored image looks like an actual uploaded photo."""
+    return bool(image_value) and not is_svg_placeholder_image(image_value)
 
 
 class EmployeeLoader(BaseLoader):
@@ -15,6 +42,9 @@ class EmployeeLoader(BaseLoader):
     def __init__(self, env, extractor, user_map=None, dept_map=None,
                  sftp_host=None, sftp_port=22, sftp_user=None,
                  sftp_key_path=None, sftp_base_path='/home/bitrix/www',
+                 avatar_download_mode='auto', avatar_local_root=None,
+                 avatar_http_base_url=None, avatar_http_headers=None,
+                 avatar_http_timeout=30,
                  **kwargs):
         super().__init__(env, extractor, **kwargs)
         # user_map: {str(bitrix_user_id): odoo_partner_id}
@@ -28,6 +58,11 @@ class EmployeeLoader(BaseLoader):
         self.sftp_key_path = sftp_key_path
         self.sftp_base_path = (sftp_base_path or '/home/bitrix/www').rstrip('/')
         self._sftp = None
+        self.avatar_download_mode = avatar_download_mode or 'auto'
+        self.avatar_local_root = (avatar_local_root or '').rstrip('/')
+        self.avatar_http_base_url = (avatar_http_base_url or '').rstrip('/')
+        self.avatar_http_headers = self._parse_http_headers(avatar_http_headers)
+        self.avatar_http_timeout = avatar_http_timeout or 30
 
     def run(self):
         self.log('Extracting Bitrix employees...')
@@ -224,9 +259,10 @@ class EmployeeLoader(BaseLoader):
 
     def _resolve_dept(self, dept_ids):
         """Return Odoo hr.department id for first known dept_id."""
+        Department = self.env['hr.department'].sudo().with_context(active_test=False)
         for did in dept_ids:
             odoo_id = self.dept_map.get(str(did))
-            if odoo_id:
+            if odoo_id and Department.browse(odoo_id).exists():
                 return odoo_id
         return None
 
@@ -276,10 +312,14 @@ class EmployeeLoader(BaseLoader):
     def sync_avatars(self):
         """Download and set employee avatars from Bitrix.
 
-        Policy: only set image if employee has no image yet (safe rerun).
+        Policy:
+        - keep existing real photos;
+        - replace Odoo-generated SVG placeholders with the Bitrix photo;
+        - keep employee/contact/user partner avatars in sync.
         """
-        if not self.sftp_host:
-            self.log('Skipping avatars: SFTP not configured')
+        sources = self._get_avatar_sources()
+        if not sources:
+            self.log('Skipping avatars: no avatar source configured')
             return
 
         avatar_rows = self.extractor.get_employee_avatars()
@@ -288,12 +328,11 @@ class EmployeeLoader(BaseLoader):
             return
 
         self.log(f'Found {len(avatar_rows)} employee avatars in Bitrix')
+        self.log(f'Avatar sources: {", ".join(sources)}')
         Employee = self.env['hr.employee'].sudo().with_context(active_test=False)
-        sftp = self._get_sftp()
-        if not sftp:
-            return
 
         imported = 0
+        propagated = 0
         skipped = 0
         errors = 0
 
@@ -309,28 +348,239 @@ class EmployeeLoader(BaseLoader):
                     skipped += 1
                     continue
 
-                # Safe rerun: skip if employee already has an image
-                if employee.image_1920:
-                    skipped += 1
+                partner_targets = self._get_avatar_partner_targets(employee)
+                existing_real_image = self._get_existing_real_avatar(
+                    employee, partner_targets,
+                )
+                if existing_real_image:
+                    if self._write_avatar_targets(
+                        employee, existing_real_image, partner_targets,
+                    ):
+                        propagated += 1
+                    else:
+                        skipped += 1
                     continue
 
-                full_path = self.sftp_base_path + photo_path
                 try:
-                    with sftp.open(full_path, 'rb') as f:
-                        data = f.read()
-                    employee.write({'image_1920': base64.b64encode(data)})
-                    imported += 1
+                    data = self._download_avatar(photo_path)
+                    encoded = base64.b64encode(data)
+                    if self._write_avatar_targets(
+                        employee, encoded, partner_targets,
+                    ):
+                        imported += 1
+                    else:
+                        skipped += 1
                 except FileNotFoundError:
                     errors += 1
+                    _logger.warning('Avatar file not found for user %s: %s', user_id, photo_path)
                 except Exception as e:
                     errors += 1
                     _logger.warning('Avatar download error for user %s: %s', user_id, e)
 
-                if imported % 50 == 0 and imported > 0:
+                if (imported + propagated) % 50 == 0 and (imported + propagated) > 0:
                     self.env.cr.commit()
 
         finally:
             self._close_sftp()
 
         self.env.cr.commit()
-        self.log(f'Avatars: imported={imported}, skipped={skipped}, errors={errors}')
+        self.log(
+            f'Avatars: imported={imported}, propagated={propagated}, '
+            f'skipped={skipped}, errors={errors}'
+        )
+
+    def _get_avatar_partner_targets(self, employee):
+        partners = self.env['res.partner']
+        partner = self.get_partner_from_employee(employee)
+        if partner:
+            partners |= partner
+
+        user = self.get_user_from_employee(employee)
+        if user and user.partner_id:
+            partners |= user.partner_id
+
+        return partners
+
+    def _get_existing_real_avatar(self, employee, partner_targets):
+        if has_real_photo_image(employee.image_1920):
+            return employee.image_1920
+
+        for partner in partner_targets:
+            if has_real_photo_image(partner.image_1920):
+                return partner.image_1920
+
+        return False
+
+    def _write_avatar_targets(self, employee, image_value, partner_targets):
+        updated = False
+
+        if employee.image_1920 != image_value:
+            employee.write({'image_1920': image_value})
+            updated = True
+
+        for partner in partner_targets:
+            if partner.image_1920 != image_value:
+                partner.write({'image_1920': image_value})
+                updated = True
+
+        return updated
+
+    def _parse_http_headers(self, raw_headers):
+        if not raw_headers:
+            return {}
+
+        raw_headers = raw_headers.strip()
+        if not raw_headers:
+            return {}
+
+        try:
+            parsed = json.loads(raw_headers)
+        except Exception:
+            parsed = None
+
+        if isinstance(parsed, dict):
+            return {
+                str(key).strip(): str(value).strip()
+                for key, value in parsed.items()
+                if str(key).strip() and str(value).strip()
+            }
+
+        headers = {}
+        for line in raw_headers.splitlines():
+            if ':' not in line:
+                continue
+            key, value = line.split(':', 1)
+            key = key.strip()
+            value = value.strip()
+            if key and value:
+                headers[key] = value
+
+        return headers
+
+    def _get_avatar_sources(self):
+        mode = self.avatar_download_mode or 'auto'
+        if mode == 'sftp':
+            return ['sftp'] if self.sftp_host else []
+        if mode == 'local':
+            return ['local'] if self._has_local_avatar_root() else []
+        if mode == 'http':
+            return ['http'] if self.avatar_http_base_url else []
+
+        sources = []
+        if self._has_local_avatar_root():
+            sources.append('local')
+        if self.sftp_host:
+            sources.append('sftp')
+        if self.avatar_http_base_url:
+            sources.append('http')
+        return sources
+
+    def _has_local_avatar_root(self):
+        for root in self._get_local_avatar_roots():
+            if os.path.isdir(root):
+                return True
+        return False
+
+    def _get_local_avatar_roots(self):
+        roots = []
+        if self.avatar_local_root:
+            roots.append(self.avatar_local_root)
+        if self.sftp_base_path:
+            roots.append(self.sftp_base_path)
+        return roots
+
+    def _download_avatar(self, photo_path):
+        last_error = None
+
+        for source in self._get_avatar_sources():
+            try:
+                if source == 'local':
+                    return self._download_avatar_from_local(photo_path)
+                if source == 'sftp':
+                    return self._download_avatar_from_sftp(photo_path)
+                if source == 'http':
+                    return self._download_avatar_from_http(photo_path)
+            except Exception as e:
+                last_error = e
+
+        if last_error:
+            raise last_error
+        raise FileNotFoundError(photo_path)
+
+    def _download_avatar_from_sftp(self, photo_path):
+        sftp = self._get_sftp()
+        if not sftp:
+            raise FileNotFoundError(photo_path)
+
+        full_path = self.sftp_base_path + photo_path
+        with sftp.open(full_path, 'rb') as sftp_file:
+            return sftp_file.read()
+
+    def _download_avatar_from_local(self, photo_path):
+        for candidate_path in self._get_local_avatar_paths(photo_path):
+            if not os.path.isfile(candidate_path):
+                continue
+            with open(candidate_path, 'rb') as local_file:
+                return local_file.read()
+
+        raise FileNotFoundError(photo_path)
+
+    def _get_local_avatar_paths(self, photo_path):
+        candidates = []
+        normalized_path = (photo_path or '').strip()
+        if not normalized_path:
+            return candidates
+
+        relative_upload_path = normalized_path
+        if normalized_path.startswith('/upload/'):
+            relative_upload_path = normalized_path[len('/upload/'):]
+
+        if self.avatar_local_root:
+            candidates.append(
+                os.path.join(self.avatar_local_root, relative_upload_path.lstrip('/'))
+            )
+            candidates.append(
+                os.path.join(self.avatar_local_root, normalized_path.lstrip('/'))
+            )
+
+        if self.sftp_base_path:
+            candidates.append(
+                os.path.join(self.sftp_base_path, normalized_path.lstrip('/'))
+            )
+
+        unique_candidates = []
+        seen = set()
+        for candidate in candidates:
+            normalized_candidate = os.path.normpath(candidate)
+            if normalized_candidate in seen:
+                continue
+            seen.add(normalized_candidate)
+            unique_candidates.append(normalized_candidate)
+        return unique_candidates
+
+    def _download_avatar_from_http(self, photo_path):
+        target_url = self._get_avatar_http_url(photo_path)
+        if not target_url:
+            raise FileNotFoundError(photo_path)
+
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        headers.update(self.avatar_http_headers)
+        request = Request(target_url, headers=headers)
+
+        try:
+            with urlopen(request, timeout=self.avatar_http_timeout) as response:
+                return response.read()
+        except HTTPError:
+            raise
+        except URLError:
+            raise
+
+    def _get_avatar_http_url(self, photo_path):
+        normalized_path = (photo_path or '').strip()
+        if not normalized_path:
+            return ''
+        if normalized_path.startswith(('http://', 'https://')):
+            return normalized_path
+        if not self.avatar_http_base_url:
+            return ''
+        return urljoin(f'{self.avatar_http_base_url}/', normalized_path.lstrip('/'))
