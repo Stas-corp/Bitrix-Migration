@@ -117,9 +117,18 @@ class AttachmentLoader(BaseLoader):
                         attached_at=row.get('attached_at'),
                     )
 
-                    # Compound uniqueness key: type:entity_id:file_path
-                    compound_key = f'{attachment_type}:{att.entity_id}:{att.file_path}'
-                    if compound_key in existing_att_mappings or att.file_path in existing_att_mappings:
+                    # Compound uniqueness key
+                    if attachment_type == 'comment' and att.forum_message_id:
+                        compound_key = f'comment:{att.entity_id}:{att.forum_message_id}:{att.file_path}'
+                    else:
+                        compound_key = f'{attachment_type}:{att.entity_id}:{att.file_path}'
+                    # Also check legacy plain file_path key for backward-safe skip
+                    legacy_task_key = f'task:{att.entity_id}:{att.file_path}'
+                    legacy_comment_key = f'comment:{att.entity_id}:{att.file_path}'
+                    if (compound_key in existing_att_mappings
+                            or att.file_path in existing_att_mappings
+                            or legacy_task_key in existing_att_mappings
+                            or legacy_comment_key in existing_att_mappings):
                         self.skipped_count += 1
                         processed += 1
                         continue

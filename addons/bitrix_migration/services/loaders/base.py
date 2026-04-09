@@ -194,6 +194,46 @@ class BaseLoader:
             )
         return self.env['res.users']
 
+    def recompute_task_user_ids(self, task):
+        """Recompute task user_ids from canonical assignee data.
+
+        Priority:
+        1. x_bitrix_assignee_user_ids (stored, includes user_map fallback users)
+        2. Fallback: re-resolve from employee links (responsible + accomplice)
+
+        Creator, auditor, originator, and participant do NOT contribute.
+        """
+        if 'x_bitrix_assignee_user_ids' in task._fields and task.x_bitrix_assignee_user_ids:
+            target_user_ids = task.x_bitrix_assignee_user_ids.ids
+        else:
+            # Fallback: resolve from employee link fields
+            target_user_ids = []
+            if 'x_bitrix_responsible_employee_id' in task._fields and task.x_bitrix_responsible_employee_id:
+                user = self.get_user_from_employee(task.x_bitrix_responsible_employee_id)
+                if user and user.id not in target_user_ids:
+                    target_user_ids.append(user.id)
+            if 'x_bitrix_accomplice_employee_ids' in task._fields:
+                for emp in task.x_bitrix_accomplice_employee_ids:
+                    user = self.get_user_from_employee(emp)
+                    if user and user.id not in target_user_ids:
+                        target_user_ids.append(user.id)
+
+            # If we resolved new users, store them in x_bitrix_assignee_user_ids
+            if target_user_ids and 'x_bitrix_assignee_user_ids' in task._fields:
+                task.write({'x_bitrix_assignee_user_ids': [(6, 0, sorted(set(target_user_ids)))]})
+
+        target_sorted = sorted(set(target_user_ids))
+        if 'user_ids' in task._fields:
+            if set(task.user_ids.ids) != set(target_sorted):
+                task.write({'user_ids': [(6, 0, target_sorted)]})
+        elif 'user_id' in task._fields:
+            target_user_id = target_sorted[0] if target_sorted else False
+            if (task.user_id.id if task.user_id else False) != target_user_id:
+                task.write({'user_id': target_user_id})
+
+        if hasattr(task, '_sync_bitrix_user_access'):
+            task._sync_bitrix_user_access(mirror_assignee_users=False)
+
     def run(self):
         """Override in subclasses."""
         raise NotImplementedError

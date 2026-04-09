@@ -67,9 +67,18 @@ class TestMarkupNormalizer(TransactionCase):
         self.assertNotIn('[USER=', result)
 
     def test_user_tag_empty(self):
-        """Empty [USER=ID][/USER] is removed."""
+        """Empty [USER=ID][/USER] produces empty string, not 'User #ID'."""
         result = normalize_bitrix_markup('[USER=123][/USER]')
         self.assertNotIn('[USER=', result)
+        self.assertNotIn('User #', result)
+        self.assertEqual(result, '')
+
+    def test_user_tag_empty_no_map_no_inner(self):
+        """Empty USER tag with no map and no inner text returns empty string."""
+        result = normalize_bitrix_markup('before [USER=999][/USER] after')
+        self.assertNotIn('User #', result)
+        self.assertIn('before', result)
+        self.assertIn('after', result)
 
     # ── Lists ───────────────────────────────────────────────────────
 

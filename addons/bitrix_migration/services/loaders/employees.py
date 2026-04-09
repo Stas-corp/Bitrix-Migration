@@ -188,56 +188,39 @@ class EmployeeLoader(BaseLoader):
             })
 
     def _sync_task_assignees(self, employee, user_id):
+        """Refresh task assignees/access for tasks affected by this employee's user mapping.
+
+        Responsible + accomplice contribute to assignee user_ids.
+        Auditors contribute to access users.
+        """
         Task = self.env['project.task'].sudo().with_context(active_test=False)
 
-        has_participant_field = (
-            'x_bitrix_participant_employee_ids' in Task._fields
-        )
-        has_responsible_field = (
-            'x_bitrix_responsible_employee_ids' in Task._fields
-        )
-        has_creator_field = 'x_bitrix_creator_employee_id' in Task._fields
+        has_responsible_field = 'x_bitrix_responsible_employee_id' in Task._fields
+        has_accomplice_field = 'x_bitrix_accomplice_employee_ids' in Task._fields
+        has_auditor_field = 'x_bitrix_auditor_employee_ids' in Task._fields
 
-        if not has_participant_field and not has_responsible_field and not has_creator_field:
+        if not has_responsible_field and not has_accomplice_field and not has_auditor_field:
             return
 
-        if has_participant_field and has_creator_field:
-            domain = ['|', ('x_bitrix_participant_employee_ids', 'in', employee.id), ('x_bitrix_creator_employee_id', '=', employee.id)]
-        elif has_participant_field:
-            domain = [('x_bitrix_participant_employee_ids', 'in', employee.id)]
-        elif has_responsible_field and has_creator_field:
-            domain = ['|', ('x_bitrix_responsible_employee_ids', 'in', employee.id), ('x_bitrix_creator_employee_id', '=', employee.id)]
-        elif has_responsible_field:
-            domain = [('x_bitrix_responsible_employee_ids', 'in', employee.id)]
+        # Find tasks where this employee is canonical responsible or accomplice
+        domain_parts = []
+        if has_responsible_field:
+            domain_parts.append(('x_bitrix_responsible_employee_id', '=', employee.id))
+        if has_accomplice_field:
+            domain_parts.append(('x_bitrix_accomplice_employee_ids', 'in', employee.id))
+        if has_auditor_field:
+            domain_parts.append(('x_bitrix_auditor_employee_ids', 'in', employee.id))
+
+        if len(domain_parts) > 1:
+            domain = ['|'] * (len(domain_parts) - 1) + domain_parts
         else:
-            domain = [('x_bitrix_creator_employee_id', '=', employee.id)]
+            domain = domain_parts
 
         tasks = Task.search(domain)
         for task in tasks:
-            participant_employees = (
-                task.x_bitrix_participant_employee_ids if has_participant_field
-                else task.x_bitrix_responsible_employee_ids if has_responsible_field
-                else self.env['hr.employee']
-            )
-
-            target_user_ids = []
-            for participant_employee in participant_employees:
-                participant_user = self.get_user_from_employee(participant_employee)
-                if participant_user and participant_user.id not in target_user_ids:
-                    target_user_ids.append(participant_user.id)
-
-            if has_creator_field and task.x_bitrix_creator_employee_id:
-                creator_user = self.get_user_from_employee(task.x_bitrix_creator_employee_id)
-                if creator_user and creator_user.id not in target_user_ids:
-                    target_user_ids.append(creator_user.id)
-
-            if 'user_ids' in task._fields:
-                if set(task.user_ids.ids) != set(target_user_ids):
-                    task.write({'user_ids': [(6, 0, target_user_ids)]})
-            elif 'user_id' in task._fields:
-                target_user_id = target_user_ids[0] if target_user_ids else False
-                if (task.user_id.id if task.user_id else False) != target_user_id:
-                    task.write({'user_id': target_user_id})
+            self.recompute_task_user_ids(task)
+            if hasattr(task, '_sync_bitrix_user_access'):
+                task._sync_bitrix_user_access(mirror_assignee_users=False)
 
     def _resolve_dept(self, dept_ids):
         """Return Odoo hr.department id for first known dept_id."""

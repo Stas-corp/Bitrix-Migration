@@ -40,12 +40,14 @@ def normalize_bitrix_markup(text, employee_name_map=None):
 
     employee_name_map = employee_name_map or {}
 
-    # [USER=ID]Name[/USER] → resolved name or original name in bold
+    # [USER=ID]Name[/USER] → resolved name or original name in bold; empty → ''
     def _replace_user(match):
         user_id = match.group(1)
         inner_name = match.group(2).strip()
         resolved = employee_name_map.get(str(user_id))
-        name = resolved or inner_name or f'User #{user_id}'
+        name = resolved or inner_name
+        if not name:
+            return ''
         return f'<strong>{_escape(name)}</strong>'
 
     text = re.sub(
@@ -54,9 +56,6 @@ def normalize_bitrix_markup(text, employee_name_map=None):
         text,
         flags=re.DOTALL | re.IGNORECASE,
     )
-
-    # Remove [USER=ID][/USER] (empty user tags)
-    text = re.sub(r'\[USER=\d+\]\s*\[/USER\]', '', text, flags=re.IGNORECASE)
 
     # [DISK FILE ID=...] — remove disk file references (handled via attachments)
     text = re.sub(r'\[DISK\s+FILE\s+ID=\d+\]', '', text, flags=re.IGNORECASE)

@@ -41,6 +41,28 @@ class BitrixTaskEmployeeLink(models.Model):
             """
         )
 
+        # Deduplicate responsible links: keep lowest id per task_id
+        self.env.cr.execute(
+            """
+            DELETE FROM bitrix_task_employee_link
+            WHERE role = 'responsible'
+              AND id NOT IN (
+                  SELECT MIN(id)
+                  FROM bitrix_task_employee_link
+                  WHERE role = 'responsible'
+                  GROUP BY task_id
+              )
+            """
+        )
+
+        # Partial unique index: at most one responsible per task
+        self.env.cr.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS bitrix_task_employee_link_one_responsible_per_task
+            ON bitrix_task_employee_link (task_id) WHERE role = 'responsible'
+            """
+        )
+
         # Idempotent migration from legacy m2m relation tables.
         self.env.cr.execute(
             """

@@ -37,10 +37,10 @@ class BitrixMySQLExtractor:
             t.ID AS external_id,
             t.TITLE AS name,
             CASE WHEN t.GROUP_ID > 0 THEN t.GROUP_ID ELSE NULL END AS project_external_id,
-            GROUP_CONCAT(DISTINCT CASE WHEN m.TYPE = 'R' THEN m.USER_ID END SEPARATOR ', ') AS responsible_user_ids,
-            GROUP_CONCAT(DISTINCT CASE WHEN m.TYPE = 'A' THEN m.USER_ID END SEPARATOR ', ') AS accomplice_user_ids,
-            GROUP_CONCAT(DISTINCT CASE WHEN m.TYPE = 'U' THEN m.USER_ID END SEPARATOR ', ') AS auditor_user_ids,
-            GROUP_CONCAT(DISTINCT CASE WHEN m.TYPE = 'O' THEN m.USER_ID END SEPARATOR ', ') AS originator_user_ids,
+            GROUP_CONCAT(DISTINCT CASE WHEN m.TYPE = 'R' THEN m.USER_ID END ORDER BY m.USER_ID SEPARATOR ', ') AS responsible_user_ids,
+            GROUP_CONCAT(DISTINCT CASE WHEN m.TYPE = 'A' THEN m.USER_ID END ORDER BY m.USER_ID SEPARATOR ', ') AS accomplice_user_ids,
+            GROUP_CONCAT(DISTINCT CASE WHEN m.TYPE = 'U' THEN m.USER_ID END ORDER BY m.USER_ID SEPARATOR ', ') AS auditor_user_ids,
+            GROUP_CONCAT(DISTINCT CASE WHEN m.TYPE = 'O' THEN m.USER_ID END ORDER BY m.USER_ID SEPARATOR ', ') AS originator_user_ids,
             (SELECT GROUP_CONCAT(DISTINCT tl.NAME SEPARATOR ', ')
              FROM b_tasks_task_tag tt
              JOIN b_tasks_label tl ON tl.ID = tt.TAG_ID
@@ -78,10 +78,10 @@ class BitrixMySQLExtractor:
             t.ID AS external_id,
             t.TITLE AS name,
             CASE WHEN t.GROUP_ID > 0 THEN t.GROUP_ID ELSE NULL END AS project_external_id,
-            GROUP_CONCAT(DISTINCT CASE WHEN m.TYPE = 'R' THEN m.USER_ID END SEPARATOR ', ') AS responsible_user_ids,
-            GROUP_CONCAT(DISTINCT CASE WHEN m.TYPE = 'A' THEN m.USER_ID END SEPARATOR ', ') AS accomplice_user_ids,
-            GROUP_CONCAT(DISTINCT CASE WHEN m.TYPE = 'U' THEN m.USER_ID END SEPARATOR ', ') AS auditor_user_ids,
-            GROUP_CONCAT(DISTINCT CASE WHEN m.TYPE = 'O' THEN m.USER_ID END SEPARATOR ', ') AS originator_user_ids,
+            GROUP_CONCAT(DISTINCT CASE WHEN m.TYPE = 'R' THEN m.USER_ID END ORDER BY m.USER_ID SEPARATOR ', ') AS responsible_user_ids,
+            GROUP_CONCAT(DISTINCT CASE WHEN m.TYPE = 'A' THEN m.USER_ID END ORDER BY m.USER_ID SEPARATOR ', ') AS accomplice_user_ids,
+            GROUP_CONCAT(DISTINCT CASE WHEN m.TYPE = 'U' THEN m.USER_ID END ORDER BY m.USER_ID SEPARATOR ', ') AS auditor_user_ids,
+            GROUP_CONCAT(DISTINCT CASE WHEN m.TYPE = 'O' THEN m.USER_ID END ORDER BY m.USER_ID SEPARATOR ', ') AS originator_user_ids,
             (SELECT GROUP_CONCAT(DISTINCT tl.NAME SEPARATOR ', ')
              FROM b_tasks_task_tag tt
              JOIN b_tasks_label tl ON tl.ID = tt.TAG_ID
@@ -241,7 +241,10 @@ class BitrixMySQLExtractor:
         FROM b_disk_attached_object ao
         JOIN b_disk_object do ON do.ID = ao.OBJECT_ID
         JOIN b_file bf ON bf.ID = do.FILE_ID
+        JOIN b_tasks t ON t.ID = ao.ENTITY_ID
         WHERE ao.ENTITY_TYPE = 'Bitrix\\\\Tasks\\\\Integration\\\\Disk\\\\Connector\\\\Task'
+          AND (t.ZOMBIE = 'N' OR t.ZOMBIE IS NULL)
+          AND {task_where_clause}
         ORDER BY ao.CREATE_TIME
     """
 
@@ -278,6 +281,7 @@ class BitrixMySQLExtractor:
         JOIN b_tasks t ON t.FORUM_TOPIC_ID = fm.TOPIC_ID
         WHERE ao.ENTITY_TYPE = 'Bitrix\\\\Disk\\\\Uf\\\\ForumMessageConnector'
           AND (t.ZOMBIE = 'N' OR t.ZOMBIE IS NULL)
+          AND {task_where_clause}
         ORDER BY ao.CREATE_TIME
     """
 

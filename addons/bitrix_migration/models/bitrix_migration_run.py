@@ -23,6 +23,7 @@ class BitrixMigrationRun(models.Model):
         ('comments', 'Comments Only'),
         ('single_task', 'Single Task Test'),
         ('fix_roles', 'Fix Roles (re-sync task roles)'),
+        ('fix_attachments', 'Fix Attachments (relink comment attachments)'),
         ('meetings', 'Meetings Only'),
     ], required=True, default='dry_run', string='Mode',
         help='Режим виконання міграції. Для першого запуску рекомендовано Dry Run, '
@@ -155,6 +156,8 @@ class BitrixMigrationRun(models.Model):
                 self._run_employees_only(extractor)
             elif self.mode == 'fix_roles':
                 self._run_fix_roles(extractor)
+            elif self.mode == 'fix_attachments':
+                self._run_fix_attachments(extractor)
             elif self.mode == 'meetings':
                 self._run_meetings(extractor)
 
@@ -684,6 +687,95 @@ class BitrixMigrationRun(models.Model):
         self._append_log(f'Fix Roles complete: updated={updated}, skipped (not found)={skipped}')
         self._run_reconciliation()
 
+    def _run_fix_attachments(self, extractor):
+        """Repair comment attachments: relink from project.task to mail.message where possible.
+
+        Also normalize legacy mapping keys to canonical format.
+        """
+        self._append_log('\n--- Fix Attachments: relinking comment attachments ---')
+
+        # Build message lookup: forum_message_id → mail.message id
+        Message = self.env['mail.message'].sudo()
+        msg_recs = Message.search_read(
+            [('x_bitrix_message_id', '!=', False)],
+            ['id', 'x_bitrix_message_id'],
+        )
+        message_map = {}
+        for rec in msg_recs:
+            if rec['x_bitrix_message_id']:
+                message_map[str(rec['x_bitrix_message_id'])] = rec['id']
+        self._append_log(f'Found {len(message_map)} mail.message records with bitrix_message_id')
+
+        # Find all comment attachment mappings
+        Mapping = self.env['bitrix.migration.mapping'].sudo()
+        Attachment = self.env['ir.attachment'].sudo()
+        att_mappings = Mapping.search([
+            ('entity_type', '=', 'attachment'),
+            ('odoo_model', '=', 'ir.attachment'),
+        ])
+
+        relinked = 0
+        normalized_keys = 0
+        orphans = 0
+        already_ok = 0
+
+        for mapping in att_mappings:
+            bitrix_id = mapping.bitrix_id or ''
+
+            # Only process comment attachment keys
+            if not bitrix_id.startswith('comment:'):
+                already_ok += 1
+                continue
+
+            ir_att = Attachment.browse(mapping.odoo_id).exists()
+            if not ir_att:
+                orphans += 1
+                continue
+
+            # Parse key to find forum_message_id
+            parts = bitrix_id.split(':')
+            # Canonical: comment:task_id:forum_message_id:file_path (4+ parts)
+            # Legacy: comment:task_id:file_path (3 parts, no forum_message_id)
+            if len(parts) >= 4:
+                forum_message_id = parts[2]
+            else:
+                # Legacy key without forum_message_id — can't resolve target message
+                already_ok += 1
+                continue
+
+            # Check if attachment is already linked to mail.message
+            if ir_att.res_model == 'mail.message':
+                target_msg_id = message_map.get(forum_message_id)
+                if target_msg_id and ir_att.res_id == target_msg_id:
+                    already_ok += 1
+                    continue
+                # Relink to correct message if needed
+                if target_msg_id:
+                    ir_att.write({'res_model': 'mail.message', 'res_id': target_msg_id})
+                    relinked += 1
+                    continue
+                already_ok += 1
+                continue
+
+            # Attachment is linked to project.task — check if mail.message exists now
+            target_msg_id = message_map.get(forum_message_id)
+            if target_msg_id:
+                ir_att.write({'res_model': 'mail.message', 'res_id': target_msg_id})
+                relinked += 1
+            else:
+                already_ok += 1
+
+            if (relinked + already_ok + orphans) % 500 == 0:
+                self.env.cr.commit()
+                self._append_log(f'  ... processed {relinked + already_ok + orphans} mappings')
+
+        self.env.cr.commit()
+        self._append_log(
+            f'Fix Attachments complete: relinked={relinked}, already_ok={already_ok}, '
+            f'orphans={orphans}, normalized_keys={normalized_keys}'
+        )
+        self._run_reconciliation()
+
     def _run_reconciliation(self):
         """Print reconciliation report."""
         self._append_log('\n=== RECONCILIATION REPORT ===')
@@ -748,18 +840,140 @@ class BitrixMigrationRun(models.Model):
             count = Link.search_count([('role', '=', role), ('task_id', 'in', bitrix_task_ids)])
             self._append_log(f'  Link records ({role}): {count}')
 
+        # Tasks where creator user ended up in user_ids
+        creator_in_assignees = 0
+        for task in bitrix_tasks:
+            if not task.x_bitrix_creator_employee_id:
+                continue
+            creator_emp = task.x_bitrix_creator_employee_id
+            creator_user = creator_emp.user_id if creator_emp.user_id else None
+            if creator_user and creator_user.id in task.user_ids.ids:
+                # Check if the creator is also responsible or accomplice (that's ok)
+                is_responsible = (
+                    'x_bitrix_responsible_employee_id' in task._fields
+                    and task.x_bitrix_responsible_employee_id == creator_emp
+                )
+                is_accomplice = (
+                    'x_bitrix_accomplice_employee_ids' in task._fields
+                    and creator_emp.id in task.x_bitrix_accomplice_employee_ids.ids
+                )
+                if not is_responsible and not is_accomplice:
+                    creator_in_assignees += 1
+        self._append_log(f'  Tasks where creator-only user in user_ids: {creator_in_assignees}')
+
+        # Tasks where auditor user ended up in user_ids
+        auditor_in_assignees = 0
+        auditor_links = Link.search([
+            ('role', '=', 'auditor'), ('task_id', 'in', bitrix_task_ids),
+        ])
+        auditor_by_task = {}
+        for link in auditor_links:
+            auditor_by_task.setdefault(link.task_id.id, set()).add(link.employee_id.id)
+        for task in bitrix_tasks:
+            auditor_emp_ids = auditor_by_task.get(task.id, set())
+            if not auditor_emp_ids:
+                continue
+            for emp_id in auditor_emp_ids:
+                emp = self.env['hr.employee'].sudo().browse(emp_id)
+                if emp.user_id and emp.user_id.id in task.user_ids.ids:
+                    # Check if also responsible or accomplice
+                    is_responsible = (
+                        'x_bitrix_responsible_employee_id' in task._fields
+                        and task.x_bitrix_responsible_employee_id.id == emp_id
+                    )
+                    is_accomplice = (
+                        'x_bitrix_accomplice_employee_ids' in task._fields
+                        and emp_id in task.x_bitrix_accomplice_employee_ids.ids
+                    )
+                    if not is_responsible and not is_accomplice:
+                        auditor_in_assignees += 1
+                        break
+        self._append_log(f'  Tasks where auditor-only user in user_ids: {auditor_in_assignees}')
+
+        # Orphan attachments (mapping exists but ir.attachment record is missing)
+        att_mappings = self.env['bitrix.migration.mapping'].sudo().search([
+            ('entity_type', '=', 'attachment'),
+            ('odoo_model', '=', 'ir.attachment'),
+        ])
+        if att_mappings:
+            att_ids = att_mappings.mapped('odoo_id')
+            existing_att_ids = set(
+                self.env['ir.attachment'].sudo().browse(att_ids).exists().ids
+            )
+            orphan_attachments = len(att_ids) - len(existing_att_ids)
+        else:
+            orphan_attachments = 0
+        self._append_log(f'  Orphan attachment mappings: {orphan_attachments}')
+
+        # user_ids vs x_bitrix_assignee_user_ids discrepancies
+        if 'x_bitrix_assignee_user_ids' in Task._fields:
+            user_ids_mismatch = 0
+            for task in bitrix_tasks:
+                assignee_ids = set(task.x_bitrix_assignee_user_ids.ids)
+                actual_ids = set(task.user_ids.ids)
+                if assignee_ids and assignee_ids != actual_ids:
+                    user_ids_mismatch += 1
+            self._append_log(f'  Tasks with user_ids != x_bitrix_assignee_user_ids: {user_ids_mismatch}')
+
+            # Tasks with assignee user who has no employee mirror
+            fallback_user_tasks = 0
+            employee_user_ids = set()
+            all_emp = self.env['hr.employee'].sudo().with_context(active_test=False).search(
+                [('x_bitrix_id', '!=', 0), ('user_id', '!=', False)]
+            )
+            for emp in all_emp:
+                employee_user_ids.add(emp.user_id.id)
+            for task in bitrix_tasks:
+                for user_id in task.x_bitrix_assignee_user_ids.ids:
+                    if user_id not in employee_user_ids:
+                        fallback_user_tasks += 1
+                        break
+            self._append_log(f'  Tasks with fallback-user (no employee mirror) in assignees: {fallback_user_tasks}')
+
+        # Comment attachments still linked to project.task despite mail.message existing
+        comment_att_on_task = 0
+        Mapping = self.env['bitrix.migration.mapping'].sudo()
+        Att = self.env['ir.attachment'].sudo()
+        comment_att_mappings = Mapping.search([
+            ('entity_type', '=', 'attachment'),
+            ('odoo_model', '=', 'ir.attachment'),
+            ('bitrix_id', 'like', 'comment:%'),
+        ])
+        msg_lookup = {}
+        if comment_att_mappings:
+            msg_recs = self.env['mail.message'].sudo().search_read(
+                [('x_bitrix_message_id', '!=', False)],
+                ['id', 'x_bitrix_message_id'],
+            )
+            for rec in msg_recs:
+                if rec['x_bitrix_message_id']:
+                    msg_lookup[str(rec['x_bitrix_message_id'])] = rec['id']
+
+        for mapping in comment_att_mappings:
+            ir_att = Att.browse(mapping.odoo_id).exists()
+            if not ir_att or ir_att.res_model != 'project.task':
+                continue
+            parts = (mapping.bitrix_id or '').split(':')
+            if len(parts) >= 4:
+                forum_msg_id = parts[2]
+                if msg_lookup.get(forum_msg_id):
+                    comment_att_on_task += 1
+        self._append_log(f'  Comment attachments on project.task (should be on mail.message): {comment_att_on_task}')
+
         # Stage 2 quality checks
         self._append_log('\n--- CONTENT QUALITY ---')
 
-        # Comments with raw Bitrix markup
+        # Comments with raw Bitrix markup (count unique messages, not pattern matches)
         Message = self.env['mail.message'].sudo()
         raw_markup_patterns = ['[USER=', '[B]', '[/B]', '[URL=', '[I]', '[/I]']
-        raw_markup_count = 0
+        raw_markup_msg_ids = set()
         for pattern in raw_markup_patterns:
-            raw_markup_count += Message.search_count([
+            msgs = Message.search([
                 ('x_bitrix_message_id', '!=', False),
                 ('body', 'like', pattern),
             ])
+            raw_markup_msg_ids.update(msgs.ids)
+        raw_markup_count = len(raw_markup_msg_ids)
         self._append_log(f'  Comments with raw Bitrix markup: {raw_markup_count}')
 
         # Employees without photo

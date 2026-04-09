@@ -60,6 +60,7 @@ addons/bitrix_migration/
 - `db_table_exists(table)` / `db_column_exists(table, col)` — introspection с кешем
 - `find_employee_by_bitrix_id(bitrix_user_id, employee_map)` — lookup hr.employee
 - `log_once(key, message)` — дедупликация предупреждений
+- `recompute_task_user_ids(task)` — единый пересчёт `user_ids` из canonical responsible + accomplices
 
 ### Экстрактор
 `BitrixMySQLExtractor` принимает `date_from` для фильтрации. SQL-запросы — шаблоны с `{task_where_clause}` / `{project_where_clause}`. Колонка даты определяется автоматически через `_get_existing_mysql_column()`.
@@ -78,6 +79,7 @@ addons/bitrix_migration/
 | `departments_only` | Только отделы |
 | `employees_only` | Только сотрудники |
 | `fix_roles` | Пересинхронизация ролей у уже импортированных задач |
+| `fix_attachments` | Repair: перелінковка comment attachments з `project.task` на `mail.message` |
 | `meetings` | Только зустрічі (calendar.event) |
 
 ### Создание пользователей
@@ -97,11 +99,13 @@ Pydantic v2. Все поля валидируются через `field_validato
 | `project.project` | `x_bitrix_id` | Integer | Bitrix ID проекта |
 | `project.task` | `x_bitrix_id` | Integer | Bitrix ID задачи |
 | `project.task` | `x_bitrix_created_at` | Datetime | Оригинальная дата создания |
-| `project.task` | `x_bitrix_responsible_employee_ids` | Many2many hr.employee (computed) | Відповідальний (Bitrix TYPE='R') |
+| `project.task` | `x_bitrix_responsible_employee_id` | Many2one hr.employee (computed) | Канонічний відповідальний (Bitrix TYPE='R') |
+| `project.task` | `x_bitrix_responsible_employee_ids` | Many2many hr.employee (computed, deprecated) | Deprecated mirror: 0/1 employee |
 | `project.task` | `x_bitrix_accomplice_employee_ids` | Many2many hr.employee (computed) | Співвиконавці (Bitrix TYPE='A') |
 | `project.task` | `x_bitrix_auditor_employee_ids` | Many2many hr.employee (computed) | Наглядачі (Bitrix TYPE='U') |
 | `project.task` | `x_bitrix_originator_employee_id` | Many2one hr.employee (computed) | Постановник (Bitrix TYPE='O') |
 | `project.task` | `x_bitrix_creator_employee_id` | Many2one hr.employee | Автор (CREATED_BY) |
+| `project.task` | `x_bitrix_assignee_user_ids` | Many2many res.users (stored) | Канонічний набір виконавців (R+A → res.users, вкл. fallback через user_map) |
 | `project.task.type` | `x_bitrix_id` | Integer | Bitrix ID стадии |
 | `hr.employee` | `x_bitrix_id` | Integer | Bitrix user ID |
 | `hr.employee` | `x_bitrix_telegram` | Char | Telegram-логин |
@@ -115,14 +119,16 @@ Pydantic v2. Все поля валидируются через `field_validato
 
 | Bitrix TYPE | Bitrix роль | Odoo поле | role в link-таблице | Попадает в user_ids? |
 |---|---|---|---|---|
-| `R` | Відповідальний | `x_bitrix_responsible_employee_ids` | `responsible` | Да |
+| `R` | Відповідальний | `x_bitrix_responsible_employee_id` (Many2one, canonical) | `responsible` | Да |
 | `A` | Співвиконавець | `x_bitrix_accomplice_employee_ids` | `accomplice` | Да |
 | `U` | Наглядач | `x_bitrix_auditor_employee_ids` | `auditor` | Нет |
 | `O` | Постановник | `x_bitrix_originator_employee_id` | `originator` | Нет |
 | `CREATED_BY` | Автор/Creator | `x_bitrix_creator_employee_id` | — (прямое Many2one) | Нет |
 
-Все роли хранятся в `bitrix.task.employee.link` (task_id, employee_id, role) с UNIQUE constraint.
-В Odoo `user_ids` содержит **только** відповідального + співвиконавців. Наглядачі, постановник и автор туда не попадают.
+Все роли хранятся в `bitrix.task.employee.link` (task_id, employee_id, role) с UNIQUE constraint + partial unique index на `(task_id) WHERE role = 'responsible'`.
+
+`x_bitrix_assignee_user_ids` — канонічний набір виконавців (`res.users`), резолвиться з `R + A` через `hr.employee → user` + fallback через `user_map`. `user_ids` — дзеркало `x_bitrix_assignee_user_ids`.
+Наглядачі, постановник і автор **не** потрапляють у `user_ids` / `x_bitrix_assignee_user_ids`.
 
 ## Нормализация Bitrix markup
 
@@ -142,9 +148,14 @@ Pydantic v2. Все поля валидируются через `field_validato
 
 ## Вкладення (attachments)
 
-Ключ ідемпотентності: `{entity_type}:{entity_id}:{file_path}` (compound key).
+Ключ ідемпотентності:
+- Task attachments: `task:{task_external_id}:{file_path}`
+- Comment attachments: `comment:{task_external_id}:{forum_message_id}:{file_path}`
+
+Legacy plain `file_path` keys продовжують читатися для backward-safe skip.
 Вкладення коментарів прив'язуються до `mail.message` через `x_bitrix_message_id = forum_message_id`.
 Якщо відповідний `mail.message` не знайдено — fallback на `project.task`.
+Attachment SQL-запити фільтруються тим же `task_where_clause`, що й задачі/коментарі.
 
 ## Аватарки співробітників
 

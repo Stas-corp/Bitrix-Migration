@@ -50,6 +50,19 @@ class TestAttachmentIdempotency(TransactionCase):
         key2 = f'task:100:/upload/test.pdf'
         self.assertEqual(key1, key2)
 
+    def test_comment_compound_key_includes_forum_message_id(self):
+        """Comment attachment key includes forum_message_id for uniqueness."""
+        # Two comments on the same task with same file_path but different forum_message_id
+        key1 = f'comment:100:555:/upload/test.pdf'
+        key2 = f'comment:100:666:/upload/test.pdf'
+        self.assertNotEqual(key1, key2)
+
+    def test_comment_compound_key_same_message_same_file(self):
+        """Same comment + same file produces identical key."""
+        key1 = f'comment:100:555:/upload/test.pdf'
+        key2 = f'comment:100:555:/upload/test.pdf'
+        self.assertEqual(key1, key2)
+
     # ── 2.08: Comment attachment linking ────────────────────────────
 
     def test_mail_message_has_bitrix_fields(self):

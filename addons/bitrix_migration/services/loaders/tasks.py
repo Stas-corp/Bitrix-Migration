@@ -219,9 +219,18 @@ class TaskLoader(BaseLoader):
             originator_bitrix_ids, user_map, employee_map,
         )
 
+        # Canonical responsible: take only the first R (deterministic via ORDER BY USER_ID)
+        canonical_responsible_eid = responsible_employee_ids[0] if responsible_employee_ids else False
+        if len(responsible_employee_ids) > 1:
+            self.log_once(
+                f'multi_responsible_{record.x_bitrix_id}',
+                f'Task {record.x_bitrix_id} has {len(responsible_employee_ids)} source R entries; '
+                f'using first (employee_id={canonical_responsible_eid}), ignoring rest',
+            )
+
         # Sync employee links per role
-        self._sync_employee_links(
-            record, 'x_bitrix_responsible_employee_ids', responsible_employee_ids,
+        self._sync_employee_m2o_link(
+            record, 'x_bitrix_responsible_employee_id', canonical_responsible_eid,
         )
         self._sync_employee_links(
             record, 'x_bitrix_accomplice_employee_ids', accomplice_employee_ids,
@@ -229,41 +238,34 @@ class TaskLoader(BaseLoader):
         self._sync_employee_links(
             record, 'x_bitrix_auditor_employee_ids', auditor_employee_ids,
         )
-        # Originator is Many2one — take first
         originator_eid = originator_employee_ids[0] if originator_employee_ids else False
         self._sync_employee_m2o_link(
             record, 'x_bitrix_originator_employee_id', originator_eid,
         )
 
-        # Warn if multiple responsible
-        if len(responsible_employee_ids) > 1:
-            self.log_once(
-                f'multi_responsible_{record.x_bitrix_id}',
-                f'Task {record.x_bitrix_id} has {len(responsible_employee_ids)} responsible employees',
-            )
+        # Build canonical assignee user_ids from R + A (includes user_map fallback)
+        assignee_user_ids = list(responsible_user_ids)
+        for uid in accomplice_user_ids:
+            if uid not in assignee_user_ids:
+                assignee_user_ids.append(uid)
 
-        # user_ids = only responsible + accomplice (not auditors, originator, creator)
-        assignee_user_ids = self._merge_bitrix_user_ids(
-            responsible_bitrix_ids, accomplice_bitrix_ids,
-        )
-        _, user_ids = self._resolve_task_users(
-            assignee_user_ids, user_map, employee_map,
-        )
+        # Persist canonical assignees in x_bitrix_assignee_user_ids
+        if 'x_bitrix_assignee_user_ids' in record._fields:
+            target_sorted = sorted(set(assignee_user_ids))
+            if set(record.x_bitrix_assignee_user_ids.ids) != set(target_sorted):
+                record.write({'x_bitrix_assignee_user_ids': [(6, 0, target_sorted)]})
 
-        task_fields = record._fields
-        if 'user_ids' in task_fields:
-            target_user_ids = sorted(set(user_ids))
-            if set(record.user_ids.ids) != set(target_user_ids):
-                record.write({'user_ids': [(6, 0, target_user_ids)]})
-            self._subscribe_project_followers(record.project_id, target_user_ids)
-        elif 'user_id' in task_fields:
-            target_user_id = user_ids[0] if user_ids else False
-            if (record.user_id.id if record.user_id else False) != target_user_id:
-                record.write({'user_id': target_user_id})
-            self._subscribe_project_followers(
-                record.project_id,
-                [target_user_id] if target_user_id else [],
-            )
+        # Mirror to user_ids
+        self._recompute_task_user_ids(record)
+
+    def _recompute_task_user_ids(self, record):
+        """Recompute user_ids and subscribe project followers."""
+        self.recompute_task_user_ids(record)
+        # Also subscribe project followers for the resulting user_ids
+        if 'user_ids' in record._fields:
+            self._subscribe_project_followers(record.project_id, record.user_ids.ids)
+        elif 'user_id' in record._fields and record.user_id:
+            self._subscribe_project_followers(record.project_id, [record.user_id.id])
 
     def _subscribe_project_followers(self, project, user_ids):
         if not project or not user_ids:
