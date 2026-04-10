@@ -461,7 +461,7 @@ class BitrixMigrationRun(models.Model):
         project_id = task_row.get('project_external_id')
         if project_id:
             self._append_log(f'\n--- Project {project_id} ---')
-            raw_projects = [p for p in extractor.get_projects() if p['external_id'] == project_id]
+            raw_projects = extractor.get_project_by_id(int(project_id))
             if raw_projects:
                 proj_loader = ProjectLoader(self.env, extractor, log_callback=self._append_log)
                 for row in raw_projects:

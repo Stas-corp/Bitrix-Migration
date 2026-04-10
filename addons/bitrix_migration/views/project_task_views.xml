@@ -84,7 +84,16 @@
         <field name="name">My Tasks</field>
         <field name="res_model">project.task</field>
         <field name="view_mode">list,kanban,form,activity,calendar</field>
-        <field name="domain">['|', ('user_ids', 'in', [uid]), ('x_bitrix_auditor_employee_ids.user_id', '=', uid)]</field>
+        <field name="domain">[('user_ids', 'in', [uid])]</field>
+        <field name="context">{'create': False}</field>
+        <field name="search_view_id" ref="project.view_task_search_form_base"/>
+    </record>
+
+    <record id="action_project_task_my_bitrix_watched" model="ir.actions.act_window">
+        <field name="name">Watched Tasks</field>
+        <field name="res_model">project.task</field>
+        <field name="view_mode">list,kanban,form,activity,calendar</field>
+        <field name="domain">[('x_bitrix_auditor_employee_ids.user_id', '=', uid)]</field>
         <field name="context">{'create': False}</field>
         <field name="search_view_id" ref="project.view_task_search_form_base"/>
     </record>
@@ -93,7 +102,7 @@
         <field name="name">Projects</field>
         <field name="res_model">project.project</field>
         <field name="view_mode">kanban,list,form,activity</field>
-        <field name="domain">['|', ('task_ids.user_ids', 'in', [uid]), ('task_ids.x_bitrix_auditor_employee_ids.user_id', '=', uid)]</field>
+        <field name="domain">[('task_ids.user_ids', 'in', [uid])]</field>
         <field name="context">{'create': False}</field>
     </record>
 
@@ -103,10 +112,16 @@
               sequence="35"
               groups="bitrix_migration.group_bitrix_task_employee"/>
 
+    <menuitem id="menu_my_bitrix_watched_tasks"
+              name="Watched Tasks"
+              action="action_project_task_my_bitrix_watched"
+              sequence="36"
+              groups="bitrix_migration.group_bitrix_task_employee"/>
+
     <menuitem id="menu_my_bitrix_projects"
               name="Projects"
               action="action_project_project_my_bitrix_projects"
-              sequence="36"
+              sequence="37"
               groups="bitrix_migration.group_bitrix_task_employee"/>
 
 </odoo>

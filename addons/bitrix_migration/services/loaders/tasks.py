@@ -77,10 +77,19 @@ class TaskLoader(BaseLoader):
 
         if task.project_external_id:
             target_project_id = project_map.get(str(task.project_external_id)) or False
-            if target_project_id and stage_meta and stage_meta['entity_type'] == 'G':
-                if target_project_id in stage_meta['project_ids']:
-                    target_stage_id = stage_meta['id']
-            return target_project_id, target_stage_id
+            if target_project_id:
+                if stage_meta and stage_meta['entity_type'] == 'G':
+                    if target_project_id in stage_meta['project_ids']:
+                        target_stage_id = stage_meta['id']
+                return target_project_id, target_stage_id
+            if self.fallback_project_id:
+                self.log_once(
+                    f'missing_project_{task.project_external_id}',
+                    f'WARNING: Bitrix project {task.project_external_id} not in mapping, '
+                    f'task {task.external_id} assigned to fallback project',
+                )
+                return self.fallback_project_id, self._resolve_no_project_stage_id(task)
+            return False, False
 
         if self.fallback_project_id:
             return self.fallback_project_id, self._resolve_no_project_stage_id(task)

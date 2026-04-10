@@ -27,8 +27,32 @@ class BitrixMySQLExtractor:
             g.DESCRIPTION AS description
         FROM b_sonet_group g
         LEFT JOIN b_user u ON u.ID = g.OWNER_ID
-        WHERE {project_where_clause}
+        WHERE ({project_where_clause})
+           OR g.ID IN (
+               SELECT DISTINCT t.GROUP_ID FROM b_tasks t
+               WHERE t.GROUP_ID > 0
+                 AND (t.ZOMBIE = 'N' OR t.ZOMBIE IS NULL)
+                 AND {task_where_clause}
+           )
         ORDER BY g.ID
+    """
+
+    SQL_PROJECT_BY_ID = """
+        SELECT
+            g.ID AS external_id,
+            g.NAME AS name,
+            CASE WHEN g.PROJECT = 'Y' THEN 'project' ELSE 'workgroup' END AS type,
+            CASE WHEN g.CLOSED = 'Y' THEN 1 ELSE 0 END AS closed,
+            g.OWNER_ID AS owner_bitrix_id,
+            (SELECT GROUP_CONCAT(gt.NAME SEPARATOR ', ')
+             FROM b_sonet_group_tag gt WHERE gt.GROUP_ID = g.ID) AS tags,
+            u.ID AS user_id,
+            g.PROJECT_DATE_START AS date_start,
+            g.PROJECT_DATE_FINISH AS date_end,
+            g.DESCRIPTION AS description
+        FROM b_sonet_group g
+        LEFT JOIN b_user u ON u.ID = g.OWNER_ID
+        WHERE g.ID = %s
     """
 
     # ── Tasks ─────────────────────────────────────────────────────────
@@ -63,7 +87,13 @@ class BitrixMySQLExtractor:
     SQL_COUNT_PROJECTS_TEMPLATE = """
         SELECT COUNT(*) AS cnt
         FROM b_sonet_group g
-        WHERE {project_where_clause}
+        WHERE ({project_where_clause})
+           OR g.ID IN (
+               SELECT DISTINCT t.GROUP_ID FROM b_tasks t
+               WHERE t.GROUP_ID > 0
+                 AND (t.ZOMBIE = 'N' OR t.ZOMBIE IS NULL)
+                 AND {task_where_clause}
+           )
     """
 
     SQL_COUNT_TASKS_TEMPLATE = """
@@ -579,11 +609,25 @@ class BitrixMySQLExtractor:
 
     # ── Extract methods ───────────────────────────────────────────────
 
+    def _get_project_combined_params(self):
+        proj_params = self._get_project_params()
+        task_params = self._get_task_params()
+        parts = []
+        if proj_params:
+            parts.extend(proj_params)
+        if task_params:
+            parts.extend(task_params)
+        return tuple(parts) if parts else None
+
     def get_projects(self):
         sql = self.SQL_PROJECTS_TEMPLATE.format(
             project_where_clause=self._get_project_where_clause(),
+            task_where_clause=self._get_task_where_clause(),
         )
-        return self._execute(sql, self._get_project_params())
+        return self._execute(sql, self._get_project_combined_params())
+
+    def get_project_by_id(self, project_id):
+        return self._execute(self.SQL_PROJECT_BY_ID, (project_id,))
 
     def get_tasks(self):
         sql = self.SQL_TASKS_TEMPLATE.format(
@@ -797,8 +841,9 @@ class BitrixMySQLExtractor:
     def count_projects(self):
         sql = self.SQL_COUNT_PROJECTS_TEMPLATE.format(
             project_where_clause=self._get_project_where_clause(),
+            task_where_clause=self._get_task_where_clause(),
         )
-        result = self._execute(sql, self._get_project_params())
+        result = self._execute(sql, self._get_project_combined_params())
         return result[0]['cnt'] if result else 0
 
     def count_tasks(self):
