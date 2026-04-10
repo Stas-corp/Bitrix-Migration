@@ -47,6 +47,7 @@ odoo -u bitrix_migration -d <db_name> --stop-after-init
 3. При необходимости создайте пользователей сотрудников:
    - `Create Employee Users`
    - `Send Password Reset`
+4. Для полного HR-очищения используйте отдельную destructive-кнопку `Purge HR Data`.
 
 ## 6) Логика задач без проекта (актуальная)
 
@@ -81,8 +82,21 @@ odoo -u bitrix_migration -d <db_name> --stop-after-init
 - `Run Migration` — запуск выбранного режима.
 - `Reset` — сброс checkpoint-ов.
 - `Purge Imported Data` — удаление импортированных сущностей (осторожно).
+- `Purge HR Data` — удаление всех `hr.employee`, всех `hr.department` и связанных employee users/contacts.
 
-## 9) Быстрая проверка после запуска
+## 9) Purge HR Data
+
+- Это отдельная HR-scoped операция, а не глобальная очистка всей базы контактов.
+- Удаляются:
+  - все `hr.employee`, включая архивные и давно существовавшие;
+  - все `hr.department`;
+  - связанные с ними `res.users`;
+  - связанные с ними `res.partner`.
+- Не выполняется массовый purge всех `res.partner` по всей системе.
+- Если конкретного user/contact нельзя удалить из-за protected-логики Odoo или внешних связей, запись пропускается, а причина пишется в `Log Output`.
+- После выполнения очищаются HR mappings, checkpoints `user/employee/department` и состояние фоновой синхронизации аватаров.
+
+## 10) Быстрая проверка после запуска
 
 - В логе нет блока `ERROR`.
 - `Tasks without project` в reconciliation = `0`.

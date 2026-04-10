@@ -19,6 +19,10 @@
                             type="object" class="btn-danger"
                             invisible="state == 'running'"
                             confirm="This will delete imported Bitrix tasks, projects, stages, comments, meetings, attachments, tags, mappings and checkpoints. HR records are kept intact. Continue?"/>
+                    <button name="action_purge_hr_data" string="Purge HR Data"
+                            type="object" class="btn-danger"
+                            invisible="state == 'running'"
+                            confirm="This will delete all employees and departments in Odoo, plus employee-linked users and contacts, including pre-existing records not imported from Bitrix. Protected or still-linked users/contacts will be skipped and logged. Continue?"/>
                     <button name="action_create_employee_users" string="Create Employee Users"
                             type="object" class="btn-secondary"
                             invisible="state == 'running'"
@@ -146,6 +150,7 @@
                                         <li>Для HR-міграції спочатку оберіть <b>HR: Departments + Employees</b> або потрібний HR-режим.</li>
                                         <li>Далі використовуйте інші режими: <b>Dry Run</b>, <b>Full Migration</b>, <b>Pilot</b> тощо.</li>
                                         <li>Виконайте <b>Create Employee Users</b> і <b>Send Password Reset</b> для створення користувачів співробітникам.</li>
+                                        <li><b>Purge HR Data</b> використовуйте лише для повного очищення всіх співробітників, підрозділів і повʼязаних employee users/contacts.</li>
                                     </ol>
                                 </div>
 
@@ -169,6 +174,13 @@
                                     <li><b>Import From Date</b> — обмежує імпорт датою початку.</li>
                                     <li><b>Fallback Project</b> — проєкт для задач без проєкту в Bitrix; якщо порожньо, створиться автоматично.</li>
                                     <li><b>Test Employee</b> — співробітник для перевірочного створення користувача і доступів.</li>
+                                </ul>
+
+                                <h4 style="margin:0 0 8px 0;">Danger Zone</h4>
+                                <ul class="text-muted" style="margin:0 0 16px 18px;">
+                                    <li><b>Purge Imported Data</b> — видаляє лише імпортовані Bitrix-сутності; HR-записи не чіпає.</li>
+                                    <li><b>Purge HR Data</b> — видаляє всі `hr.employee` і `hr.department`, а також повʼязані `res.users` / `res.partner` у HR-скоупі.</li>
+                                    <li>Захищені користувачі або контакти, які неможливо видалити, будуть пропущені; деталі дивіться у <b>Log Output</b>.</li>
                                 </ul>
 
                                 <h4 style="margin:0 0 8px 0;">Troubleshooting</h4>

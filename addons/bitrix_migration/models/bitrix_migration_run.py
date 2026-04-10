@@ -1654,6 +1654,247 @@ class BitrixMigrationRun(models.Model):
 
         return deleted
 
+    def _clear_named_checkpoints(self, checkpoint_keys):
+        params = self.env['ir.config_parameter'].sudo()
+        for key in checkpoint_keys:
+            params.set_param(f'bitrix_migration.checkpoint.{key}', '')
+        self.env.cr.commit()
+
+    def _reset_avatar_sync_state(self):
+        self.sudo().write({
+            'avatar_sync_state': False,
+            'avatar_last_user_id': 0,
+            'avatar_total_count': 0,
+            'avatar_processed_count': 0,
+            'avatar_imported_count': 0,
+            'avatar_propagated_count': 0,
+            'avatar_error_count': 0,
+        })
+        self.env.cr.commit()
+
+    def _collect_hr_purge_snapshot(self):
+        Employee = self.env['hr.employee'].sudo().with_context(active_test=False)
+        Department = self.env['hr.department'].sudo().with_context(active_test=False)
+        Users = self.env['res.users'].sudo().with_context(active_test=False)
+        Link = self.env['bitrix.task.employee.link'].sudo()
+
+        employees = Employee.search([])
+        departments = Department.search([])
+        employee_ids = employees.ids
+        department_ids = departments.ids
+
+        user_ids = set()
+        partner_ids = set()
+
+        if 'user_id' in Employee._fields:
+            user_ids.update(uid for uid in employees.mapped('user_id').ids if uid)
+        if 'work_contact_id' in Employee._fields:
+            partner_ids.update(pid for pid in employees.mapped('work_contact_id').ids if pid)
+        if 'address_home_id' in Employee._fields:
+            partner_ids.update(pid for pid in employees.mapped('address_home_id').ids if pid)
+
+        if partner_ids:
+            related_users = Users.search([('partner_id', 'in', sorted(partner_ids))])
+            user_ids.update(related_users.ids)
+
+        if user_ids:
+            partner_ids.update(
+                pid for pid in Users.browse(sorted(user_ids)).exists().mapped('partner_id').ids if pid
+            )
+
+        task_ids = []
+        if employee_ids:
+            task_ids = Link.search([('employee_id', 'in', employee_ids)]).mapped('task_id').ids
+
+        return {
+            'employee_ids': sorted(set(employee_ids)),
+            'department_ids': sorted(set(department_ids)),
+            'user_ids': sorted(user_ids),
+            'partner_ids': sorted(partner_ids),
+            'task_ids': sorted(set(task_ids)),
+        }
+
+    def _prepare_hr_records_for_purge(self, employee_ids):
+        employee_ids = [eid for eid in employee_ids if eid]
+        if not employee_ids:
+            return
+
+        Message = self.env['mail.message'].sudo().with_context(active_test=False)
+        Task = self.env['project.task'].sudo().with_context(active_test=False)
+        Department = self.env['hr.department'].sudo().with_context(active_test=False)
+
+        messages = Message.search([('x_bitrix_author_employee_id', 'in', employee_ids)])
+        if messages:
+            messages.write({'x_bitrix_author_employee_id': False})
+            self._append_log(f'Cleared Bitrix author employee on messages: {len(messages)}')
+
+        if 'x_bitrix_creator_employee_id' in Task._fields:
+            tasks = Task.search([('x_bitrix_creator_employee_id', 'in', employee_ids)])
+            if tasks:
+                tasks.write({'x_bitrix_creator_employee_id': False})
+                self._append_log(f'Cleared Bitrix creator employee on tasks: {len(tasks)}')
+
+        if 'manager_id' in Department._fields:
+            departments = Department.search([('manager_id', 'in', employee_ids)])
+            if departments:
+                departments.write({'manager_id': False})
+                self._append_log(f'Cleared department managers linked to purged employees: {len(departments)}')
+
+        self.env.cr.commit()
+
+    def _unlink_ids_safely(self, model_name, ids, label, batch_size=200, batch_first=False):
+        Model = self.env[model_name].sudo().with_context(active_test=False)
+        ordered_ids = [int(record_id) for record_id in ids if record_id]
+        deleted = 0
+        skipped = 0
+
+        for start in range(0, len(ordered_ids), batch_size):
+            batch_ids = ordered_ids[start:start + batch_size]
+            batch = Model.browse(batch_ids).exists()
+            if not batch:
+                continue
+
+            if batch_first and len(batch) > 1:
+                try:
+                    batch_count = len(batch)
+                    batch.unlink()
+                    deleted += batch_count
+                    self._append_log(f'Purged {label}: {deleted}')
+                    self.env.cr.commit()
+                    continue
+                except Exception as e:
+                    self.env.cr.rollback()
+                    self._append_log(
+                        f'Batch unlink failed for {label}, retrying one by one: {e}'
+                    )
+
+            for record in batch:
+                display_name = record.display_name
+                try:
+                    record.unlink()
+                    deleted += 1
+                    if deleted % 25 == 0:
+                        self._append_log(f'Purged {label}: {deleted}')
+                except Exception as e:
+                    self.env.cr.rollback()
+                    skipped += 1
+                    self._append_log(
+                        f'SKIP {label} id={record.id} name={display_name}: {e}'
+                    )
+                self.env.cr.commit()
+
+        if deleted and deleted % 25:
+            self._append_log(f'Purged {label}: {deleted}')
+
+        return deleted, skipped
+
+    def _resync_tasks_after_employee_purge(self, task_ids, batch_size=200):
+        Task = self.env['project.task'].sudo().with_context(active_test=False)
+        ordered_ids = [int(task_id) for task_id in task_ids if task_id]
+        synced = 0
+        skipped = 0
+
+        for start in range(0, len(ordered_ids), batch_size):
+            batch_ids = ordered_ids[start:start + batch_size]
+            batch = Task.browse(batch_ids).exists()
+            if not batch:
+                continue
+
+            try:
+                batch._sync_bitrix_user_access(mirror_assignee_users=True)
+                synced += len(batch)
+                self._append_log(f'Resynced affected tasks: {synced}')
+                self.env.cr.commit()
+                continue
+            except Exception as e:
+                self.env.cr.rollback()
+                self._append_log(
+                    f'Batch task resync failed, retrying one by one: {e}'
+                )
+
+            for task in batch:
+                try:
+                    task._sync_bitrix_user_access(mirror_assignee_users=True)
+                    synced += 1
+                except Exception as e:
+                    self.env.cr.rollback()
+                    skipped += 1
+                    self._append_log(
+                        f'SKIP task resync id={task.id} name={task.display_name}: {e}'
+                    )
+                self.env.cr.commit()
+
+        return synced, skipped
+
+    def _purge_hr_related_partners(self, partner_ids, batch_size=200):
+        Partner = self.env['res.partner'].sudo().with_context(active_test=False)
+        Users = self.env['res.users'].sudo().with_context(active_test=False)
+        Employee = self.env['hr.employee'].sudo().with_context(active_test=False)
+        ordered_ids = [int(partner_id) for partner_id in partner_ids if partner_id]
+        deleted = 0
+        skipped = 0
+
+        for start in range(0, len(ordered_ids), batch_size):
+            batch_ids = ordered_ids[start:start + batch_size]
+            batch = Partner.browse(batch_ids).exists()
+            if not batch:
+                continue
+
+            for partner in batch:
+                if Users.search_count([('partner_id', '=', partner.id)]):
+                    skipped += 1
+                    self._append_log(
+                        f'SKIP contacts id={partner.id} name={partner.display_name}: still linked to surviving users'
+                    )
+                    continue
+
+                still_linked_to_employee = False
+                if 'work_contact_id' in Employee._fields:
+                    still_linked_to_employee = bool(
+                        Employee.search_count([('work_contact_id', '=', partner.id)])
+                    )
+                if not still_linked_to_employee and 'address_home_id' in Employee._fields:
+                    still_linked_to_employee = bool(
+                        Employee.search_count([('address_home_id', '=', partner.id)])
+                    )
+                if still_linked_to_employee:
+                    skipped += 1
+                    self._append_log(
+                        f'SKIP contacts id={partner.id} name={partner.display_name}: still linked to surviving employees'
+                    )
+                    continue
+
+                try:
+                    partner.unlink()
+                    deleted += 1
+                    if deleted % 25 == 0:
+                        self._append_log(f'Purged contacts: {deleted}')
+                except Exception as e:
+                    self.env.cr.rollback()
+                    skipped += 1
+                    self._append_log(
+                        f'SKIP contacts id={partner.id} name={partner.display_name}: {e}'
+                    )
+                self.env.cr.commit()
+
+        if deleted and deleted % 25:
+            self._append_log(f'Purged contacts: {deleted}')
+
+        return deleted, skipped
+
+    def _cleanup_hr_purge_metadata(self):
+        Mapping = self.env['bitrix.migration.mapping'].sudo()
+        mappings = Mapping.search([('entity_type', 'in', ['employee', 'user', 'department'])])
+        deleted_mappings = len(mappings)
+        if mappings:
+            mappings.unlink()
+            self._append_log(f'Cleared HR mappings: {deleted_mappings}')
+        self._clear_named_checkpoints(['user', 'employee', 'department'])
+        self._append_log('Cleared HR checkpoints: user, employee, department')
+        self._reset_avatar_sync_state()
+        self._append_log('Reset avatar sync state')
+        return deleted_mappings
+
     def action_purge_data(self):
         self.ensure_one()
         self.state = 'running'
@@ -1719,15 +1960,116 @@ class BitrixMigrationRun(models.Model):
 
         self.env.cr.commit()
 
+    def action_purge_hr_data(self):
+        self.ensure_one()
+        self.state = 'running'
+        self.log_output = '=== HR purge started ==='
+        self.progress = 0.0
+        self.env.cr.commit()
+
+        try:
+            snapshot = self._collect_hr_purge_snapshot()
+            self._append_log(
+                'HR purge snapshot: '
+                f"employees={len(snapshot['employee_ids'])}, "
+                f"departments={len(snapshot['department_ids'])}, "
+                f"users={len(snapshot['user_ids'])}, "
+                f"contacts={len(snapshot['partner_ids'])}, "
+                f"tasks={len(snapshot['task_ids'])}"
+            )
+
+            self.progress = 10.0
+            self.env.cr.commit()
+
+            self._append_log('Clearing HR-linked references before purge...')
+            self._prepare_hr_records_for_purge(snapshot['employee_ids'])
+
+            self.progress = 20.0
+            self.env.cr.commit()
+
+            self._append_log('Removing employees...')
+            employees_deleted, employees_skipped = self._unlink_ids_safely(
+                'hr.employee',
+                snapshot['employee_ids'],
+                'employees',
+                batch_size=200,
+                batch_first=True,
+            )
+
+            self.progress = 40.0
+            self.env.cr.commit()
+
+            self._append_log('Re-syncing tasks after employee purge...')
+            tasks_synced, task_sync_skipped = self._resync_tasks_after_employee_purge(
+                snapshot['task_ids'],
+                batch_size=200,
+            )
+
+            self.progress = 55.0
+            self.env.cr.commit()
+
+            self._append_log('Removing departments...')
+            departments_deleted, departments_skipped = self._unlink_ids_safely(
+                'hr.department',
+                snapshot['department_ids'],
+                'departments',
+                batch_size=200,
+                batch_first=True,
+            )
+
+            self.progress = 70.0
+            self.env.cr.commit()
+
+            self._append_log('Removing related users...')
+            users_deleted, users_skipped = self._unlink_ids_safely(
+                'res.users',
+                snapshot['user_ids'],
+                'users',
+                batch_size=50,
+                batch_first=False,
+            )
+
+            self.progress = 85.0
+            self.env.cr.commit()
+
+            self._append_log('Removing related contacts...')
+            contacts_deleted, contacts_skipped = self._purge_hr_related_partners(
+                snapshot['partner_ids'],
+                batch_size=100,
+            )
+
+            self.progress = 95.0
+            self.env.cr.commit()
+
+            self._append_log('Clearing HR mappings, checkpoints and avatar state...')
+            mappings_deleted = self._cleanup_hr_purge_metadata()
+
+            self.state = 'draft'
+            self.progress = 0.0
+            self._append_log(
+                '=== HR purge completed successfully: '
+                f'employees_deleted={employees_deleted}, employees_skipped={employees_skipped}, '
+                f'tasks_synced={tasks_synced}, task_sync_skipped={task_sync_skipped}, '
+                f'departments_deleted={departments_deleted}, departments_skipped={departments_skipped}, '
+                f'users_deleted={users_deleted}, users_skipped={users_skipped}, '
+                f'contacts_deleted={contacts_deleted}, contacts_skipped={contacts_skipped}, '
+                f'mappings_deleted={mappings_deleted} ==='
+            )
+
+        except Exception:
+            self.env.cr.rollback()
+            self.state = 'error'
+            self._append_log(f'=== HR PURGE ERROR ===\n{traceback.format_exc()}')
+            _logger.exception('HR purge failed')
+
+        self.env.cr.commit()
+
     def _clear_checkpoints(self):
         checkpoint_keys = [
             'user', 'tag', 'project', 'stage', 'task', 'task_relink',
             'comment', 'attachment', 'department', 'employee',
         ]
-        params = self.env['ir.config_parameter'].sudo()
-        for key in checkpoint_keys:
-            params.set_param(f'bitrix_migration.checkpoint.{key}', '')
-        self.env.cr.commit()
+        self._clear_named_checkpoints(checkpoint_keys)
 
     def action_reset(self):
         self.ensure_one()
@@ -1735,15 +2077,7 @@ class BitrixMigrationRun(models.Model):
         self.state = 'draft'
         self.log_output = ''
         self.progress = 0.0
-        self.sudo().write({
-            'avatar_sync_state': False,
-            'avatar_last_user_id': 0,
-            'avatar_total_count': 0,
-            'avatar_processed_count': 0,
-            'avatar_imported_count': 0,
-            'avatar_propagated_count': 0,
-            'avatar_error_count': 0,
-        })
+        self._reset_avatar_sync_state()
 
     @api.model
     def get_singleton_action(self):
