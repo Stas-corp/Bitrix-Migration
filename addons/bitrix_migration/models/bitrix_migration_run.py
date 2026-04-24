@@ -863,6 +863,7 @@ class BitrixMigrationRun(models.Model):
 
             loader._sync_assignees(record, task, user_map, employee_map)
             loader._sync_creator(record, task, employee_map)
+            loader._sync_deadline_and_status(record, task)
             updated += 1
 
             if updated % 500 == 0:

@@ -10,6 +10,7 @@ class ProjectTask(models.Model):
     x_bitrix_id = fields.Char(string='Bitrix ID', index=True, copy=False)
     x_bitrix_stage_id = fields.Char(string='Bitrix Stage ID', copy=False)
     x_bitrix_parent_id = fields.Char(string='Bitrix Parent ID', copy=False)
+    x_bitrix_status_code = fields.Integer(string='Bitrix Status Code', copy=False)
     x_bitrix_created_at = fields.Datetime(string='Bitrix Created At', copy=False)
     x_bitrix_responsible_employee_id = fields.Many2one(
         'hr.employee',
@@ -90,7 +91,8 @@ class ProjectTask(models.Model):
         compute='_compute_bitrix_access_user_ids',
         string='Bitrix Access Users',
         copy=False,
-        help='Users who should be able to see and comment on the task: assignees + auditors.',
+        help='Users who should be able to see and comment on the task: '
+             'assignees + auditors + originator + creator.',
     )
     x_bitrix_participant_employee_ids = fields.Many2many(
         'hr.employee',
@@ -250,6 +252,20 @@ class ProjectTask(models.Model):
             return []
         return sorted(set(self._get_users_from_employees(self.x_bitrix_auditor_employee_ids).ids))
 
+    def _compute_current_originator_user_ids(self):
+        self.ensure_one()
+        if 'x_bitrix_originator_employee_id' not in self._fields:
+            return []
+        user = self._get_user_from_employee(self.x_bitrix_originator_employee_id)
+        return [user.id] if user else []
+
+    def _compute_current_creator_user_ids(self):
+        self.ensure_one()
+        if 'x_bitrix_creator_employee_id' not in self._fields:
+            return []
+        user = self._get_user_from_employee(self.x_bitrix_creator_employee_id)
+        return [user.id] if user else []
+
     def _sync_bitrix_user_access(self, mirror_assignee_users=False):
         for task in self:
             assignee_ids = (
@@ -323,14 +339,24 @@ class ProjectTask(models.Model):
     def _compute_bitrix_auditor_employee_ids(self):
         self._compute_bitrix_employee_ids('auditor', 'x_bitrix_auditor_employee_ids')
 
+    @api.depends('x_bitrix_auditor_employee_ids.user_id')
     def _compute_bitrix_auditor_user_ids(self):
         for task in self:
             task.x_bitrix_auditor_user_ids = [(6, 0, task._compute_current_auditor_user_ids())]
 
+    @api.depends(
+        'user_ids',
+        'x_bitrix_auditor_employee_ids.user_id',
+        'x_bitrix_originator_employee_id.user_id',
+        'x_bitrix_creator_employee_id.user_id',
+    )
     def _compute_bitrix_access_user_ids(self):
         for task in self:
-            access_ids = sorted(set(task._compute_current_assignee_user_ids()) | set(
-                task._compute_current_auditor_user_ids()
+            access_ids = sorted(set(
+                task._compute_current_assignee_user_ids()
+                + task._compute_current_auditor_user_ids()
+                + task._compute_current_originator_user_ids()
+                + task._compute_current_creator_user_ids()
             ))
             task.x_bitrix_access_user_ids = [(6, 0, access_ids)]
 

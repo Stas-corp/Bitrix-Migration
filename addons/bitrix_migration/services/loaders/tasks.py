@@ -30,6 +30,12 @@ class TaskLoader(BaseLoader):
         6: 'Відкладене',
         7: 'Скасована',
     }
+    STATUS_TO_TASK_STATE = {
+        5: '1_done',
+        6: '04_waiting_normal',
+        7: '1_canceled',
+    }
+    DEFAULT_TASK_STATE = '01_in_progress'
 
     def __init__(self, env, extractor, fallback_project_id=None, fallback_stage_ids=None, **kwargs):
         super().__init__(env, extractor, **kwargs)
@@ -45,6 +51,14 @@ class TaskLoader(BaseLoader):
         except (TypeError, ValueError):
             return cls.DEFAULT_FALLBACK_STAGE_NAME
         return cls.STATUS_TO_FALLBACK_STAGE.get(status_int, cls.DEFAULT_FALLBACK_STAGE_NAME)
+
+    @classmethod
+    def get_task_state_for_status(cls, status_code):
+        try:
+            status_int = int(status_code)
+        except (TypeError, ValueError):
+            return cls.DEFAULT_TASK_STATE
+        return cls.STATUS_TO_TASK_STATE.get(status_int, cls.DEFAULT_TASK_STATE)
 
     def _resolve_no_project_stage_id(self, task):
         if not self.fallback_stage_ids:
@@ -152,6 +166,24 @@ class TaskLoader(BaseLoader):
         )
         record.invalidate_recordset(['create_date'])
 
+    def _sync_deadline_and_status(self, record, task):
+        vals = {}
+        target_deadline = task.date_deadline or False
+        if record.date_deadline != target_deadline:
+            vals['date_deadline'] = target_deadline
+
+        if 'x_bitrix_status_code' in record._fields:
+            target_status = task.status_code or False
+            if record.x_bitrix_status_code != target_status:
+                vals['x_bitrix_status_code'] = target_status
+
+        target_state = self.get_task_state_for_status(task.status_code)
+        if 'state' in record._fields and record.state != target_state:
+            vals['state'] = target_state
+
+        if vals:
+            record.write(vals)
+
     @staticmethod
     def _split_bitrix_user_ids(raw_ids):
         if not raw_ids:
@@ -221,10 +253,10 @@ class TaskLoader(BaseLoader):
         accomplice_employee_ids, accomplice_user_ids = self._resolve_task_users(
             accomplice_bitrix_ids, user_map, employee_map,
         )
-        auditor_employee_ids, _ = self._resolve_task_users(
+        auditor_employee_ids, auditor_user_ids = self._resolve_task_users(
             auditor_bitrix_ids, user_map, employee_map,
         )
-        originator_employee_ids, _ = self._resolve_task_users(
+        originator_employee_ids, originator_user_ids = self._resolve_task_users(
             originator_bitrix_ids, user_map, employee_map,
         )
 
@@ -267,14 +299,55 @@ class TaskLoader(BaseLoader):
         # Mirror to user_ids
         self._recompute_task_user_ids(record)
 
+        # Keep Odoo's native follower-only project/task rules aligned with
+        # Bitrix access roles. R + A remain assignees; U/O are followers only.
+        access_user_ids = self._merge_user_ids(
+            responsible_user_ids,
+            accomplice_user_ids,
+            auditor_user_ids,
+            originator_user_ids,
+        )
+        self._subscribe_access_followers(record, access_user_ids)
+
     def _recompute_task_user_ids(self, record):
-        """Recompute user_ids and subscribe project followers."""
+        """Recompute user_ids and subscribe assignee followers."""
         self.recompute_task_user_ids(record)
-        # Also subscribe project followers for the resulting user_ids
+        # Also subscribe followers for the resulting assignees.
         if 'user_ids' in record._fields:
-            self._subscribe_project_followers(record.project_id, record.user_ids.ids)
+            self._subscribe_access_followers(record, record.user_ids.ids)
         elif 'user_id' in record._fields and record.user_id:
-            self._subscribe_project_followers(record.project_id, [record.user_id.id])
+            self._subscribe_access_followers(record, [record.user_id.id])
+
+    @staticmethod
+    def _merge_user_ids(*groups):
+        merged = []
+        for group in groups:
+            for user_id in group or []:
+                if user_id and user_id not in merged:
+                    merged.append(user_id)
+        return merged
+
+    def _subscribe_access_followers(self, task, user_ids):
+        """Subscribe task/project followers required by Odoo native rules."""
+        if not task or not user_ids:
+            return
+
+        users = self.env['res.users'].sudo().browse(user_ids).exists()
+        partner_ids = sorted(set(users.mapped('partner_id').ids))
+        if not partner_ids:
+            return
+
+        self._subscribe_task_followers(task, partner_ids)
+        self._subscribe_project_followers(task.project_id, user_ids)
+
+    def _subscribe_task_followers(self, task, partner_ids):
+        if not task or not partner_ids:
+            return
+
+        existing_partner_ids = set(task.sudo().message_partner_ids.ids)
+        missing_partner_ids = sorted(set(partner_ids) - existing_partner_ids)
+        if missing_partner_ids:
+            task.sudo().message_subscribe(partner_ids=missing_partner_ids)
 
     def _subscribe_project_followers(self, project, user_ids):
         if not project or not user_ids:
@@ -317,6 +390,10 @@ class TaskLoader(BaseLoader):
         if current_id != employee.id:
             record.write({'x_bitrix_creator_employee_id': employee.id})
 
+        creator_user = self.get_user_from_employee(employee)
+        if creator_user:
+            self._subscribe_access_followers(record, [creator_user.id])
+
     def run(self, raw_tasks=None):
         """Load tasks. Optionally accepts pre-fetched raw_tasks list."""
         if raw_tasks is None:
@@ -355,6 +432,10 @@ class TaskLoader(BaseLoader):
                     'x_bitrix_stage_id': str(task.stage_id) if task.stage_id else '',
                     'x_bitrix_parent_id': str(task.parent_id) if task.parent_id else '',
                 }
+                if 'x_bitrix_status_code' in self.env['project.task']._fields:
+                    vals['x_bitrix_status_code'] = task.status_code or False
+                if 'state' in self.env['project.task']._fields:
+                    vals['state'] = self.get_task_state_for_status(task.status_code)
                 if 'user_ids' in self.env['project.task']._fields:
                     vals['user_ids'] = [(6, 0, [])]
                 elif 'user_id' in self.env['project.task']._fields:
@@ -375,7 +456,7 @@ class TaskLoader(BaseLoader):
                     vals['stage_id'] = odoo_stage_id
 
                 if task.date_deadline:
-                    vals['date_deadline'] = task.date_deadline.strftime('%Y-%m-%d')
+                    vals['date_deadline'] = task.date_deadline
                 if task.date_created and self.db_column_exists('project_task', 'x_bitrix_created_at'):
                     vals['x_bitrix_created_at'] = task.date_created
 
@@ -392,6 +473,7 @@ class TaskLoader(BaseLoader):
                         record, task, project_map, stage_meta_map,
                     )
                     self._sync_created_at(record, task)
+                    self._sync_deadline_and_status(record, task)
                     self._sync_tags(record, task, tag_name_map)
                     self._sync_assignees(record, task, user_map, employee_map)
                     self._sync_creator(record, task, employee_map)

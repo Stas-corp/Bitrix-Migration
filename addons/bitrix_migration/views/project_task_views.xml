@@ -16,9 +16,10 @@
                 <attribute name="groups">project.group_project_user,project.group_project_manager</attribute>
             </xpath>
             <xpath expr="//field[@name='user_ids']" position="after">
-                <field name="x_bitrix_responsible_user_id"
+                <field name="x_bitrix_responsible_employee_id"
+                       readonly="1"
                        optional="show"
-                       invisible="not x_bitrix_responsible_user_id"
+                       invisible="not x_bitrix_responsible_employee_id"
                        string="Відповідальний"/>
                 <field name="x_bitrix_accomplice_employee_ids"
                        widget="many2many_tags"
@@ -26,16 +27,41 @@
                        optional="show"
                        invisible="not x_bitrix_accomplice_employee_ids"
                        string="Співвиконавці"/>
-                <field name="x_bitrix_auditor_user_ids"
+                <field name="x_bitrix_auditor_employee_ids"
                        widget="many2many_tags"
+                       readonly="1"
                        optional="show"
-                       invisible="not x_bitrix_auditor_user_ids"
+                       invisible="not x_bitrix_auditor_employee_ids"
                        string="Наглядачі"/>
                 <field name="x_bitrix_originator_employee_id"
                        readonly="1"
                        optional="show"
                        invisible="not x_bitrix_originator_employee_id"
                        string="Постановник"/>
+                <field name="x_bitrix_creator_employee_id"
+                       readonly="1"
+                       optional="show"
+                       invisible="not x_bitrix_creator_employee_id"
+                       string="Створив"/>
+            </xpath>
+            <xpath expr="//field[@name='user_ids']" position="attributes">
+                <attribute name="string">Odoo-виконавці</attribute>
+            </xpath>
+            <xpath expr="//field[@name='tag_ids']" position="before">
+                <label for="tag_ids" string="Мітки"/>
+            </xpath>
+            <xpath expr="//field[@name='tag_ids']" position="attributes">
+                <attribute name="string">Мітки</attribute>
+                <attribute name="nolabel">1</attribute>
+            </xpath>
+            <xpath expr="//field[@name='partner_id']" position="before">
+                <label for="partner_id"
+                       string="Клієнт"
+                       invisible="not project_id or has_template_ancestor or has_project_template"/>
+            </xpath>
+            <xpath expr="//field[@name='partner_id']" position="attributes">
+                <attribute name="string">Клієнт</attribute>
+                <attribute name="nolabel">1</attribute>
             </xpath>
             <xpath expr="//page[@name='extra_info']/group/group[2]" position="inside">
                 <field name="x_bitrix_created_at"
@@ -43,6 +69,7 @@
                        invisible="not x_bitrix_created_at"/>
                 <field name="x_bitrix_id" readonly="1"/>
                 <field name="x_bitrix_stage_id" readonly="1"/>
+                <field name="x_bitrix_status_code" readonly="1"/>
                 <field name="x_bitrix_parent_id" readonly="1"/>
                 <field name="x_bitrix_assignee_user_ids"
                        widget="many2many_tags"
@@ -102,7 +129,7 @@
         <field name="name">Projects</field>
         <field name="res_model">project.project</field>
         <field name="view_mode">kanban,list,form,activity</field>
-        <field name="domain">[('task_ids.user_ids', 'in', [uid])]</field>
+        <field name="domain">['|', '|', '|', ('task_ids.user_ids', 'in', [uid]), ('task_ids.x_bitrix_auditor_employee_ids.user_id', '=', uid), ('task_ids.x_bitrix_originator_employee_id.user_id', '=', uid), ('task_ids.x_bitrix_creator_employee_id.user_id', '=', uid)]</field>
         <field name="context">{'create': False}</field>
     </record>
 

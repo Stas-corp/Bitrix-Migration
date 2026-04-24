@@ -1,3 +1,5 @@
+from datetime import datetime
+
 from odoo.tests.common import TransactionCase
 
 
@@ -331,6 +333,7 @@ class TestAssigneeUserIds(TransactionCase):
         """project.task must have x_bitrix_assignee_user_ids field."""
         fields = self.env['project.task'].fields_get()
         self.assertIn('x_bitrix_assignee_user_ids', fields)
+        self.assertIn('x_bitrix_status_code', fields)
 
     def test_field_is_many2many_to_res_users(self):
         """x_bitrix_assignee_user_ids is a Many2many to res.users."""
@@ -455,6 +458,77 @@ class TestAssigneeUserIds(TransactionCase):
         self.assertFalse(task.user_ids.ids)
         self.assertIn(self.user_u.id, task.x_bitrix_access_user_ids.ids)
 
+    def test_responsible_employee_without_user_is_visible_but_not_assignee(self):
+        """Responsible employee role is preserved even when no Odoo user exists."""
+        employee = self.env['hr.employee'].create({
+            'name': 'No User Responsible',
+            'x_bitrix_id': 205,
+        })
+        task = self._create_task('Responsible Without User')
+        task.x_bitrix_responsible_employee_id = employee
+        task.invalidate_recordset()
+
+        self.assertEqual(task.x_bitrix_responsible_employee_id, employee)
+        self.assertFalse(task.x_bitrix_responsible_user_id)
+        self.assertFalse(task.user_ids)
+
+    def test_access_users_include_watchers_originator_and_creator_only(self):
+        """Access users include U/O/creator, while user_ids remains limited to R+A."""
+        originator_user = self.env['res.users'].create({
+            'name': 'Access Originator User',
+            'login': 'access_originator@example.com',
+            'email': 'access_originator@example.com',
+        })
+        creator_user = self.env['res.users'].create({
+            'name': 'Access Creator User',
+            'login': 'access_creator@example.com',
+            'email': 'access_creator@example.com',
+        })
+        originator = self.env['hr.employee'].create({
+            'name': 'Access Originator Employee',
+            'x_bitrix_id': 206,
+            'user_id': originator_user.id,
+        })
+        creator = self.env['hr.employee'].create({
+            'name': 'Access Creator Employee',
+            'x_bitrix_id': 207,
+            'user_id': creator_user.id,
+        })
+
+        task = self._create_task('Access Users From Non Assignee Roles')
+        task.x_bitrix_auditor_employee_ids = self.emp_auditor_user
+        task.x_bitrix_originator_employee_id = originator
+        task.x_bitrix_creator_employee_id = creator
+        task.invalidate_recordset()
+
+        access_ids = set(task.x_bitrix_access_user_ids.ids)
+        self.assertIn(self.user_u.id, access_ids)
+        self.assertIn(originator_user.id, access_ids)
+        self.assertIn(creator_user.id, access_ids)
+        self.assertFalse(task.user_ids)
+
+    def test_loader_keeps_deadline_datetime_and_maps_status(self):
+        """Bitrix deadline keeps time and status code maps to task state."""
+        task = self._create_task('Deadline Status Sync')
+        deadline = datetime(2026, 4, 24, 18, 0, 0)
+
+        from ..services.loaders.tasks import TaskLoader
+        from ..services.normalizers.dto import BitrixTask
+        loader = TaskLoader(env=self.env, extractor=None)
+        bitrix_task = BitrixTask(
+            external_id=123456,
+            name='Deadline Status Sync',
+            date_deadline=deadline,
+            status_code=5,
+        )
+
+        loader._sync_deadline_and_status(task, bitrix_task)
+        task.invalidate_recordset()
+
+        self.assertEqual(task.date_deadline, deadline)
+        self.assertEqual(task.x_bitrix_status_code, 5)
+        self.assertEqual(task.state, '1_done')
+
     def test_task_search_supports_auditor_user_domain(self):
         """Searching through auditor.user_id works for computed Bitrix auditor field."""
         task = self._create_task('Auditor User Search Task')
@@ -480,6 +554,58 @@ class TestAssigneeUserIds(TransactionCase):
         ])
 
         self.assertEqual(found, self.project)
+
+    def test_access_followers_are_subscribed_to_task_and_project(self):
+        """Bitrix access users become followers for Odoo native follower rules."""
+        user = self.env['res.users'].create({
+            'name': 'Follower Sync User',
+            'login': 'follower_sync_user@example.com',
+            'email': 'follower_sync_user@example.com',
+        })
+        task = self._create_task('Follower Sync Task')
+
+        from ..services.loaders.tasks import TaskLoader
+        loader = TaskLoader(env=self.env, extractor=None)
+        loader._subscribe_access_followers(task, [user.id])
+
+        self.assertIn(user.partner_id.id, task.message_partner_ids.ids)
+        self.assertIn(user.partner_id.id, task.project_id.message_partner_ids.ids)
+
+    def test_bitrix_employee_can_read_follower_project_after_role_subscription(self):
+        """A Bitrix auditor can read a follower-only project after repair subscribes them."""
+        group_user = self.env.ref('base.group_user')
+        group_project_user = self.env.ref('project.group_project_user')
+        group = self.env.ref('bitrix_migration.group_bitrix_task_employee')
+        user = self.env['res.users'].create({
+            'name': 'Project Access Auditor',
+            'login': 'project_access_auditor@example.com',
+            'email': 'project_access_auditor@example.com',
+            'group_ids': [(6, 0, [group_user.id, group_project_user.id, group.id])],
+        })
+        employee = self.env['hr.employee'].create({
+            'name': 'Project Access Auditor',
+            'user_id': user.id,
+            'x_bitrix_id': 9103,
+        })
+        project = self.env['project.project'].create({
+            'name': 'Follower Only Bitrix Project',
+            'privacy_visibility': 'followers',
+        })
+        task = self.env['project.task'].create({
+            'name': 'Auditor Project Visibility Task',
+            'project_id': project.id,
+            'x_bitrix_id': '9103',
+            'x_bitrix_auditor_employee_ids': [(6, 0, [employee.id])],
+        })
+
+        from ..services.loaders.tasks import TaskLoader
+        loader = TaskLoader(env=self.env, extractor=None)
+        loader._subscribe_access_followers(task, [user.id])
+
+        visible = self.env['project.project'].with_user(user).search([
+            ('id', '=', project.id),
+        ])
+        self.assertEqual(visible, project)
 
     def test_user_ids_write_updates_assignee_and_access_mirrors(self):
         """Manual assignee edits keep Bitrix assignee/access mirrors aligned."""
