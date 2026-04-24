@@ -94,6 +94,13 @@ class ProjectTask(models.Model):
         help='Users who should be able to see and comment on the task: '
              'assignees + auditors + originator + creator.',
     )
+    x_task_watcher_user_ids = fields.Many2many(
+        'res.users',
+        string='Task Watchers',
+        copy=False,
+        help='Odoo business watchers. Watchers are subscribed to the task and project '
+             'so they keep access without becoming assignees.',
+    )
     x_bitrix_participant_employee_ids = fields.Many2many(
         'hr.employee',
         string='Bitrix Participants',
@@ -286,6 +293,44 @@ class ProjectTask(models.Model):
 
     def _sync_user_ids_from_assignee_storage(self):
         return
+
+    def _subscribe_user_followers_for_access(self, user_ids):
+        if not user_ids:
+            return
+
+        users = self.env['res.users'].sudo().browse(sorted(set(user_ids))).exists()
+        users = users.filtered(lambda user: user.partner_id and not user.share)
+        if not users:
+            return
+
+        partner_ids = set(users.mapped('partner_id').ids)
+        for task in self.sudo():
+            existing_task_partner_ids = set(task.message_partner_ids.ids)
+            missing_task_partner_ids = sorted(partner_ids - existing_task_partner_ids)
+            if missing_task_partner_ids:
+                task.message_subscribe(partner_ids=missing_task_partner_ids)
+
+            if task.project_id:
+                existing_project_partner_ids = set(task.project_id.message_partner_ids.ids)
+                missing_project_partner_ids = sorted(partner_ids - existing_project_partner_ids)
+                if missing_project_partner_ids:
+                    task.project_id.message_subscribe(partner_ids=missing_project_partner_ids)
+
+    def _add_task_watchers_from_users(self, user_ids):
+        if 'x_task_watcher_user_ids' not in self._fields or not user_ids:
+            return
+
+        users = self.env['res.users'].sudo().browse(sorted(set(user_ids))).exists()
+        users = users.filtered(lambda user: user.partner_id and not user.share)
+        if not users:
+            return
+
+        for task in self:
+            target_ids = sorted(set(task.x_task_watcher_user_ids.ids) | set(users.ids))
+            if set(task.x_task_watcher_user_ids.ids) != set(target_ids):
+                task.write({'x_task_watcher_user_ids': [(6, 0, target_ids)]})
+            else:
+                task._subscribe_user_followers_for_access(target_ids)
 
     def _ensure_responsible_user_in_assignees(self, explicit_user=None):
         for task in self:
@@ -497,14 +542,31 @@ class ProjectTask(models.Model):
                         }
                     )
                 )
+            access_user_ids = set(task.user_ids.ids) | set(task.x_task_watcher_user_ids.ids)
+            if task.create_uid and not task.create_uid.share:
+                access_user_ids.add(task.create_uid.id)
+            task._subscribe_user_followers_for_access(access_user_ids)
         return tasks
 
     def write(self, vals):
+        updated_fields = set(vals)
+        access_trigger_fields = {
+            'user_ids',
+            'x_task_watcher_user_ids',
+            'stage_id',
+            'project_id',
+        }
+        old_access_user_ids_by_task = {}
+        if updated_fields & access_trigger_fields:
+            for task in self:
+                old_access_user_ids_by_task[task.id] = (
+                    set(task.user_ids.ids) | set(task.x_task_watcher_user_ids.ids)
+                )
+
         res = super().write(vals)
         if self.env.context.get('bitrix_skip_user_sync'):
             return res
 
-        updated_fields = set(vals)
         if 'user_ids' in updated_fields:
             self._sync_assignee_storage_from_user_ids()
         if 'x_bitrix_assignee_user_ids' in updated_fields:
@@ -522,8 +584,20 @@ class ProjectTask(models.Model):
                         'x_bitrix_responsible_employee_id',
                         'x_bitrix_accomplice_employee_ids',
                     }
+                    )
                 )
-            )
+        if updated_fields & access_trigger_fields:
+            current_user_ids = set()
+            if self.env.user and not self.env.user.share:
+                current_user_ids.add(self.env.user.id)
+            for task in self:
+                access_user_ids = (
+                    old_access_user_ids_by_task.get(task.id, set())
+                    | set(task.user_ids.ids)
+                    | set(task.x_task_watcher_user_ids.ids)
+                    | current_user_ids
+                )
+                task._subscribe_user_followers_for_access(access_user_ids)
         return res
 
     # ── Search helpers ───────────────────────────────────────────────

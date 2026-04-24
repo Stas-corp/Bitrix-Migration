@@ -334,6 +334,7 @@ class TestAssigneeUserIds(TransactionCase):
         fields = self.env['project.task'].fields_get()
         self.assertIn('x_bitrix_assignee_user_ids', fields)
         self.assertIn('x_bitrix_status_code', fields)
+        self.assertIn('x_task_watcher_user_ids', fields)
 
     def test_field_is_many2many_to_res_users(self):
         """x_bitrix_assignee_user_ids is a Many2many to res.users."""
@@ -570,6 +571,41 @@ class TestAssigneeUserIds(TransactionCase):
 
         self.assertIn(user.partner_id.id, task.message_partner_ids.ids)
         self.assertIn(user.partner_id.id, task.project_id.message_partner_ids.ids)
+
+    def test_task_watchers_are_followers_without_being_assignees(self):
+        """Odoo watchers get access subscriptions without becoming assignees."""
+        task = self._create_task('Odoo Watcher Task')
+        task.write({'x_task_watcher_user_ids': [(6, 0, [self.user_u.id])]})
+        task.invalidate_recordset()
+
+        self.assertIn(self.user_u.id, task.x_task_watcher_user_ids.ids)
+        self.assertNotIn(self.user_u.id, task.user_ids.ids)
+        self.assertIn(self.user_u.partner_id.id, task.message_partner_ids.ids)
+        self.assertIn(self.user_u.partner_id.id, task.project_id.message_partner_ids.ids)
+
+    def test_bitrix_observer_users_can_be_backfilled_to_task_watchers(self):
+        """Bitrix observer/access users can seed the Odoo watcher field."""
+        task = self._create_task('Backfill Odoo Watchers')
+        task._add_task_watchers_from_users([self.user_u.id])
+        task.invalidate_recordset()
+
+        self.assertIn(self.user_u.id, task.x_task_watcher_user_ids.ids)
+        self.assertNotIn(self.user_u.id, task.user_ids.ids)
+        self.assertIn(self.user_u.partner_id.id, task.message_partner_ids.ids)
+
+    def test_delegation_keeps_old_and_new_assignees_as_followers(self):
+        """Replacing assignees preserves task access for old and new assignees."""
+        task = self._create_task('Delegation Access Task')
+        task.write({'user_ids': [(6, 0, [self.user_r.id])]})
+        task.write({'user_ids': [(6, 0, [self.user_a.id])]})
+        task.invalidate_recordset()
+
+        self.assertNotIn(self.user_r.id, task.user_ids.ids)
+        self.assertIn(self.user_a.id, task.user_ids.ids)
+        self.assertIn(self.user_r.partner_id.id, task.message_partner_ids.ids)
+        self.assertIn(self.user_a.partner_id.id, task.message_partner_ids.ids)
+        self.assertIn(self.user_r.partner_id.id, task.project_id.message_partner_ids.ids)
+        self.assertIn(self.user_a.partner_id.id, task.project_id.message_partner_ids.ids)
 
     def test_bitrix_employee_can_read_follower_project_after_role_subscription(self):
         """A Bitrix auditor can read a follower-only project after repair subscribes them."""

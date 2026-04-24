@@ -308,6 +308,10 @@ class TaskLoader(BaseLoader):
             originator_user_ids,
         )
         self._subscribe_access_followers(record, access_user_ids)
+        if 'x_task_watcher_user_ids' in record._fields:
+            record._add_task_watchers_from_users(
+                self._merge_user_ids(auditor_user_ids, originator_user_ids)
+            )
 
     def _recompute_task_user_ids(self, record):
         """Recompute user_ids and subscribe assignee followers."""
@@ -393,6 +397,8 @@ class TaskLoader(BaseLoader):
         creator_user = self.get_user_from_employee(employee)
         if creator_user:
             self._subscribe_access_followers(record, [creator_user.id])
+            if 'x_task_watcher_user_ids' in record._fields:
+                record._add_task_watchers_from_users([creator_user.id])
 
     def run(self, raw_tasks=None):
         """Load tasks. Optionally accepts pre-fetched raw_tasks list."""
