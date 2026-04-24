@@ -27,6 +27,10 @@
                             type="object" class="btn-secondary"
                             invisible="state == 'running'"
                             confirm="Create or update Odoo users for imported Bitrix employees with restricted access to assigned Bitrix tasks only?"/>
+                    <button name="action_fix_department_managers" string="Fix Department Managers"
+                            type="object" class="btn-secondary"
+                            invisible="state == 'running'"
+                            confirm="Fill department managers from Bitrix UF_HEAD without changing employee managers?"/>
                     <button name="action_create_test_employee_user" string="Create Test Employee User"
                             type="object" class="btn-secondary"
                             invisible="state == 'running' or not test_employee_id"
@@ -58,7 +62,7 @@
                                     <strong>HR режими:</strong>
                                     <p style="margin:8px 0 4px 0;">
                                         <b>Departments Only</b> — створює ієрархію підрозділів
-                                        hr.department із керівниками.
+                                        hr.department; керівники підтягнуться, якщо співробітники вже є.
                                     </p>
                                     <p style="margin:0 0 4px 0;">
                                         <b>Employees Only</b> — створює hr.employee

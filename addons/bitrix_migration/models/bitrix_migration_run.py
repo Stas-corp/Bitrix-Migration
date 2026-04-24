@@ -672,7 +672,51 @@ class BitrixMigrationRun(models.Model):
         emp_loader.run()
 
         if not dry_run:
+            self._run_department_manager_sync(extractor)
+
+        if not dry_run:
             self._schedule_avatar_sync(extractor)
+
+    def _run_department_manager_sync(self, extractor):
+        """Backfill hr.department.manager_id from Bitrix UF_HEAD."""
+        from ..services.loaders.departments import DepartmentLoader
+
+        self._append_log('\n--- Department Managers ---')
+        dept_loader = DepartmentLoader(
+            self.env, extractor,
+            dry_run=False,
+            log_callback=self._append_log,
+        )
+        dept_loader.sync_department_managers()
+
+    def action_fix_department_managers(self):
+        """One-off repair action for already imported HR departments."""
+        self.ensure_one()
+        self.state = 'running'
+        self._append_log('=== Department manager sync started ===')
+        self.progress = 0.0
+        self.env.cr.commit()
+
+        extractor = None
+        try:
+            extractor = self._get_extractor()
+            self._run_department_manager_sync(extractor)
+            self.state = 'done'
+            self.progress = 100.0
+            self._append_log('=== Department manager sync completed ===')
+        except Exception:
+            self.env.cr.rollback()
+            self.state = 'error'
+            self._append_log(f'=== DEPARTMENT MANAGER SYNC ERROR ===\n{traceback.format_exc()}')
+            _logger.exception('Department manager sync failed')
+        finally:
+            if extractor:
+                try:
+                    extractor.close()
+                except Exception:
+                    _logger.warning('Could not close Bitrix extractor cleanly', exc_info=True)
+
+        self.env.cr.commit()
 
     def _schedule_avatar_sync(self, extractor):
         """Count available avatars and arm the background avatar stage."""
