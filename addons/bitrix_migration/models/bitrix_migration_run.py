@@ -10,24 +10,24 @@ _logger = logging.getLogger(__name__)
 class BitrixMigrationRun(models.Model):
     _name = 'bitrix.migration.run'
     _description = 'Bitrix Migration Runner'
+    _visible_modes = {
+        'hr',
+        'departments_only',
+        'employees_only',
+        'full',
+        'fix_roles',
+        'fix_attachments',
+    }
 
     mode = fields.Selection([
         ('hr', 'HR: Departments + Employees'),
         ('departments_only', 'HR: Departments Only'),
         ('employees_only', 'HR: Employees Only'),
         ('full', 'Full Migration'),
-        ('dry_run', 'Dry Run'),
-        ('pilot', 'Pilot (3-5 projects)'),
-        ('projects_only', 'Projects Only'),
-        ('relink', 'Relink Parents'),
-        ('comments', 'Comments Only'),
-        ('single_task', 'Single Task Test'),
         ('fix_roles', 'Fix Roles (re-sync task roles)'),
         ('fix_attachments', 'Fix Attachments (relink comment attachments)'),
-        ('meetings', 'Meetings Only'),
-    ], required=True, default='dry_run', string='Mode',
-        help='Режим виконання міграції. Для першого запуску рекомендовано Dry Run, '
-             'далі Full або Pilot.')
+    ], required=True, default='full', string='Mode',
+        help='Режим виконання міграції.')
 
     # MySQL connection
     mysql_host = fields.Char(string='MySQL Host', default='localhost')
@@ -2128,7 +2128,9 @@ class BitrixMigrationRun(models.Model):
     def get_singleton_action(self):
         record = self.search([], limit=1, order='id asc')
         if not record:
-            record = self.create({'mode': 'dry_run'})
+            record = self.create({'mode': 'full'})
+        elif record.mode not in self._visible_modes:
+            record.mode = 'full'
         return {
             'type': 'ir.actions.act_window',
             'name': 'Bitrix Migration',
