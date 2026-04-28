@@ -1,5 +1,6 @@
 import base64
 import logging
+import time
 
 from ..normalizers.dto import BitrixAttachment
 from .base import BaseLoader
@@ -24,11 +25,30 @@ class AttachmentLoader(BaseLoader):
         self.sftp_base_path = sftp_base_path.rstrip('/')
         self._sftp = None
 
+    def _format_attachment_ref(self, attachment_type, att, compound_key=None):
+        parts = [
+            f'type={attachment_type}',
+            f'task={att.entity_id}',
+            f'name={att.file_name}',
+            f'path={att.file_path}',
+        ]
+        if att.forum_message_id:
+            parts.append(f'forum_message={att.forum_message_id}')
+        if att.file_size:
+            parts.append(f'expected_size={att.file_size}')
+        if compound_key:
+            parts.append(f'key={compound_key}')
+        return ', '.join(parts)
+
     def _get_sftp(self):
         if self._sftp is not None:
             return self._sftp
         try:
             import paramiko
+            self.log(
+                f'SFTP connecting to {self.sftp_user}@{self.sftp_host}:'
+                f'{self.sftp_port} base_path={self.sftp_base_path}'
+            )
             ssh = paramiko.SSHClient()
             ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
             connect_kwargs = {
@@ -48,21 +68,34 @@ class AttachmentLoader(BaseLoader):
 
     def _close_sftp(self):
         if self._sftp:
+            self.log('SFTP closing connection')
             self._sftp.close()
             self._sftp = None
 
-    def _download_file(self, file_path):
+    def _download_file(self, file_path, expected_size=None):
         """Download file from SFTP, return base64-encoded content."""
         sftp = self._get_sftp()
         full_path = self.sftp_base_path + file_path
+        started_at = time.monotonic()
+        self.log(f'SFTP download start: {full_path} expected_size={expected_size or 0}')
         try:
+            self.log(f'SFTP open start: {full_path}')
             with sftp.open(full_path, 'rb') as f:
+                self.log(f'SFTP read start: {full_path}')
                 data = f.read()
+            elapsed = time.monotonic() - started_at
+            self.log(
+                f'SFTP download done: {full_path} bytes={len(data)} '
+                f'duration={elapsed:.2f}s'
+            )
             return base64.b64encode(data)
         except FileNotFoundError:
+            elapsed = time.monotonic() - started_at
+            self.log(f'SFTP file not found: {full_path} duration={elapsed:.2f}s')
             return None
         except Exception as e:
-            self.log(f'SFTP download error for {full_path}: {e}')
+            elapsed = time.monotonic() - started_at
+            self.log(f'SFTP download error for {full_path}: {e} duration={elapsed:.2f}s')
             return None
 
     def run(self, attachment_type='task', raw_attachments=None):
@@ -85,6 +118,7 @@ class AttachmentLoader(BaseLoader):
         self.log(f'Found {len(raw_attachments)} {attachment_type} attachments')
 
         task_map = self.get_mapping().get_all_mappings('task')
+        self.log(f'Loaded task mapping entries: {len(task_map)}')
 
         # Build message_id lookup for comment attachments
         message_map = {}
@@ -96,15 +130,23 @@ class AttachmentLoader(BaseLoader):
             for rec in msg_recs:
                 if rec['x_bitrix_message_id']:
                     message_map[str(rec['x_bitrix_message_id'])] = rec['id']
+            self.log(f'Loaded comment message mapping entries: {len(message_map)}')
 
         # Use compound key for idempotency: entity_type:entity_id:file_path
         existing_att_mappings = self.get_mapping().get_all_mappings('attachment')
+        self.log(f'Loaded existing attachment mapping entries: {len(existing_att_mappings)}')
 
         processed = 0
         files_downloaded = 0
+        batch_no = 0
 
         try:
             for batch in self._batched(raw_attachments, self.batch_size):
+                batch_no += 1
+                self.log(
+                    f'Batch {batch_no} start: size={len(batch)}, '
+                    f'processed_before={processed}'
+                )
                 for row in batch:
                     att = BitrixAttachment(
                         entity_type=attachment_type,
@@ -122,15 +164,23 @@ class AttachmentLoader(BaseLoader):
                         compound_key = f'comment:{att.entity_id}:{att.forum_message_id}:{att.file_path}'
                     else:
                         compound_key = f'{attachment_type}:{att.entity_id}:{att.file_path}'
+                    att_ref = self._format_attachment_ref(attachment_type, att, compound_key)
+                    self.log(f'Attachment start: {att_ref}')
                     # Also check legacy plain file_path key for backward-safe skip
                     legacy_task_key = f'task:{att.entity_id}:{att.file_path}'
                     legacy_comment_key = f'comment:{att.entity_id}:{att.file_path}'
-                    if (compound_key in existing_att_mappings
-                            or att.file_path in existing_att_mappings
-                            or legacy_task_key in existing_att_mappings
-                            or legacy_comment_key in existing_att_mappings):
+                    existing_key = None
+                    for key in (compound_key, att.file_path, legacy_task_key, legacy_comment_key):
+                        if key in existing_att_mappings:
+                            existing_key = key
+                            break
+                    if existing_key:
                         self.skipped_count += 1
                         processed += 1
+                        self.log(
+                            f'Attachment skip existing mapping: matched_key={existing_key} '
+                            f'processed={processed}'
+                        )
                         continue
 
                     # Resolve parent
@@ -155,20 +205,36 @@ class AttachmentLoader(BaseLoader):
                         self.error_count += 1
                         self.errors.append((att.file_path, f'Parent entity not found: {att.entity_id}'))
                         processed += 1
+                        self.log(
+                            f'Attachment parent missing: {att_ref}, processed={processed}, '
+                            f'errors={self.error_count}'
+                        )
                         continue
+                    self.log(
+                        f'Attachment parent resolved: {att_ref}, '
+                        f'res_model={res_model}, res_id={res_id}'
+                    )
 
                     if not self.dry_run:
                         # Download file
-                        file_data = self._download_file(att.file_path)
+                        file_data = self._download_file(att.file_path, att.file_size)
                         if file_data is None:
                             self.error_count += 1
                             self.errors.append((att.file_path, 'File not found on SFTP'))
                             processed += 1
+                            self.log(
+                                f'Attachment download failed: {att_ref}, processed={processed}, '
+                                f'errors={self.error_count}'
+                            )
                             continue
 
                         files_downloaded += 1
 
                         try:
+                            self.log(
+                                f'Creating ir.attachment: {att_ref}, '
+                                f'res_model={res_model}, res_id={res_id}'
+                            )
                             ir_att = self.env['ir.attachment'].sudo().create({
                                 'name': att.file_name,
                                 'datas': file_data,
@@ -180,16 +246,30 @@ class AttachmentLoader(BaseLoader):
                                 compound_key, 'attachment', 'ir.attachment', ir_att.id,
                             )
                             self.created_count += 1
+                            self.log(
+                                f'Attachment created: ir_attachment_id={ir_att.id}, '
+                                f'created={self.created_count}, downloaded={files_downloaded}'
+                            )
                         except Exception as e:
                             self.error_count += 1
                             self.errors.append((att.file_path, str(e)))
+                            self.log(
+                                f'Attachment create failed: {att_ref}, error={e}, '
+                                f'errors={self.error_count}'
+                            )
                     else:
                         self.created_count += 1
+                        self.log(f'DRY RUN attachment would be created: {att_ref}')
 
                     processed += 1
                     if files_downloaded % 100 == 0 and files_downloaded > 0:
                         self.log(f'Downloaded {files_downloaded} files...')
 
+                self.log(
+                    f'Batch {batch_no} done: processed={processed}, '
+                    f'created={self.created_count}, skipped={self.skipped_count}, '
+                    f'errors={self.error_count}'
+                )
                 self.commit_checkpoint(processed)
 
         finally:
