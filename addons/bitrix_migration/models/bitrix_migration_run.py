@@ -15,8 +15,10 @@ class BitrixMigrationRun(models.Model):
         'departments_only',
         'employees_only',
         'full',
+        'meetings',
         'fix_roles',
         'fix_attachments',
+        'fix_descriptions',
     }
 
     mode = fields.Selection([
@@ -24,8 +26,10 @@ class BitrixMigrationRun(models.Model):
         ('departments_only', 'HR: Departments Only'),
         ('employees_only', 'HR: Employees Only'),
         ('full', 'Full Migration'),
+        ('meetings', 'Meetings Only'),
         ('fix_roles', 'Fix Roles (re-sync task roles)'),
         ('fix_attachments', 'Fix Attachments (relink comment attachments)'),
+        ('fix_descriptions', 'Fix Descriptions (repair empty descriptions with attachments)'),
     ], required=True, default='full', string='Mode',
         help='Режим виконання міграції.')
 
@@ -198,6 +202,8 @@ class BitrixMigrationRun(models.Model):
                 self._run_fix_roles(extractor)
             elif self.mode == 'fix_attachments':
                 self._run_fix_attachments(extractor)
+            elif self.mode == 'fix_descriptions':
+                self._run_fix_descriptions(extractor)
             elif self.mode == 'meetings':
                 self._run_meetings(extractor)
 
@@ -229,6 +235,7 @@ class BitrixMigrationRun(models.Model):
             'Stages (G)': extractor.count_stages(),
             'Comments (real)': extractor.count_comments(),
             'Meetings': extractor.count_meetings(),
+            'Meeting comments': extractor.count_meeting_comments(),
             'Departments': extractor.count_departments(),
             'Employees': extractor.count_employees(),
         }
@@ -375,6 +382,13 @@ class BitrixMigrationRun(models.Model):
                 'fallback_system_author': self.fallback_system_author,
             }),
             ('Meetings', MeetingLoader, {}),
+            ('Meeting Comments', CommentLoader, {
+                'preserve_authorship': self.preserve_authorship,
+                'fallback_system_author': self.fallback_system_author,
+                'document_model': 'calendar.event',
+                'source_entity_type': 'meeting',
+                'entity_type': 'meeting_comment',
+            }),
         ]
 
         # Add attachment steps only if SFTP is configured
@@ -405,19 +419,40 @@ class BitrixMigrationRun(models.Model):
 
         # Run comment attachments separately if SFTP configured
         if self.sftp_host:
+            sftp_kwargs = {
+                'sftp_host': self.sftp_host,
+                'sftp_port': self.sftp_port,
+                'sftp_user': self.sftp_user,
+                'sftp_key_path': self.sftp_key_path,
+                'sftp_base_path': self.sftp_base_path or '/home/bitrix/www',
+            }
             self._append_log(f'\n--- Step: Comment Attachments ---')
             att_loader = AttachmentLoader(
                 env=self.env,
                 extractor=extractor,
                 dry_run=dry_run,
                 log_callback=self._append_log,
-                sftp_host=self.sftp_host,
-                sftp_port=self.sftp_port,
-                sftp_user=self.sftp_user,
-                sftp_key_path=self.sftp_key_path,
-                sftp_base_path=self.sftp_base_path or '/home/bitrix/www',
+                **sftp_kwargs,
             )
             att_loader.run(attachment_type='comment')
+
+            self._append_log(f'\n--- Step: Meeting Attachments ---')
+            AttachmentLoader(
+                env=self.env,
+                extractor=extractor,
+                dry_run=dry_run,
+                log_callback=self._append_log,
+                **sftp_kwargs,
+            ).run(attachment_type='meeting')
+
+            self._append_log(f'\n--- Step: Meeting Comment Attachments ---')
+            AttachmentLoader(
+                env=self.env,
+                extractor=extractor,
+                dry_run=dry_run,
+                log_callback=self._append_log,
+                **sftp_kwargs,
+            ).run(attachment_type='meeting_comment')
 
         self._run_reconciliation()
 
@@ -857,7 +892,9 @@ class BitrixMigrationRun(models.Model):
                     pass
 
     def _run_meetings(self, extractor):
-        """Migrate Bitrix meetings into calendar.event."""
+        """Migrate Bitrix meetings, comments, and attachments into calendar.event."""
+        from ..services.loaders.attachments import AttachmentLoader
+        from ..services.loaders.comments import CommentLoader
         from ..services.loaders.meetings import MeetingLoader
 
         self._append_log('\n--- Meetings ---')
@@ -868,6 +905,45 @@ class BitrixMigrationRun(models.Model):
             log_callback=self._append_log,
         )
         loader.run()
+
+        self._append_log('\n--- Meeting Comments ---')
+        CommentLoader(
+            env=self.env,
+            extractor=extractor,
+            dry_run=False,
+            log_callback=self._append_log,
+            preserve_authorship=self.preserve_authorship,
+            fallback_system_author=self.fallback_system_author,
+            document_model='calendar.event',
+            source_entity_type='meeting',
+            entity_type='meeting_comment',
+        ).run()
+
+        if self.sftp_host:
+            sftp_kwargs = {
+                'sftp_host': self.sftp_host,
+                'sftp_port': self.sftp_port,
+                'sftp_user': self.sftp_user,
+                'sftp_key_path': self.sftp_key_path,
+                'sftp_base_path': self.sftp_base_path or '/home/bitrix/www',
+            }
+            self._append_log('\n--- Meeting Attachments ---')
+            AttachmentLoader(
+                env=self.env,
+                extractor=extractor,
+                dry_run=False,
+                log_callback=self._append_log,
+                **sftp_kwargs,
+            ).run(attachment_type='meeting')
+
+            self._append_log('\n--- Meeting Comment Attachments ---')
+            AttachmentLoader(
+                env=self.env,
+                extractor=extractor,
+                dry_run=False,
+                log_callback=self._append_log,
+                **sftp_kwargs,
+            ).run(attachment_type='meeting_comment')
 
     def _run_fix_roles(self, extractor):
         """Re-sync roles for already imported tasks without re-creating them."""
@@ -918,6 +994,104 @@ class BitrixMigrationRun(models.Model):
         self._append_log(f'Fix Roles complete: updated={updated}, skipped (not found)={skipped}')
         self._run_reconciliation()
 
+    def _run_fix_descriptions(self, extractor):
+        """Repair empty descriptions/bodies that were blanked by DISK FILE tags."""
+        from ..services.normalizers.bitrix_markup import (
+            build_employee_name_map,
+            normalize_bitrix_markup,
+        )
+        from ..services.normalizers.dto import BitrixComment, BitrixMeeting, BitrixTask
+
+        self._append_log('\n--- Fix Descriptions: repairing empty DISK FILE content ---')
+        if self.migration_date_from:
+            self._append_log(
+                f'WARNING: migration_date_from={self.migration_date_from} is set. '
+                f'fix_descriptions will only repair records created after this date. '
+                f'For full repair clear the date filter and re-run.'
+            )
+
+        disk_file_re = re.compile(r'\[DISK\s+FILE\s+ID=\d+\]', re.IGNORECASE)
+        employee_name_map = build_employee_name_map(self.env)
+
+        def _is_blankish(value):
+            return not value or len(str(value).strip()) < 5
+
+        def _repair_rows(label, rows, dto_cls, model_name, search_field,
+                         external_id_getter, raw_text_getter, target_field):
+            Model = self.env[model_name].sudo().with_context(active_test=False)
+            updated = 0
+            skipped_missing = 0
+            already_filled = 0
+            no_disk_tag = 0
+
+            self._append_log(f'Fetched {len(rows)} {label} from Bitrix')
+            for row in rows:
+                dto = dto_cls(**row)
+                raw_text = raw_text_getter(dto) or ''
+                if not disk_file_re.search(raw_text):
+                    no_disk_tag += 1
+                    continue
+
+                external_id = str(external_id_getter(dto))
+                record = Model.search([(search_field, '=', external_id)], limit=1)
+                if not record:
+                    skipped_missing += 1
+                    continue
+
+                if not _is_blankish(record[target_field]):
+                    already_filled += 1
+                    continue
+
+                normalized = normalize_bitrix_markup(raw_text, employee_name_map)
+                if not normalized:
+                    no_disk_tag += 1
+                    continue
+
+                record.write({target_field: normalized})
+                updated += 1
+                if updated % 500 == 0:
+                    self.env.cr.commit()
+                    self._append_log(f'  ... {label}: updated={updated}')
+
+            self.env.cr.commit()
+            self._append_log(
+                f'{label}: updated={updated}, skipped_missing={skipped_missing}, '
+                f'already_filled={already_filled}, no_disk_tag={no_disk_tag}'
+            )
+
+        _repair_rows(
+            'Tasks',
+            extractor.get_tasks(),
+            BitrixTask,
+            'project.task',
+            'x_bitrix_id',
+            lambda task: task.external_id,
+            lambda task: task.description,
+            'description',
+        )
+        _repair_rows(
+            'Comments',
+            extractor.get_comments(),
+            BitrixComment,
+            'mail.message',
+            'x_bitrix_message_id',
+            lambda comment: comment.message_id,
+            lambda comment: comment.body,
+            'body',
+        )
+        _repair_rows(
+            'Meetings',
+            extractor.get_meetings(),
+            BitrixMeeting,
+            'calendar.event',
+            'x_bitrix_id',
+            lambda meeting: meeting.external_id,
+            lambda meeting: meeting.description,
+            'description',
+        )
+
+        self._run_reconciliation()
+
     def _run_fix_attachments(self, extractor):
         """Repair comment attachments: relink from project.task to mail.message where possible.
 
@@ -954,7 +1128,10 @@ class BitrixMigrationRun(models.Model):
             bitrix_id = mapping.bitrix_id or ''
 
             # Only process comment attachment keys
-            if not bitrix_id.startswith('comment:'):
+            if not (
+                bitrix_id.startswith('comment:')
+                or bitrix_id.startswith('meeting_comment:')
+            ):
                 already_ok += 1
                 continue
 
@@ -965,8 +1142,8 @@ class BitrixMigrationRun(models.Model):
 
             # Parse key to find forum_message_id
             parts = bitrix_id.split(':')
-            # Canonical: comment:task_id:forum_message_id:file_path (4+ parts)
-            # Legacy: comment:task_id:file_path (3 parts, no forum_message_id)
+            # Canonical: comment|meeting_comment:parent_id:forum_message_id:file_path.
+            # Legacy: comment:task_id:file_path (3 parts, no forum_message_id).
             if len(parts) >= 4:
                 forum_message_id = parts[2]
             else:
@@ -988,7 +1165,7 @@ class BitrixMigrationRun(models.Model):
                 already_ok += 1
                 continue
 
-            # Attachment is linked to project.task — check if mail.message exists now
+            # Attachment is linked to a parent record — check if mail.message exists now
             target_msg_id = message_map.get(forum_message_id)
             if target_msg_id:
                 ir_att.write({'res_model': 'mail.message', 'res_id': target_msg_id})
@@ -1023,6 +1200,10 @@ class BitrixMigrationRun(models.Model):
                 [('x_bitrix_message_id', '!=', False)]),
             'Comments without author mapping': self.env['mail.message'].sudo().search_count(
                 [('x_bitrix_message_id', '!=', False), ('x_bitrix_author_id', '!=', False)]),
+            'Meeting comments': self.env['mail.message'].sudo().search_count(
+                [('model', '=', 'calendar.event'), ('x_bitrix_message_id', '!=', False)]),
+            'Meeting attachments (events)': self.env['ir.attachment'].sudo().search_count(
+                [('res_model', '=', 'calendar.event')]),
             'Attachments': self.env['ir.attachment'].sudo().search_count([]),
             'Mapping records': self.env['bitrix.migration.mapping'].sudo().search_count([]),
             'Departments': self.env['hr.department'].sudo().search_count(
@@ -1161,14 +1342,16 @@ class BitrixMigrationRun(models.Model):
                         break
             self._append_log(f'  Tasks with fallback-user (no employee mirror) in assignees: {fallback_user_tasks}')
 
-        # Comment attachments still linked to project.task despite mail.message existing
-        comment_att_on_task = 0
+        # Comment attachments still linked to their parent despite mail.message existing
+        comment_att_on_parent = 0
         Mapping = self.env['bitrix.migration.mapping'].sudo()
         Att = self.env['ir.attachment'].sudo()
         comment_att_mappings = Mapping.search([
             ('entity_type', '=', 'attachment'),
             ('odoo_model', '=', 'ir.attachment'),
+            '|',
             ('bitrix_id', 'like', 'comment:%'),
+            ('bitrix_id', 'like', 'meeting_comment:%'),
         ])
         msg_lookup = {}
         if comment_att_mappings:
@@ -1181,15 +1364,26 @@ class BitrixMigrationRun(models.Model):
                     msg_lookup[str(rec['x_bitrix_message_id'])] = rec['id']
 
         for mapping in comment_att_mappings:
+            bitrix_id = mapping.bitrix_id or ''
             ir_att = Att.browse(mapping.odoo_id).exists()
-            if not ir_att or ir_att.res_model != 'project.task':
+            if not ir_att:
                 continue
-            parts = (mapping.bitrix_id or '').split(':')
+            expected_parent_model = (
+                'calendar.event'
+                if bitrix_id.startswith('meeting_comment:')
+                else 'project.task'
+            )
+            if ir_att.res_model != expected_parent_model:
+                continue
+            parts = bitrix_id.split(':')
             if len(parts) >= 4:
                 forum_msg_id = parts[2]
                 if msg_lookup.get(forum_msg_id):
-                    comment_att_on_task += 1
-        self._append_log(f'  Comment attachments on project.task (should be on mail.message): {comment_att_on_task}')
+                    comment_att_on_parent += 1
+        self._append_log(
+            f'  Comment attachments still on parent (should be on mail.message): '
+            f'{comment_att_on_parent}'
+        )
 
         # Stage 2 quality checks
         self._append_log('\n--- CONTENT QUALITY ---')
@@ -2112,7 +2306,8 @@ class BitrixMigrationRun(models.Model):
     def _clear_checkpoints(self):
         checkpoint_keys = [
             'user', 'tag', 'project', 'stage', 'task', 'task_relink',
-            'comment', 'attachment', 'department', 'employee',
+            'comment', 'meeting', 'meeting_comment', 'attachment',
+            'department', 'employee',
         ]
         self._clear_named_checkpoints(checkpoint_keys)
 

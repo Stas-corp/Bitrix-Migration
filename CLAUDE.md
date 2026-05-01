@@ -1,4 +1,6 @@
-# Bitrix Migration — CLAUDE.md
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ## Что это
 
@@ -11,39 +13,76 @@ Docker: Odoo доступен на `http://localhost:8079`.
 ```
 addons/bitrix_migration/
 ├── models/
-│   ├── bitrix_migration_run.py   # Главная модель: настройки, запуск, кнопки UI
-│   ├── bitrix_mapping.py         # Таблица соответствий Bitrix ID → Odoo ID
-│   ├── hr_department.py          # x_bitrix_id на hr.department
-│   ├── hr_employee.py            # x_bitrix_id, x_bitrix_telegram на hr.employee
-│   ├── mail_message.py           # x_bitrix_id, x_bitrix_author_employee_id
-│   ├── project_project.py        # x_bitrix_id на project.project
-│   ├── project_task.py           # x_bitrix_id, x_bitrix_created_at, x_bitrix_responsible_employee_ids
-│   ├── project_task_type.py      # x_bitrix_id на project.task.type (стадии)
-│   └── calendar_event.py         # x_bitrix_id на calendar.event
+│   ├── bitrix_migration_run.py        # Главная модель: настройки, запуск, кнопки UI (~2100 строк)
+│   ├── bitrix_mapping.py              # Таблица соответствий Bitrix ID → Odoo ID
+│   ├── bitrix_task_employee_link.py   # Роли на задачах: task_id, employee_id, role + UNIQUE constraint
+│   ├── hr_department.py               # x_bitrix_id на hr.department
+│   ├── hr_employee.py                 # x_bitrix_id, x_bitrix_telegram на hr.employee
+│   ├── mail_message.py                # x_bitrix_id, x_bitrix_author_employee_id
+│   ├── project_project.py             # x_bitrix_id на project.project
+│   ├── project_task.py                # x_bitrix_id, роли (computed), x_bitrix_assignee_user_ids
+│   ├── project_task_type.py           # x_bitrix_id на project.task.type (стадии)
+│   └── calendar_event.py              # x_bitrix_id на calendar.event
 ├── services/
 │   ├── extractors/
-│   │   └── bitrix_mysql.py       # Читает данные из MySQL Bitrix
+│   │   └── bitrix_mysql.py            # Читает данные из MySQL Bitrix
 │   ├── loaders/
-│   │   ├── base.py               # BaseLoader: get_or_create, checkpoint, db introspection
+│   │   ├── base.py                    # BaseLoader: get_or_create, checkpoint, db introspection
 │   │   ├── projects.py
 │   │   ├── stages.py
 │   │   ├── tags.py
-│   │   ├── tasks.py
-│   │   ├── tasks_relink.py       # Второй проход: parent_id + cycle detection
+│   │   ├── tasks.py                   # Сложная логика ролей, стадий, fallback-проекта
+│   │   ├── tasks_relink.py            # Второй проход: parent_id + cycle detection
 │   │   ├── comments.py
-│   │   ├── attachments.py        # SFTP → Odoo ir.attachment (compound key, comment linking)
+│   │   ├── attachments.py             # SFTP → Odoo ir.attachment (compound key, comment linking)
 │   │   ├── users.py
 │   │   ├── departments.py
-│   │   ├── employees.py          # + SFTP avatar sync
-│   │   └── meetings.py           # MeetingLoader → calendar.event
+│   │   ├── employees.py               # + SFTP avatar sync
+│   │   └── meetings.py                # MeetingLoader → calendar.event
 │   └── normalizers/
-│       ├── dto.py                # Pydantic DTOs: BitrixProject, BitrixTask, BitrixMeeting, ...
-│       └── bitrix_markup.py      # BBCode → HTML конвертер для Bitrix markup
+│       ├── dto.py                     # Pydantic DTOs: BitrixProject, BitrixTask, BitrixMeeting, ...
+│       └── bitrix_markup.py           # BBCode → HTML конвертер для Bitrix markup
 └── views/
     ├── bitrix_migration_run_views.xml
     ├── hr_employee_views.xml
     └── project_task_views.xml
 ```
+
+## Среда разработки
+
+```bash
+# Запуск
+docker compose up -d
+
+# Логи Odoo
+docker compose logs -f odoo
+
+# Перезапуск после изменений в Python
+docker compose restart odoo
+
+# Применить XML/структурные изменения модуля
+docker compose exec odoo odoo -u bitrix_migration -d odoo --stop-after-init
+
+# Odoo shell
+docker compose exec odoo odoo shell -d odoo
+```
+
+Odoo UI: http://localhost:8079
+
+## Тесты
+
+```bash
+# Запуск тестов модуля
+docker compose exec odoo odoo --test-enable -d odoo -u bitrix_migration --stop-after-init
+```
+
+Тесты находятся в `tests/`:
+- `test_role_mapping.py` — маппинг ролей Bitrix → Odoo, UNIQUE constraint на responsible
+- `test_markup_normalizer.py` — BBCode → HTML конвертация
+- `test_attachments.py` — ідемпотентність вкладень, прив'язка до коментарів
+- `test_meetings.py` — створення calendar.event з даними зустрічей
+- `test_employee_avatars.py` — синхронізація фото, SVG-placeholder detection
+- `test_departments.py` — ієрархія відділів, прив'язка керівника
 
 ## Ключевые паттерны
 
@@ -83,11 +122,11 @@ addons/bitrix_migration/
 | `meetings` | Только зустрічі (calendar.event) |
 
 ### Создание пользователей
-После импорта сотрудников: кнопки на форме `BitrixMigrationRun`:
+После импорта сотрудников — кнопки на форме `BitrixMigrationRun`:
 1. **Create Employee Users** — пакетное создание `res.users` (group_portal или group_user)
 2. **Create Test Employee User** — один сотрудник из `test_employee_id`
 3. **Send Password Reset** — рассылка писем сброса пароля
-4. **Purge Imported Data** — удалить всё импортированное (с подтверждением)
+4. **Purge Imported Data** / **Purge HR Data** — удалить всё импортированное (с подтверждением)
 
 ### DTO (dto.py)
 Pydantic v2. Все поля валидируются через `field_validator`. Ноль / пустая строка / 'NULL' → `None` через `_clean_str()` и `_to_int_or_none()`. PHP-сериализованные массивы (`a:N:{...}`) парсит `parse_php_int_array()`.
@@ -159,8 +198,26 @@ Attachment SQL-запити фільтруються тим же `task_where_cla
 
 ## Аватарки співробітників
 
-`EmployeeLoader.sync_avatars()` завантажує фото через SFTP з `b_user.PERSONAL_PHOTO → b_file`.
+`EmployeeLoader.sync_avatars()` ставить у чергу SFTP-завантаження з `b_user.PERSONAL_PHOTO → b_file`.
+Фактичне завантаження виконується фоновим cron-джобом `_cron_process_avatar_batch()` — по 20 аватарів за тік з бюджетом 45 с. Стан черги зберігається в полях `avatar_sync_state` / `avatar_last_user_id` запису `bitrix.migration.run`. Джоб реентерабельний: безпечний перезапуск в середині черги.
 Політика: фото встановлюється тільки якщо `image_1920` порожнє (безпечний rerun).
+
+## Fallback-проект для задач без GROUP_ID
+
+Близько 86% задач Bitrix мають `GROUP_ID=0` (без проекту). `TaskLoader` автоматично створює проект **"Bitrix: Без проекта"** з 6 фіксованими стадіями:
+`Чекає виконання → Виконується → Чекає контролю → Відкладене → Завершене → Скасована`
+
+Якщо проект вже існує — повторне створення пропускається (ідемпотентно).
+
+## Reconciliation (пост-міграційний аудит)
+
+`_run_reconciliation()` в `bitrix_migration_run.py` — комплексний звіт після міграції:
+- Якість ролей: задачі без відповідального, розбіжності `user_ids` vs `x_bitrix_assignee_user_ids`
+- Якість контенту: задачі з необробленою Bitrix-розміткою в описі
+- Осиротілі записи: маппінги без відповідних Odoo-об'єктів
+- Dept manager sync: відповідність `hr.department.manager_id` до Bitrix `UF_HEAD`
+
+Запускається кнопкою **Run Reconciliation** на формі або вручну з Odoo shell.
 
 ## Архівування закритих проєктів
 
@@ -175,35 +232,4 @@ Attachment SQL-запити фільтруються тим же `task_where_cla
 - Стадии в Bitrix могут иметь ключ `'ID'` или `'id'` — экстрактор нормализует через `AS id`.
 - Cycle detection в `tasks_relink.py` — `_has_parent_cycle()` обходит `parent_map` до нахождения цикла или корня.
 - `get_partner_from_employee()`: приоритет `work_contact_id` → `user_id.partner_id` → `address_home_id`.
-
-## Среда разработки
-
-```bash
-# Запуск
-docker compose up -d
-
-# Логи Odoo
-docker compose logs -f odoo
-
-# Перезапуск после изменений в Python
-docker compose restart odoo
-
-# Odoo shell
-docker compose exec odoo odoo shell -d odoo
-```
-
-Odoo UI: http://localhost:8079
-Модуль обновляется через Settings → Apps → Upgrade или `-u bitrix_migration`.
-
-## Тесты
-
-```bash
-# Запуск тестов модуля
-docker compose exec odoo odoo --test-enable -d odoo -u bitrix_migration --stop-after-init
-```
-
-Тесты находятся в `tests/`:
-- `test_role_mapping.py` — маппинг ролей Bitrix → Odoo (Этап 1)
-- `test_markup_normalizer.py` — BBCode → HTML конвертация (Этап 2)
-- `test_attachments.py` — ідемпотентність вкладень, прив'язка до коментарів (Этап 2)
-- `test_meetings.py` — створення calendar.event з даними зустрічей (Этап 2)
+- Каждый загрузчик коммитит независимо — безопасно продолжать с любого checkpoint после сбоя.

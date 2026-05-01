@@ -118,12 +118,26 @@ class TestMarkupNormalizer(TransactionCase):
         self.assertIn('<th>Col1</th>', result)
         self.assertIn('<td>Val1</td>', result)
 
-    # ── DISK FILE removed ───────────────────────────────────────────
+    # ── DISK FILE placeholder ───────────────────────────────────────
 
     def test_disk_file_removed(self):
         result = normalize_bitrix_markup('See file [DISK FILE ID=42] here')
         self.assertNotIn('[DISK', result)
         self.assertNotIn('FILE ID', result)
+        self.assertIn('файл', result)
+        self.assertIn('See file', result)
+        self.assertIn('here', result)
+
+    def test_disk_file_only_produces_placeholder(self):
+        result = normalize_bitrix_markup('[DISK FILE ID=42]')
+        self.assertTrue(result)
+        self.assertIn('файл', result)
+        self.assertNotIn('[DISK', result)
+
+    def test_multiple_disk_files(self):
+        result = normalize_bitrix_markup('[DISK FILE ID=42][DISK FILE ID=43]')
+        self.assertEqual(result.count('файл'), 2)
+        self.assertNotIn('[DISK', result)
 
     # ── Newlines ────────────────────────────────────────────────────
 

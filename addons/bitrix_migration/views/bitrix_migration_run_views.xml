@@ -63,7 +63,7 @@
                                    invisible="mode in ('hr', 'departments_only', 'employees_only', 'fix_roles', 'fix_attachments')"/>
                             <field name="fallback_project_id"
                                    options="{'no_create_edit': True}"
-                                   invisible="mode in ('hr', 'departments_only', 'employees_only', 'fix_roles', 'fix_attachments')"
+                                   invisible="mode in ('hr', 'departments_only', 'employees_only', 'fix_roles', 'fix_attachments', 'fix_descriptions')"
                                    placeholder="Auto-created if empty"/>
                             <field name="test_employee_id"
                                    options="{'no_create': True, 'no_open': True}"
@@ -177,8 +177,10 @@
                                     <li><b>HR: Departments Only</b> — тільки структура підрозділів і керівники.</li>
                                     <li><b>HR: Employees Only</b> — тільки співробітники (після імпорту підрозділів).</li>
                                     <li><b>Full Migration</b> — повна міграція користувачів, проєктів, задач, коментарів і вкладень.</li>
+                                    <li><b>Meetings Only</b> — імпортує зустрічі, їх коментарі та вкладення.</li>
                                     <li><b>Fix Roles</b> — повторна синхронізація ролей учасників задач.</li>
                                     <li><b>Fix Attachments</b> — повторна привʼязка вкладень коментарів.</li>
+                                    <li><b>Fix Descriptions</b> — відновлює порожні описи з Bitrix DISK FILE placeholders.</li>
                                 </ul>
 
                                 <h4 style="margin:0 0 8px 0;">Ключові опції</h4>

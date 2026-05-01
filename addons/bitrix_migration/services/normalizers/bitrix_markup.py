@@ -9,7 +9,7 @@ Supported tags:
   [URL]...[/URL]       → <a href="...">...</a>
   [IMG]...[/IMG]       → <img src="..."/>
   [USER=ID]Name[/USER] → <strong>Name</strong> (or resolved name from employee_map)
-  [DISK FILE ID=...]   → (removed, file references handled via attachments)
+  [DISK FILE ID=...]   → <em>📎 файл (см. вложения)</em>
   [LIST] [*] [/LIST]   → <ul><li>...</li></ul>
   [QUOTE]...[/QUOTE]   → <blockquote>...</blockquote>
   [CODE]...[/CODE]     → <pre><code>...</code></pre>
@@ -57,8 +57,13 @@ def normalize_bitrix_markup(text, employee_name_map=None):
         flags=re.DOTALL | re.IGNORECASE,
     )
 
-    # [DISK FILE ID=...] — remove disk file references (handled via attachments)
-    text = re.sub(r'\[DISK\s+FILE\s+ID=\d+\]', '', text, flags=re.IGNORECASE)
+    # [DISK FILE ID=...] — keep a visible marker while files are handled as attachments.
+    text = re.sub(
+        r'\[DISK\s+FILE\s+ID=(\d+)\]',
+        r'<em>📎 файл (см. вложения)</em>',
+        text,
+        flags=re.IGNORECASE,
+    )
 
     # Simple paired tags
     _SIMPLE_TAGS = [

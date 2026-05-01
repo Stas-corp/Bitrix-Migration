@@ -10,7 +10,7 @@ MIGRATION_BOT_NAME = 'Bitrix Migration Bot'
 
 
 class CommentLoader(BaseLoader):
-    """Loads Bitrix comments into mail.message (chatter) on project.task.
+    """Loads Bitrix comments into mail.message (chatter) on migrated records.
 
     Comments in Odoo always use res.partner as the visible author, but we also
     preserve the matched hr.employee so history can be re-linked later if the
@@ -22,11 +22,16 @@ class CommentLoader(BaseLoader):
 
     def __init__(self, env, extractor, batch_size=None, dry_run=False, log_callback=None,
                  preserve_authorship=True, fallback_system_author=True,
-                 system_author_partner_id=None):
+                 system_author_partner_id=None, document_model='project.task',
+                 source_entity_type='task', entity_type=None):
         super().__init__(env, extractor, batch_size, dry_run, log_callback)
         self.preserve_authorship = preserve_authorship
         self.fallback_system_author = fallback_system_author
         self.system_author_partner_id = system_author_partner_id
+        self.document_model = document_model
+        self.source_entity_type = source_entity_type
+        if entity_type:
+            self.entity_type = entity_type
 
     def _ensure_system_author(self):
         """Get or create the system migration bot partner."""
@@ -102,11 +107,15 @@ class CommentLoader(BaseLoader):
         system_partner_id = self._ensure_system_author()
 
         if raw_comments is None:
-            self.log('Extracting Bitrix comments (real only)...')
-            raw_comments = self.extractor.get_comments()
+            if self.document_model == 'calendar.event':
+                self.log('Extracting Bitrix meeting comments (real only)...')
+                raw_comments = self.extractor.get_meeting_comments()
+            else:
+                self.log('Extracting Bitrix comments (real only)...')
+                raw_comments = self.extractor.get_comments()
         self.log(f'Found {len(raw_comments)} comments to process')
 
-        task_map = self.get_mapping().get_all_mappings('task')
+        task_map = self.get_mapping().get_all_mappings(self.source_entity_type)
         user_map = self.get_mapping().get_all_mappings('user')
         employee_map = self.get_mapping().get_all_mappings('employee')
         employee_name_map = build_employee_name_map(self.env)
@@ -128,7 +137,7 @@ class CommentLoader(BaseLoader):
         )
         for rec in existing_recs:
             if rec['x_bitrix_message_id']:
-                existing_msg_map[rec['x_bitrix_message_id']] = rec['id']
+                existing_msg_map[str(rec['x_bitrix_message_id'])] = rec['id']
         self.log(f'Already migrated: {len(existing_msg_map)} comments')
 
         note_subtype = self.env.ref('mail.mt_note', raise_if_not_found=False)
@@ -151,7 +160,7 @@ class CommentLoader(BaseLoader):
                     self.error_count += 1
                     self.errors.append((
                         msg_id_str,
-                        f'Task bitrix_id={comment.entity_id} not found in mapping',
+                        f'{self.document_model} bitrix_id={comment.entity_id} not found in mapping',
                     ))
                     processed += 1
                     continue
@@ -179,7 +188,7 @@ class CommentLoader(BaseLoader):
 
                 if not self.dry_run:
                     vals = {
-                        'model': 'project.task',
+                        'model': self.document_model,
                         'res_id': odoo_task_id,
                         'body': normalize_bitrix_markup(
                             comment.body or '', employee_name_map,

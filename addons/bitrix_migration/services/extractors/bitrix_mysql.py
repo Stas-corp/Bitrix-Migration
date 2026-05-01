@@ -7,6 +7,10 @@ from pymysql.cursors import DictCursor
 
 _logger = logging.getLogger(__name__)
 
+# ENTITY_TYPE for calendar disk attachments must be discovered on production.
+# Run the diagnostic query from the rollout plan and replace this value.
+MEETING_ATTACHMENT_ENTITY_TYPE = 'Bitrix\\Disk\\Uf\\CalendarEventConnector'
+
 
 class BitrixMySQLExtractor:
     """MySQL connector for extracting data from Bitrix24 database."""
@@ -336,7 +340,7 @@ class BitrixMySQLExtractor:
     """
 
     # ── Meetings ──────────────────────────────────────────────────────
-    SQL_MEETINGS = """
+    SQL_MEETINGS_TEMPLATE = """
         SELECT
             ce.ID AS external_id,
             ce.NAME AS name,
@@ -348,12 +352,116 @@ class BitrixMySQLExtractor:
                AND child.DELETED = 'N'
                AND child.ID != child.PARENT_ID) AS participant_bitrix_ids,
             ce.MEETING_HOST AS organizer_bitrix_id,
-            ce.DESCRIPTION AS description
+            ce.DESCRIPTION AS description,
+            {forum_topic_expr}
         FROM b_calendar_event ce
         WHERE ce.IS_MEETING = '1'
           AND ce.DELETED = 'N'
           AND ce.ID = ce.PARENT_ID
         ORDER BY ce.DATE_FROM
+    """
+
+    SQL_MEETING_FORUM_COMMENTS = """
+        SELECT
+            'calendar.event' AS document_model,
+            ce.ID AS entity_id,
+            fm.ID AS message_id,
+            'comment' AS type,
+            fm.POST_MESSAGE AS body,
+            fm.POST_DATE AS date,
+            fm.AUTHOR_ID AS author_bitrix_id
+        FROM b_forum_message fm
+        STRAIGHT_JOIN b_calendar_event ce ON ce.FORUM_TOPIC_ID = fm.TOPIC_ID
+        WHERE fm.SERVICE_TYPE IS NULL
+          AND fm.NEW_TOPIC = 'N'
+          AND ce.IS_MEETING = '1'
+          AND ce.DELETED = 'N'
+          AND ce.ID = ce.PARENT_ID
+        ORDER BY fm.POST_DATE
+    """
+
+    SQL_MEETING_SONET_COMMENTS = """
+        SELECT
+            'calendar.event' AS document_model,
+            ce.ID AS entity_id,
+            slc.ID AS message_id,
+            'comment' AS type,
+            COALESCE(NULLIF(slc.MESSAGE, ''), slc.TEXT_MESSAGE) AS body,
+            slc.LOG_DATE AS date,
+            slc.USER_ID AS author_bitrix_id
+        FROM b_sonet_log sl
+        JOIN b_sonet_log_comment slc ON slc.LOG_ID = sl.ID
+        JOIN b_calendar_event ce ON ce.ID = sl.SOURCE_ID
+        WHERE sl.MODULE_ID = 'calendar'
+          AND ce.IS_MEETING = '1'
+          AND ce.DELETED = 'N'
+          AND ce.ID = ce.PARENT_ID
+        ORDER BY slc.LOG_DATE
+    """
+
+    SQL_MEETING_ATTACHMENTS = """
+        SELECT
+            ce.ID AS meeting_external_id,
+            do.NAME AS file_name,
+            do.SIZE AS file_size,
+            bf.CONTENT_TYPE AS content_type,
+            CONCAT('/upload/', bf.SUBDIR, '/', bf.FILE_NAME) AS file_path,
+            ao.CREATE_TIME AS attached_at
+        FROM b_disk_attached_object ao
+        JOIN b_disk_object do ON do.ID = ao.OBJECT_ID
+        JOIN b_file bf ON bf.ID = do.FILE_ID
+        JOIN b_calendar_event ce ON ce.ID = ao.ENTITY_ID
+                                AND ce.IS_MEETING = '1'
+                                AND ce.DELETED = 'N'
+                                AND ce.ID = ce.PARENT_ID
+        WHERE ao.ENTITY_TYPE = %s
+        ORDER BY ao.CREATE_TIME
+    """
+
+    SQL_MEETING_FORUM_COMMENT_ATTACHMENTS = """
+        SELECT
+            ce.ID AS meeting_external_id,
+            ao.ENTITY_ID AS forum_message_id,
+            do.NAME AS file_name,
+            do.SIZE AS file_size,
+            bf.CONTENT_TYPE AS content_type,
+            CONCAT('/upload/', bf.SUBDIR, '/', bf.FILE_NAME) AS file_path,
+            ao.CREATE_TIME AS attached_at
+        FROM b_disk_attached_object ao
+        JOIN b_disk_object do ON do.ID = ao.OBJECT_ID
+        JOIN b_file bf ON bf.ID = do.FILE_ID
+        JOIN b_forum_message fm ON fm.ID = ao.ENTITY_ID
+        JOIN b_calendar_event ce ON ce.FORUM_TOPIC_ID = fm.TOPIC_ID
+                                AND ce.IS_MEETING = '1'
+                                AND ce.DELETED = 'N'
+                                AND ce.ID = ce.PARENT_ID
+        WHERE ao.ENTITY_TYPE = 'Bitrix\\\\Disk\\\\Uf\\\\ForumMessageConnector'
+        ORDER BY ao.CREATE_TIME
+    """
+
+    SQL_MEETING_SONET_COMMENT_ATTACHMENTS = """
+        SELECT
+            ce.ID AS meeting_external_id,
+            ao.ENTITY_ID AS forum_message_id,
+            do.NAME AS file_name,
+            do.SIZE AS file_size,
+            bf.CONTENT_TYPE AS content_type,
+            CONCAT('/upload/', bf.SUBDIR, '/', bf.FILE_NAME) AS file_path,
+            ao.CREATE_TIME AS attached_at
+        FROM b_disk_attached_object ao
+        JOIN b_disk_object do ON do.ID = ao.OBJECT_ID
+        JOIN b_file bf ON bf.ID = do.FILE_ID
+        JOIN b_sonet_log_comment slc ON slc.ID = ao.ENTITY_ID
+        JOIN b_sonet_log sl ON sl.ID = slc.LOG_ID
+        JOIN b_calendar_event ce ON ce.ID = sl.SOURCE_ID
+                                AND ce.IS_MEETING = '1'
+                                AND ce.DELETED = 'N'
+                                AND ce.ID = ce.PARENT_ID
+        WHERE ao.ENTITY_TYPE IN (
+            'Bitrix\\\\Disk\\\\Uf\\\\BlogPostCommentConnector',
+            'Bitrix\\\\Disk\\\\Uf\\\\SonetCommentConnector'
+        )
+        ORDER BY ao.CREATE_TIME
     """
 
     # ── Departments ───────────────────────────────────────────────────
@@ -490,6 +598,22 @@ class BitrixMySQLExtractor:
     """
     SQL_COUNT_STAGES = "SELECT COUNT(*) AS cnt FROM b_tasks_stages WHERE ENTITY_TYPE = 'G' AND TITLE IS NOT NULL AND TITLE != ''"
     SQL_COUNT_MEETINGS = "SELECT COUNT(*) AS cnt FROM b_calendar_event WHERE IS_MEETING = '1' AND DELETED = 'N' AND ID = PARENT_ID"
+    SQL_COUNT_MEETING_COMMENTS = """
+        SELECT COUNT(*) AS cnt FROM b_forum_message fm
+        STRAIGHT_JOIN b_calendar_event ce ON ce.FORUM_TOPIC_ID = fm.TOPIC_ID
+        WHERE fm.SERVICE_TYPE IS NULL AND fm.NEW_TOPIC = 'N'
+          AND ce.IS_MEETING = '1' AND ce.DELETED = 'N' AND ce.ID = ce.PARENT_ID
+    """
+    SQL_COUNT_MEETING_SONET_COMMENTS = """
+        SELECT COUNT(*) AS cnt
+        FROM b_sonet_log sl
+        JOIN b_sonet_log_comment slc ON slc.LOG_ID = sl.ID
+        JOIN b_calendar_event ce ON ce.ID = sl.SOURCE_ID
+        WHERE sl.MODULE_ID = 'calendar'
+          AND ce.IS_MEETING = '1'
+          AND ce.DELETED = 'N'
+          AND ce.ID = ce.PARENT_ID
+    """
 
     def __init__(self, host, port, user, password, database, date_from=None):
         self.host = host
@@ -502,6 +626,7 @@ class BitrixMySQLExtractor:
         self._task_created_expr = None
         self._task_filter_column = None
         self._project_filter_column = None
+        self._calendar_forum_topic_column = None
 
     def _get_connection(self):
         if self._conn is None or not self._conn.open:
@@ -588,6 +713,17 @@ class BitrixMySQLExtractor:
                 ['DATE_CREATE', 'PROJECT_DATE_START', 'DATE_ACTIVITY'],
             )
         return self._project_filter_column
+
+    def _get_calendar_forum_topic_column(self):
+        if self._calendar_forum_topic_column is None:
+            self._calendar_forum_topic_column = self._get_existing_mysql_column(
+                'b_calendar_event',
+                ['FORUM_TOPIC_ID'],
+            )
+        return self._calendar_forum_topic_column
+
+    def _uses_calendar_forum_comments(self):
+        return bool(self._get_calendar_forum_topic_column())
 
     def _get_task_where_clause(self):
         column_name = self._get_task_filter_column()
@@ -707,7 +843,34 @@ class BitrixMySQLExtractor:
         return self._execute(self.SQL_COMMENT_ATTACHMENTS_FOR_TASK, (task_id,))
 
     def get_meetings(self):
-        return self._execute(self.SQL_MEETINGS)
+        forum_topic_expr = (
+            'ce.FORUM_TOPIC_ID AS forum_topic_id'
+            if self._get_calendar_forum_topic_column()
+            else 'NULL AS forum_topic_id'
+        )
+        sql = self.SQL_MEETINGS_TEMPLATE.format(forum_topic_expr=forum_topic_expr)
+        return self._execute(sql)
+
+    def get_meeting_comments(self):
+        if self._uses_calendar_forum_comments():
+            return self._execute(self.SQL_MEETING_FORUM_COMMENTS)
+        return self._execute(self.SQL_MEETING_SONET_COMMENTS)
+
+    def get_meeting_attachments(self):
+        if MEETING_ATTACHMENT_ENTITY_TYPE.startswith('CHANGEME'):
+            raise RuntimeError(
+                'MEETING_ATTACHMENT_ENTITY_TYPE not configured. '
+                'Run discovery query and patch the constant.'
+            )
+        return self._execute(
+            self.SQL_MEETING_ATTACHMENTS,
+            (MEETING_ATTACHMENT_ENTITY_TYPE,),
+        )
+
+    def get_meeting_comment_attachments(self):
+        if self._uses_calendar_forum_comments():
+            return self._execute(self.SQL_MEETING_FORUM_COMMENT_ATTACHMENTS)
+        return self._execute(self.SQL_MEETING_SONET_COMMENT_ATTACHMENTS)
 
     def get_departments(self):
         return self._execute(self.SQL_DEPARTMENTS)
@@ -868,6 +1031,11 @@ class BitrixMySQLExtractor:
 
     def count_meetings(self):
         return self._count(self.SQL_COUNT_MEETINGS)
+
+    def count_meeting_comments(self):
+        if self._uses_calendar_forum_comments():
+            return self._count(self.SQL_COUNT_MEETING_COMMENTS)
+        return self._count(self.SQL_COUNT_MEETING_SONET_COMMENTS)
 
     def count_departments(self):
         return self._count(self.SQL_COUNT_DEPARTMENTS)

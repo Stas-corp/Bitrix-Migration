@@ -28,7 +28,7 @@ class AttachmentLoader(BaseLoader):
     def _format_attachment_ref(self, attachment_type, att, compound_key=None):
         parts = [
             f'type={attachment_type}',
-            f'task={att.entity_id}',
+            f'entity={att.entity_id}',
             f'name={att.file_name}',
             f'path={att.file_path}',
         ]
@@ -39,6 +39,30 @@ class AttachmentLoader(BaseLoader):
         if compound_key:
             parts.append(f'key={compound_key}')
         return ', '.join(parts)
+
+    def _make_compound_key(self, attachment_type, att):
+        if attachment_type == 'comment' and att.forum_message_id:
+            return f'comment:{att.entity_id}:{att.forum_message_id}:{att.file_path}'
+        if attachment_type == 'meeting_comment' and att.forum_message_id:
+            return f'meeting_comment:{att.entity_id}:{att.forum_message_id}:{att.file_path}'
+        return f'{attachment_type}:{att.entity_id}:{att.file_path}'
+
+    def _resolve_parent(self, attachment_type, att, task_map, message_map, meeting_map):
+        if attachment_type == 'task':
+            return 'project.task', task_map.get(str(att.entity_id))
+        if attachment_type == 'comment':
+            msg_id = message_map.get(str(att.forum_message_id)) if att.forum_message_id else None
+            if msg_id:
+                return 'mail.message', msg_id
+            return 'project.task', task_map.get(str(att.entity_id))
+        if attachment_type == 'meeting':
+            return 'calendar.event', meeting_map.get(str(att.entity_id))
+        if attachment_type == 'meeting_comment':
+            msg_id = message_map.get(str(att.forum_message_id)) if att.forum_message_id else None
+            if msg_id:
+                return 'mail.message', msg_id
+            return 'calendar.event', meeting_map.get(str(att.entity_id))
+        return None, None
 
     def _get_sftp(self):
         if self._sftp is not None:
@@ -102,7 +126,7 @@ class AttachmentLoader(BaseLoader):
         """Load attachments.
 
         Args:
-            attachment_type: 'task' or 'comment'
+            attachment_type: 'task', 'comment', 'meeting', or 'meeting_comment'
             raw_attachments: optional pre-fetched list
         """
         if raw_attachments is None:
@@ -111,6 +135,10 @@ class AttachmentLoader(BaseLoader):
                 raw_attachments = self.extractor.get_task_attachments()
             elif attachment_type == 'comment':
                 raw_attachments = self.extractor.get_comment_attachments()
+            elif attachment_type == 'meeting':
+                raw_attachments = self.extractor.get_meeting_attachments()
+            elif attachment_type == 'meeting_comment':
+                raw_attachments = self.extractor.get_meeting_comment_attachments()
             else:
                 self.log(f'Unknown attachment_type: {attachment_type}')
                 return
@@ -120,9 +148,14 @@ class AttachmentLoader(BaseLoader):
         task_map = self.get_mapping().get_all_mappings('task')
         self.log(f'Loaded task mapping entries: {len(task_map)}')
 
+        meeting_map = {}
+        if attachment_type in ('meeting', 'meeting_comment'):
+            meeting_map = self.get_mapping().get_all_mappings('meeting')
+            self.log(f'Loaded meeting mapping entries: {len(meeting_map)}')
+
         # Build message_id lookup for comment attachments
         message_map = {}
-        if attachment_type == 'comment':
+        if attachment_type in ('comment', 'meeting_comment'):
             msg_recs = self.env['mail.message'].sudo().search_read(
                 [('x_bitrix_message_id', '!=', False)],
                 ['id', 'x_bitrix_message_id'],
@@ -131,6 +164,12 @@ class AttachmentLoader(BaseLoader):
                 if rec['x_bitrix_message_id']:
                     message_map[str(rec['x_bitrix_message_id'])] = rec['id']
             self.log(f'Loaded comment message mapping entries: {len(message_map)}')
+            if not message_map:
+                self.log(
+                    f'WARN: {attachment_type} attachments requested but message_map is empty — '
+                    f'all attachments will fall back to parent entity. '
+                    f'Did CommentLoader run first?'
+                )
 
         # Use compound key for idempotency: entity_type:entity_id:file_path
         existing_att_mappings = self.get_mapping().get_all_mappings('attachment')
@@ -150,7 +189,7 @@ class AttachmentLoader(BaseLoader):
                 for row in batch:
                     att = BitrixAttachment(
                         entity_type=attachment_type,
-                        entity_id=row.get('task_external_id', 0),
+                        entity_id=row.get('task_external_id') or row.get('meeting_external_id', 0),
                         forum_message_id=row.get('forum_message_id'),
                         file_name=row.get('file_name', ''),
                         file_size=row.get('file_size', 0),
@@ -160,17 +199,23 @@ class AttachmentLoader(BaseLoader):
                     )
 
                     # Compound uniqueness key
-                    if attachment_type == 'comment' and att.forum_message_id:
-                        compound_key = f'comment:{att.entity_id}:{att.forum_message_id}:{att.file_path}'
-                    else:
-                        compound_key = f'{attachment_type}:{att.entity_id}:{att.file_path}'
+                    compound_key = self._make_compound_key(attachment_type, att)
                     att_ref = self._format_attachment_ref(attachment_type, att, compound_key)
                     self.log(f'Attachment start: {att_ref}')
                     # Also check legacy plain file_path key for backward-safe skip
                     legacy_task_key = f'task:{att.entity_id}:{att.file_path}'
                     legacy_comment_key = f'comment:{att.entity_id}:{att.file_path}'
+                    legacy_meeting_key = f'meeting:{att.entity_id}:{att.file_path}'
+                    legacy_meeting_comment_key = f'meeting_comment:{att.entity_id}:{att.file_path}'
                     existing_key = None
-                    for key in (compound_key, att.file_path, legacy_task_key, legacy_comment_key):
+                    for key in (
+                        compound_key,
+                        att.file_path,
+                        legacy_task_key,
+                        legacy_comment_key,
+                        legacy_meeting_key,
+                        legacy_meeting_comment_key,
+                    ):
                         if key in existing_att_mappings:
                             existing_key = key
                             break
@@ -184,22 +229,9 @@ class AttachmentLoader(BaseLoader):
                         continue
 
                     # Resolve parent
-                    if attachment_type == 'task':
-                        res_model = 'project.task'
-                        res_id = task_map.get(str(att.entity_id))
-                    elif attachment_type == 'comment':
-                        # Link to mail.message if we can find it
-                        msg_id = message_map.get(str(att.forum_message_id)) if att.forum_message_id else None
-                        if msg_id:
-                            res_model = 'mail.message'
-                            res_id = msg_id
-                        else:
-                            # Fallback: link to task
-                            res_model = 'project.task'
-                            res_id = task_map.get(str(att.entity_id))
-                    else:
-                        res_model = None
-                        res_id = None
+                    res_model, res_id = self._resolve_parent(
+                        attachment_type, att, task_map, message_map, meeting_map,
+                    )
 
                     if not res_id:
                         self.error_count += 1

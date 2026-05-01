@@ -14,6 +14,7 @@ class TestMeetingDTO(TransactionCase):
             participant_bitrix_ids='1, 2, 3',
             organizer_bitrix_id=1,
             description='Review sprint results',
+            forum_topic_id='123',
         )
         self.assertEqual(m.external_id, 42)
         self.assertEqual(m.name, 'Sprint Review')
@@ -21,6 +22,7 @@ class TestMeetingDTO(TransactionCase):
         self.assertIsNotNone(m.date_end)
         self.assertEqual(m.participant_bitrix_ids, '1, 2, 3')
         self.assertEqual(m.organizer_bitrix_id, 1)
+        self.assertEqual(m.forum_topic_id, 123)
 
     def test_dto_minimal(self):
         from ..services.normalizers.dto import BitrixMeeting
