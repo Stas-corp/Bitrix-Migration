@@ -1,8 +1,12 @@
 import logging
+import os
 import re
+import time
 import traceback
 
 from odoo import models, fields, api
+from odoo.exceptions import UserError
+from odoo.tools import config
 
 _logger = logging.getLogger(__name__)
 
@@ -10,6 +14,7 @@ _logger = logging.getLogger(__name__)
 class BitrixMigrationRun(models.Model):
     _name = 'bitrix.migration.run'
     _description = 'Bitrix Migration Runner'
+    _attachment_sync_types = ('task', 'comment', 'meeting', 'meeting_comment')
     _visible_modes = {
         'hr',
         'departments_only',
@@ -138,6 +143,34 @@ class BitrixMigrationRun(models.Model):
     avatar_imported_count = fields.Integer(string='Avatar Imported', readonly=True, default=0)
     avatar_propagated_count = fields.Integer(string='Avatar Propagated', readonly=True, default=0)
     avatar_error_count = fields.Integer(string='Avatar Errors', readonly=True, default=0)
+
+    # Attachment background-stage progress (read-only, managed by manual queue + cron)
+    attachment_sync_state = fields.Selection([
+        ('pending', 'Pending'),
+        ('running', 'Running'),
+        ('done', 'Done'),
+        ('error', 'Error'),
+    ], string='Attachment Sync State', readonly=True)
+    attachment_current_type = fields.Selection([
+        ('task', 'Task'),
+        ('comment', 'Comment'),
+        ('meeting', 'Meeting'),
+        ('meeting_comment', 'Meeting Comment'),
+    ], string='Attachment Type', readonly=True)
+    attachment_current_index = fields.Integer(string='Attachment Current Index', readonly=True, default=0)
+    attachment_total_count = fields.Integer(string='Attachment Total Count', readonly=True, default=0)
+    attachment_processed_count = fields.Integer(string='Attachment Processed', readonly=True, default=0)
+    attachment_created_count = fields.Integer(string='Attachment Created', readonly=True, default=0)
+    attachment_skipped_count = fields.Integer(string='Attachment Skipped', readonly=True, default=0)
+    attachment_error_count = fields.Integer(string='Attachment Errors', readonly=True, default=0)
+    attachment_active_key = fields.Char(string='Attachment Active Key', readonly=True)
+    attachment_active_tmp_path = fields.Char(string='Attachment Active Tmp Path', readonly=True)
+    attachment_active_bytes = fields.Float(string='Attachment Active Bytes', readonly=True, default=0.0)
+    attachment_active_expected_size = fields.Float(
+        string='Attachment Active Expected Size',
+        readonly=True,
+        default=0.0,
+    )
 
     def _append_log(self, message):
         self.ensure_one()
@@ -362,7 +395,6 @@ class BitrixMigrationRun(models.Model):
         from ..services.loaders.tasks import TaskLoader
         from ..services.loaders.tasks_relink import TaskRelinkLoader
         from ..services.loaders.comments import CommentLoader
-        from ..services.loaders.attachments import AttachmentLoader
         from ..services.loaders.meetings import MeetingLoader
         fallback_project_id = self._ensure_fallback_project()
         fallback_stage_ids = self._ensure_fallback_project_stages(fallback_project_id)
@@ -391,17 +423,6 @@ class BitrixMigrationRun(models.Model):
             }),
         ]
 
-        # Add attachment steps only if SFTP is configured
-        if self.sftp_host:
-            sftp_kwargs = {
-                'sftp_host': self.sftp_host,
-                'sftp_port': self.sftp_port,
-                'sftp_user': self.sftp_user,
-                'sftp_key_path': self.sftp_key_path,
-                'sftp_base_path': self.sftp_base_path or '/home/bitrix/www',
-            }
-            steps.append(('Task Attachments', AttachmentLoader, sftp_kwargs))
-
         total_steps = len(steps)
         for i, (name, LoaderClass, kwargs) in enumerate(steps):
             self._append_log(f'\n--- Step {i+1}/{total_steps}: {name} ---')
@@ -417,44 +438,337 @@ class BitrixMigrationRun(models.Model):
             )
             loader.run()
 
-        # Run comment attachments separately if SFTP configured
         if self.sftp_host:
-            sftp_kwargs = {
-                'sftp_host': self.sftp_host,
-                'sftp_port': self.sftp_port,
-                'sftp_user': self.sftp_user,
-                'sftp_key_path': self.sftp_key_path,
-                'sftp_base_path': self.sftp_base_path or '/home/bitrix/www',
-            }
-            self._append_log(f'\n--- Step: Comment Attachments ---')
-            att_loader = AttachmentLoader(
-                env=self.env,
-                extractor=extractor,
-                dry_run=dry_run,
-                log_callback=self._append_log,
-                **sftp_kwargs,
+            self._append_log(
+                '\n--- Attachments ---\n'
+                'SFTP attachments are loaded by the background attachment queue. '
+                'Use "Start/Resume Attachments" after the main migration steps finish.'
             )
-            att_loader.run(attachment_type='comment')
-
-            self._append_log(f'\n--- Step: Meeting Attachments ---')
-            AttachmentLoader(
-                env=self.env,
-                extractor=extractor,
-                dry_run=dry_run,
-                log_callback=self._append_log,
-                **sftp_kwargs,
-            ).run(attachment_type='meeting')
-
-            self._append_log(f'\n--- Step: Meeting Comment Attachments ---')
-            AttachmentLoader(
-                env=self.env,
-                extractor=extractor,
-                dry_run=dry_run,
-                log_callback=self._append_log,
-                **sftp_kwargs,
-            ).run(attachment_type='meeting_comment')
 
         self._run_reconciliation()
+
+    def _get_sftp_loader_kwargs(self):
+        return {
+            'sftp_host': self.sftp_host,
+            'sftp_port': self.sftp_port,
+            'sftp_user': self.sftp_user,
+            'sftp_key_path': self.sftp_key_path,
+            'sftp_base_path': self.sftp_base_path or '/home/bitrix/www',
+        }
+
+    def _get_attachment_tmp_dir(self):
+        data_dir = config['data_dir'] or '/tmp'
+        return os.path.join(
+            data_dir,
+            'bitrix_attachment_tmp',
+            self.env.cr.dbname,
+            str(self.id),
+        )
+
+    def _get_attachment_rows_for_type(self, extractor, attachment_type):
+        if attachment_type == 'task':
+            task_ids = self._get_imported_task_bitrix_ids()
+            if task_ids and hasattr(extractor, 'get_task_attachments_for_task_ids'):
+                return extractor.get_task_attachments_for_task_ids(task_ids)
+            return extractor.get_task_attachments()
+        if attachment_type == 'comment':
+            task_ids = self._get_imported_task_bitrix_ids()
+            if task_ids and hasattr(extractor, 'get_comment_attachments_for_task_ids'):
+                return extractor.get_comment_attachments_for_task_ids(task_ids)
+            return extractor.get_comment_attachments()
+        if attachment_type == 'meeting':
+            return extractor.get_meeting_attachments()
+        if attachment_type == 'meeting_comment':
+            return extractor.get_meeting_comment_attachments()
+        raise ValueError(f'Unknown attachment type: {attachment_type}')
+
+    def _get_imported_task_bitrix_ids(self):
+        tasks = self.env['project.task'].sudo().with_context(active_test=False).search_read(
+            [('x_bitrix_id', 'not in', (False, '', '0'))],
+            ['x_bitrix_id'],
+        )
+        task_ids = []
+        for task in tasks:
+            bitrix_id = task.get('x_bitrix_id')
+            try:
+                task_ids.append(int(bitrix_id))
+            except (TypeError, ValueError):
+                continue
+        return task_ids
+
+    def _try_lock_attachment_sync(self):
+        self.ensure_one()
+        self.env.cr.execute('SELECT pg_try_advisory_lock(%s, %s)', (84621, self.id))
+        return bool(self.env.cr.fetchone()[0])
+
+    def _unlock_attachment_sync(self):
+        self.ensure_one()
+        self.env.cr.execute('SELECT pg_advisory_unlock(%s, %s)', (84621, self.id))
+
+    def _next_attachment_type(self, attachment_type):
+        if not attachment_type:
+            return self._attachment_sync_types[0]
+        try:
+            index = self._attachment_sync_types.index(attachment_type)
+        except ValueError:
+            return self._attachment_sync_types[0]
+        next_index = index + 1
+        if next_index >= len(self._attachment_sync_types):
+            return False
+        return self._attachment_sync_types[next_index]
+
+    def _clear_active_attachment_download(self):
+        tmp_path = self.attachment_active_tmp_path
+        if tmp_path:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+
+    def _reset_attachment_sync_state(self, remove_tmp=False):
+        if remove_tmp:
+            self._clear_active_attachment_download()
+        self.sudo().write({
+            'attachment_sync_state': False,
+            'attachment_current_type': False,
+            'attachment_current_index': 0,
+            'attachment_total_count': 0,
+            'attachment_processed_count': 0,
+            'attachment_created_count': 0,
+            'attachment_skipped_count': 0,
+            'attachment_error_count': 0,
+            'attachment_active_key': False,
+            'attachment_active_tmp_path': False,
+            'attachment_active_bytes': 0.0,
+            'attachment_active_expected_size': 0.0,
+        })
+        self.env.cr.commit()
+
+    def action_start_attachment_sync(self):
+        """Manually queue resumable attachment migration for cron processing."""
+        self.ensure_one()
+        if not self.sftp_host:
+            raise UserError('SFTP host is required to migrate attachments.')
+
+        extractor = None
+        totals = {}
+        total = 0
+        try:
+            extractor = self._get_extractor()
+            for attachment_type in self._attachment_sync_types:
+                try:
+                    count = len(self._get_attachment_rows_for_type(extractor, attachment_type))
+                except Exception as e:
+                    count = 0
+                    self._append_log(
+                        f'WARNING: could not count {attachment_type} attachments: {e}'
+                    )
+                totals[attachment_type] = count
+                total += count
+        finally:
+            if extractor:
+                try:
+                    extractor.close()
+                except Exception:
+                    _logger.warning('Could not close Bitrix extractor cleanly', exc_info=True)
+
+        self._reset_attachment_sync_state(remove_tmp=True)
+        first_type = self._attachment_sync_types[0]
+        self.sudo().write({
+            'state': 'running',
+            'attachment_sync_state': 'pending',
+            'attachment_current_type': first_type,
+            'attachment_current_index': 0,
+            'attachment_total_count': total,
+            'attachment_processed_count': 0,
+            'attachment_created_count': 0,
+            'attachment_skipped_count': 0,
+            'attachment_error_count': 0,
+            'attachment_active_key': False,
+            'attachment_active_tmp_path': False,
+            'attachment_active_bytes': 0.0,
+            'attachment_active_expected_size': 0.0,
+        })
+        self.env.cr.commit()
+        self._append_log(
+            'Attachment sync queued: '
+            + ', '.join(f'{key}={value}' for key, value in totals.items())
+            + f', total={total}. Cron will process downloads in short resumable ticks.'
+        )
+
+    @api.model
+    def _cron_process_attachment_batch(self):
+        """Background cron: process a short resumable batch of attachments."""
+        from ..services.loaders.attachments import AttachmentLoader
+
+        max_seconds = 45
+        deadline = time.monotonic() + max_seconds
+
+        run = self.search(
+            [('attachment_sync_state', 'in', ('pending', 'running'))],
+            limit=1, order='id asc',
+        )
+        if not run:
+            return
+
+        if not run._try_lock_attachment_sync():
+            return
+
+        run.sudo().write({'attachment_sync_state': 'running'})
+        run.env.cr.commit()
+
+        extractor = None
+        loader = None
+        try:
+            extractor = run._get_extractor()
+
+            def _update_attachment_progress(progress):
+                run.sudo().write({
+                    'attachment_sync_state': 'running',
+                    'attachment_current_type': progress['attachment_type'],
+                    'attachment_current_index': progress['index'],
+                    'attachment_active_key': progress['active_key'],
+                    'attachment_active_tmp_path': progress['active_tmp_path'],
+                    'attachment_active_bytes': progress['active_bytes'],
+                    'attachment_active_expected_size': progress['active_expected_size'],
+                })
+                run.env.cr.commit()
+
+            loader = AttachmentLoader(
+                env=run.env,
+                extractor=extractor,
+                dry_run=False,
+                log_callback=run._append_log,
+                progress_callback=_update_attachment_progress,
+                **run._get_sftp_loader_kwargs(),
+            )
+
+            current_type = run.attachment_current_type or run._attachment_sync_types[0]
+            while current_type:
+                if time.monotonic() >= deadline:
+                    break
+
+                try:
+                    raw_attachments = run._get_attachment_rows_for_type(extractor, current_type)
+                except Exception as e:
+                    run._append_log(
+                        f'WARNING: could not extract {current_type} attachments; '
+                        f'skipping type: {e}'
+                    )
+                    run.sudo().write({
+                        'attachment_error_count': (run.attachment_error_count or 0) + 1,
+                        'attachment_current_type': run._next_attachment_type(current_type),
+                        'attachment_current_index': 0,
+                        'attachment_active_key': False,
+                        'attachment_active_tmp_path': False,
+                        'attachment_active_bytes': 0.0,
+                        'attachment_active_expected_size': 0.0,
+                    })
+                    run.env.cr.commit()
+                    current_type = run.attachment_current_type
+                    continue
+
+                result = loader.run_resumable_batch(
+                    attachment_type=current_type,
+                    raw_attachments=raw_attachments,
+                    start_index=run.attachment_current_index or 0,
+                    deadline=deadline,
+                    tmp_dir=run._get_attachment_tmp_dir(),
+                    active_key=run.attachment_active_key,
+                    active_tmp_path=run.attachment_active_tmp_path,
+                    active_bytes=run.attachment_active_bytes or 0,
+                    active_expected_size=run.attachment_active_expected_size or 0,
+                )
+
+                processed_total = (run.attachment_processed_count or 0) + result['processed']
+                created_total = (run.attachment_created_count or 0) + result['created']
+                skipped_total = (run.attachment_skipped_count or 0) + result['skipped']
+                error_total = (run.attachment_error_count or 0) + result['errors']
+
+                if result['done']:
+                    next_type = run._next_attachment_type(current_type)
+                    run._append_log(
+                        f'Attachment type done: {current_type}, '
+                        f'created={created_total}, skipped={skipped_total}, errors={error_total}'
+                    )
+                    run.sudo().write({
+                        'attachment_current_type': next_type or False,
+                        'attachment_current_index': 0,
+                        'attachment_processed_count': processed_total,
+                        'attachment_created_count': created_total,
+                        'attachment_skipped_count': skipped_total,
+                        'attachment_error_count': error_total,
+                        'attachment_active_key': False,
+                        'attachment_active_tmp_path': False,
+                        'attachment_active_bytes': 0.0,
+                        'attachment_active_expected_size': 0.0,
+                    })
+                    run.env.cr.commit()
+                    current_type = next_type
+                    continue
+
+                run.sudo().write({
+                    'attachment_sync_state': 'running',
+                    'attachment_current_type': current_type,
+                    'attachment_current_index': result['next_index'],
+                    'attachment_processed_count': processed_total,
+                    'attachment_created_count': created_total,
+                    'attachment_skipped_count': skipped_total,
+                    'attachment_error_count': error_total,
+                    'attachment_active_key': result['active_key'],
+                    'attachment_active_tmp_path': result['active_tmp_path'],
+                    'attachment_active_bytes': result['active_bytes'],
+                    'attachment_active_expected_size': result['active_expected_size'],
+                })
+                run.env.cr.commit()
+                return
+
+            if not current_type:
+                run.sudo().write({
+                    'attachment_sync_state': 'done',
+                    'attachment_current_type': False,
+                    'attachment_current_index': 0,
+                    'attachment_active_key': False,
+                    'attachment_active_tmp_path': False,
+                    'attachment_active_bytes': 0.0,
+                    'attachment_active_expected_size': 0.0,
+                    'state': 'done',
+                    'progress': 100.0,
+                })
+                run._append_log(
+                    f'Attachment sync completed: processed={run.attachment_processed_count}, '
+                    f'created={run.attachment_created_count}, '
+                    f'skipped={run.attachment_skipped_count}, '
+                    f'errors={run.attachment_error_count}'
+                )
+                run.env.cr.commit()
+
+        except Exception:
+            run.env.cr.rollback()
+            run.sudo().write({
+                'attachment_sync_state': 'error',
+                'state': 'error',
+            })
+            run._append_log(
+                f'=== ATTACHMENT SYNC ERROR ===\n{traceback.format_exc()}'
+            )
+            _logger.exception('Attachment background sync failed for run %s', run.id)
+            run.env.cr.commit()
+        finally:
+            if loader:
+                try:
+                    loader._close_sftp()
+                except Exception:
+                    pass
+            if extractor:
+                try:
+                    extractor.close()
+                except Exception:
+                    pass
+            try:
+                run._unlock_attachment_sync()
+            except Exception:
+                _logger.warning('Could not release attachment sync lock', exc_info=True)
 
     def _run_single_task(self, extractor):
         """Load a single task with all its comments and attachments."""
@@ -464,7 +778,6 @@ class BitrixMigrationRun(models.Model):
         from ..services.loaders.stages import StageLoader
         from ..services.loaders.tasks import TaskLoader
         from ..services.loaders.comments import CommentLoader
-        from ..services.loaders.attachments import AttachmentLoader
 
         task_id = self.single_task_bitrix_id
         if not task_id:
@@ -560,31 +873,11 @@ class BitrixMigrationRun(models.Model):
 
         # 8. Attachments (if SFTP configured)
         if self.sftp_host:
-            self._append_log(f'\n--- Task Attachments ---')
-            raw_task_atts = extractor.get_task_attachments_for_task(int(task_id))
-            att_loader = AttachmentLoader(
-                self.env, extractor,
-                log_callback=self._append_log,
-                sftp_host=self.sftp_host,
-                sftp_port=self.sftp_port,
-                sftp_user=self.sftp_user,
-                sftp_key_path=self.sftp_key_path,
-                sftp_base_path=self.sftp_base_path or '/home/bitrix/www',
+            self._append_log(
+                '\n--- Attachments ---\n'
+                'SFTP attachments are loaded by the background attachment queue. '
+                'Use "Start/Resume Attachments" to load files without the HTTP time limit.'
             )
-            att_loader.run(attachment_type='task', raw_attachments=raw_task_atts)
-
-            self._append_log(f'\n--- Comment Attachments ---')
-            raw_comment_atts = extractor.get_comment_attachments_for_task(int(task_id))
-            att_loader2 = AttachmentLoader(
-                self.env, extractor,
-                log_callback=self._append_log,
-                sftp_host=self.sftp_host,
-                sftp_port=self.sftp_port,
-                sftp_user=self.sftp_user,
-                sftp_key_path=self.sftp_key_path,
-                sftp_base_path=self.sftp_base_path or '/home/bitrix/www',
-            )
-            att_loader2.run(attachment_type='comment', raw_attachments=raw_comment_atts)
 
         self._append_log('\n--- Single task migration complete ---')
 
@@ -893,7 +1186,6 @@ class BitrixMigrationRun(models.Model):
 
     def _run_meetings(self, extractor):
         """Migrate Bitrix meetings, comments, and attachments into calendar.event."""
-        from ..services.loaders.attachments import AttachmentLoader
         from ..services.loaders.comments import CommentLoader
         from ..services.loaders.meetings import MeetingLoader
 
@@ -920,30 +1212,11 @@ class BitrixMigrationRun(models.Model):
         ).run()
 
         if self.sftp_host:
-            sftp_kwargs = {
-                'sftp_host': self.sftp_host,
-                'sftp_port': self.sftp_port,
-                'sftp_user': self.sftp_user,
-                'sftp_key_path': self.sftp_key_path,
-                'sftp_base_path': self.sftp_base_path or '/home/bitrix/www',
-            }
-            self._append_log('\n--- Meeting Attachments ---')
-            AttachmentLoader(
-                env=self.env,
-                extractor=extractor,
-                dry_run=False,
-                log_callback=self._append_log,
-                **sftp_kwargs,
-            ).run(attachment_type='meeting')
-
-            self._append_log('\n--- Meeting Comment Attachments ---')
-            AttachmentLoader(
-                env=self.env,
-                extractor=extractor,
-                dry_run=False,
-                log_callback=self._append_log,
-                **sftp_kwargs,
-            ).run(attachment_type='meeting_comment')
+            self._append_log(
+                '\n--- Meeting Attachments ---\n'
+                'SFTP attachments are loaded by the background attachment queue. '
+                'Use "Start/Resume Attachments" after meeting import finishes.'
+            )
 
     def _run_fix_roles(self, extractor):
         """Re-sync roles for already imported tasks without re-creating them."""
@@ -1123,6 +1396,7 @@ class BitrixMigrationRun(models.Model):
         normalized_keys = 0
         orphans = 0
         already_ok = 0
+        linked_to_message = 0
 
         for mapping in att_mappings:
             bitrix_id = mapping.bitrix_id or ''
@@ -1151,25 +1425,26 @@ class BitrixMigrationRun(models.Model):
                 already_ok += 1
                 continue
 
-            # Check if attachment is already linked to mail.message
-            if ir_att.res_model == 'mail.message':
-                target_msg_id = message_map.get(forum_message_id)
-                if target_msg_id and ir_att.res_id == target_msg_id:
-                    already_ok += 1
-                    continue
-                # Relink to correct message if needed
-                if target_msg_id:
-                    ir_att.write({'res_model': 'mail.message', 'res_id': target_msg_id})
-                    relinked += 1
-                    continue
-                already_ok += 1
-                continue
-
-            # Attachment is linked to a parent record — check if mail.message exists now
             target_msg_id = message_map.get(forum_message_id)
             if target_msg_id:
-                ir_att.write({'res_model': 'mail.message', 'res_id': target_msg_id})
-                relinked += 1
+                message = Message.browse(target_msg_id).exists()
+                if message:
+                    vals = {}
+                    if message.model and message.res_id and (
+                        ir_att.res_model != message.model
+                        or ir_att.res_id != message.res_id
+                    ):
+                        vals = {'res_model': message.model, 'res_id': message.res_id}
+                    if vals:
+                        ir_att.write(vals)
+                        relinked += 1
+                    else:
+                        already_ok += 1
+                    if ir_att not in message.attachment_ids:
+                        message.write({'attachment_ids': [(4, ir_att.id)]})
+                        linked_to_message += 1
+                else:
+                    already_ok += 1
             else:
                 already_ok += 1
 
@@ -1180,7 +1455,8 @@ class BitrixMigrationRun(models.Model):
         self.env.cr.commit()
         self._append_log(
             f'Fix Attachments complete: relinked={relinked}, already_ok={already_ok}, '
-            f'orphans={orphans}, normalized_keys={normalized_keys}'
+            f'orphans={orphans}, normalized_keys={normalized_keys}, '
+            f'linked_to_message={linked_to_message}'
         )
         self._run_reconciliation()
 
@@ -2186,6 +2462,7 @@ class BitrixMigrationRun(models.Model):
             self._append_log('Clearing migration mappings and checkpoints...')
             self.env['bitrix.migration.mapping'].sudo().search([]).unlink()
             self._clear_checkpoints()
+            self._reset_attachment_sync_state(remove_tmp=True)
 
             self.state = 'draft'
             self.progress = 0.0
@@ -2318,6 +2595,7 @@ class BitrixMigrationRun(models.Model):
         self.log_output = ''
         self.progress = 0.0
         self._reset_avatar_sync_state()
+        self._reset_attachment_sync_state(remove_tmp=True)
 
     @api.model
     def get_singleton_action(self):

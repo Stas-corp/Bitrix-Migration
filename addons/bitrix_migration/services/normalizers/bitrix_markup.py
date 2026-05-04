@@ -9,7 +9,7 @@ Supported tags:
   [URL]...[/URL]       → <a href="...">...</a>
   [IMG]...[/IMG]       → <img src="..."/>
   [USER=ID]Name[/USER] → <strong>Name</strong> (or resolved name from employee_map)
-  [DISK FILE ID=...]   → <em>📎 файл (см. вложения)</em>
+  [DISK FILE ID=...]   → placeholder with the original Disk file id
   [LIST] [*] [/LIST]   → <ul><li>...</li></ul>
   [QUOTE]...[/QUOTE]   → <blockquote>...</blockquote>
   [CODE]...[/CODE]     → <pre><code>...</code></pre>
@@ -57,10 +57,19 @@ def normalize_bitrix_markup(text, employee_name_map=None):
         flags=re.DOTALL | re.IGNORECASE,
     )
 
-    # [DISK FILE ID=...] — keep a visible marker while files are handled as attachments.
+    # [DISK FILE ID=...] — keep the Disk id so AttachmentLoader can replace it
+    # with the final /web/content link after the file is created.
+    def _replace_disk_file(match):
+        disk_file_id = _escape(match.group(1))
+        return (
+            '<span class="o_bitrix_disk_file_placeholder" '
+            f'data-bitrix-disk-file-id="{disk_file_id}">'
+            'файл (см. вложения)</span>'
+        )
+
     text = re.sub(
-        r'\[DISK\s+FILE\s+ID=(\d+)\]',
-        r'<em>📎 файл (см. вложения)</em>',
+        r'\[DISK\s+FILE\s+ID=([A-Za-z0-9_-]+)\]',
+        _replace_disk_file,
         text,
         flags=re.IGNORECASE,
     )

@@ -101,6 +101,149 @@ class TestAttachmentIdempotency(TransactionCase):
         )
         self.assertEqual(len(msg_recs), 0)
 
+    def test_task_attachment_adds_description_link_once(self):
+        """Task attachments are also visible from the task description."""
+        from ..services.loaders.attachments import AttachmentLoader
+        from ..services.normalizers.dto import BitrixAttachment
+
+        loader = AttachmentLoader(self.env, extractor=None, dry_run=True)
+        att = BitrixAttachment(
+            entity_type='task',
+            entity_id=9001,
+            disk_file_id='n42',
+            disk_attached_object_id='90042',
+            file_name='Report & plan.pdf',
+            file_path='/upload/test.pdf',
+        )
+        ir_att = self.env['ir.attachment'].sudo().create({
+            'name': 'Report & plan.pdf',
+            'raw': b'data',
+            'res_model': 'project.task',
+            'res_id': self.task.id,
+            'mimetype': 'application/pdf',
+        })
+
+        self.assertTrue(loader._ensure_task_description_attachment_link(
+            ir_att, 'project.task', self.task.id, att,
+        ))
+        self.assertIn(
+            f'/web/content/{ir_att.id}?download=true',
+            self.task.description,
+        )
+        self.assertIn('Report &amp; plan.pdf', self.task.description)
+
+        self.assertFalse(loader._ensure_task_description_attachment_link(
+            ir_att, 'project.task', self.task.id, att,
+        ))
+        self.assertEqual(
+            self.task.description.count(f'/web/content/{ir_att.id}?download=true'),
+            1,
+        )
+
+    def test_task_attachment_replaces_disk_file_marker(self):
+        """Task description DISK FILE markers are replaced with the attachment link."""
+        from ..services.loaders.attachments import AttachmentLoader
+        from ..services.normalizers.dto import BitrixAttachment
+
+        self.task.description = 'Before [DISK FILE ID=n277883] after'
+        loader = AttachmentLoader(self.env, extractor=None, dry_run=True)
+        att = BitrixAttachment(
+            entity_type='task',
+            entity_id=9001,
+            disk_file_id='n277883',
+            disk_attached_object_id='182607',
+            file_name='Offer.pdf',
+            file_path='/upload/offer.pdf',
+        )
+        ir_att = self.env['ir.attachment'].sudo().create({
+            'name': 'Offer.pdf',
+            'raw': b'data',
+            'res_model': 'project.task',
+            'res_id': self.task.id,
+            'mimetype': 'application/pdf',
+        })
+
+        self.assertTrue(loader._ensure_task_description_attachment_link(
+            ir_att, 'project.task', self.task.id, att,
+        ))
+        self.assertNotIn('[DISK FILE ID=', self.task.description)
+        self.assertIn('Before', self.task.description)
+        self.assertIn('after', self.task.description)
+        self.assertIn(f'/web/content/{ir_att.id}?download=true', self.task.description)
+
+    def test_task_attachment_replaces_attached_object_marker(self):
+        """Some Bitrix descriptions reference b_disk_attached_object.ID."""
+        from ..services.loaders.attachments import AttachmentLoader
+        from ..services.normalizers.dto import BitrixAttachment
+
+        self.task.description = (
+            '<span class="o_bitrix_disk_file_placeholder" '
+            'data-bitrix-disk-file-id="182607">файл (см. вложения)</span>'
+        )
+        loader = AttachmentLoader(self.env, extractor=None, dry_run=True)
+        att = BitrixAttachment(
+            entity_type='task',
+            entity_id=9001,
+            disk_file_id='n277778',
+            disk_attached_object_id='182607',
+            file_name='Invoice.pdf',
+            file_path='/upload/invoice.pdf',
+        )
+        ir_att = self.env['ir.attachment'].sudo().create({
+            'name': 'Invoice.pdf',
+            'raw': b'data',
+            'res_model': 'project.task',
+            'res_id': self.task.id,
+            'mimetype': 'application/pdf',
+        })
+
+        self.assertTrue(loader._ensure_task_description_attachment_link(
+            ir_att, 'project.task', self.task.id, att,
+        ))
+        self.assertNotIn('o_bitrix_disk_file_placeholder', self.task.description)
+        self.assertIn(f'/web/content/{ir_att.id}?download=true', self.task.description)
+
+    def test_comment_attachment_replaces_generic_placeholder_once(self):
+        """Comment placeholders are replaced after Odoo strips marker data attrs."""
+        from ..services.loaders.attachments import AttachmentLoader
+        from ..services.normalizers.dto import BitrixAttachment
+
+        msg = self.env['mail.message'].sudo().create({
+            'body': (
+                '<p>comment with file<br>'
+                '<span class="o_bitrix_disk_file_placeholder">файл (см. вложения)</span>'
+                '</p>'
+            ),
+            'model': 'project.task',
+            'res_id': self.task.id,
+            'x_bitrix_message_id': 555,
+        })
+        loader = AttachmentLoader(self.env, extractor=None, dry_run=True)
+        att = BitrixAttachment(
+            entity_type='comment',
+            entity_id=9001,
+            forum_message_id=555,
+            disk_file_id='n277900',
+            disk_attached_object_id='182900',
+            file_name='Comment image.png',
+            file_path='/upload/comment.png',
+        )
+        ir_att = self.env['ir.attachment'].sudo().create({
+            'name': 'Comment image.png',
+            'raw': b'data',
+            'res_model': 'project.task',
+            'res_id': self.task.id,
+            'mimetype': 'image/png',
+        })
+
+        self.assertTrue(loader._ensure_message_body_attachment_link(ir_att, msg, att))
+        self.assertNotIn('o_bitrix_disk_file_placeholder', msg.body)
+        self.assertIn(f'/web/content/{ir_att.id}?download=true', msg.body)
+        self.assertIn('Comment image.png', msg.body)
+
+        self.assertFalse(loader._ensure_message_body_attachment_link(ir_att, msg, att))
+        self.assertEqual(msg.body.count(f'/web/content/{ir_att.id}?download=true'), 1)
+
 
 class TestAttachmentDTO(TransactionCase):
     """Tests for BitrixAttachment DTO."""
@@ -119,6 +262,8 @@ class TestAttachmentDTO(TransactionCase):
             entity_type='comment',
             entity_id=42,
             forum_message_id=555,
+            disk_file_id='n777',
+            disk_attached_object_id='888',
             file_name='report.pdf',
             file_size=1024,
             content_type='application/pdf',
@@ -127,6 +272,8 @@ class TestAttachmentDTO(TransactionCase):
         self.assertEqual(att.entity_type, 'comment')
         self.assertEqual(att.entity_id, 42)
         self.assertEqual(att.forum_message_id, 555)
+        self.assertEqual(att.disk_file_id, 'n777')
+        self.assertEqual(att.disk_attached_object_id, '888')
         self.assertEqual(att.file_name, 'report.pdf')
 
     def test_dto_null_forum_message_id(self):

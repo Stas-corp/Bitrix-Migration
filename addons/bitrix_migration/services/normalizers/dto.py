@@ -302,16 +302,22 @@ class BitrixAttachment(BaseModel):
     entity_type: str = 'task'  # 'task' or 'comment'
     entity_id: int = 0
     forum_message_id: Optional[int] = None
+    disk_file_id: str = ''
+    disk_attached_object_id: str = ''
     file_name: str = ''
     file_size: int = 0
     content_type: str = 'application/octet-stream'
     file_path: str = ''
     attached_at: Optional[datetime] = None
 
-    @field_validator('file_name', 'content_type', 'file_path', mode='before')
+    @field_validator(
+        'disk_file_id', 'disk_attached_object_id', 'file_name',
+        'content_type', 'file_path', mode='before',
+    )
     @classmethod
     def clean_str(cls, v):
-        return _clean_str(v) or ''
+        cleaned = _clean_str(v)
+        return '' if cleaned is None else str(cleaned)
 
     @field_validator('forum_message_id', mode='before')
     @classmethod

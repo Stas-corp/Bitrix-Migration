@@ -124,6 +124,7 @@ class TestMarkupNormalizer(TransactionCase):
         result = normalize_bitrix_markup('See file [DISK FILE ID=42] here')
         self.assertNotIn('[DISK', result)
         self.assertNotIn('FILE ID', result)
+        self.assertIn('data-bitrix-disk-file-id="42"', result)
         self.assertIn('файл', result)
         self.assertIn('See file', result)
         self.assertIn('here', result)
