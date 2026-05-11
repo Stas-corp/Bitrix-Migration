@@ -143,10 +143,13 @@ class EmployeeLoader(BaseLoader):
         self.log_stats()
 
     def archive_fired(self):
-        """Set active=False on hr.employee whose Bitrix user is ACTIVE='N'.
+        """Set active=False on hr.employee (and linked res.users) for Bitrix ACTIVE='N'.
 
         Only touches already-migrated employees (matched by x_bitrix_id).
-        Idempotent: skips employees that are already archived.
+        Linked res.users is archived only when:
+          - it is not a protected system user (admin/root/public);
+          - it has no other active hr.employee linked to it.
+        Idempotent: skips records that are already archived.
         """
         self.log('Extracting Bitrix fired user IDs (ACTIVE="N")...')
         rows = self.extractor.get_fired_employee_ids()
@@ -159,32 +162,85 @@ class EmployeeLoader(BaseLoader):
             return
 
         Employee = self.env['hr.employee'].sudo().with_context(active_test=False)
-        employees = Employee.search([
-            ('x_bitrix_id', 'in', fired_bitrix_ids),
-            ('active', '=', True),
-        ])
-        self.log(f'Matched {len(employees)} migrated employees to archive')
+        employees = Employee.search([('x_bitrix_id', 'in', fired_bitrix_ids)])
+        self.log(f'Matched {len(employees)} migrated employees (active+archived)')
+
+        protected_user_ids = self._get_protected_user_ids()
 
         archived = 0
+        archived_users = 0
+        skipped_users_protected = 0
+        skipped_users_shared = 0
         for batch in self._batched(employees, self.batch_size):
             for emp in batch:
+                user = emp.user_id
                 if self.dry_run:
-                    archived += 1
+                    if emp.active:
+                        archived += 1
+                    if user and user.active and user.id not in protected_user_ids:
+                        archived_users += 1
+                    continue
+                if emp.active:
+                    try:
+                        emp.write({'active': False})
+                        archived += 1
+                    except Exception as e:
+                        self.error_count += 1
+                        self.errors.append((emp.x_bitrix_id, str(e)))
+                        self.log(
+                            f'ERROR archiving hr.employee bitrix_id={emp.x_bitrix_id}: {e}'
+                        )
+                        continue
+
+                if not user or not user.active:
+                    continue
+                if user.id in protected_user_ids:
+                    skipped_users_protected += 1
+                    self.log(
+                        f'Skip protected user login={user.login} (id={user.id}) '
+                        f'linked to bitrix_id={emp.x_bitrix_id}'
+                    )
+                    continue
+                other_active = Employee.search_count([
+                    ('user_id', '=', user.id),
+                    ('active', '=', True),
+                    ('id', '!=', emp.id),
+                ])
+                if other_active:
+                    skipped_users_shared += 1
+                    self.log(
+                        f'Skip user login={user.login}: {other_active} other active '
+                        f'hr.employee still linked'
+                    )
                     continue
                 try:
-                    emp.write({'active': False})
-                    archived += 1
+                    user.write({'active': False})
+                    archived_users += 1
                 except Exception as e:
                     self.error_count += 1
-                    self.errors.append((emp.x_bitrix_id, str(e)))
+                    self.errors.append((emp.x_bitrix_id, f'user archive: {e}'))
                     self.log(
-                        f'ERROR archiving hr.employee bitrix_id={emp.x_bitrix_id}: {e}'
+                        f'ERROR archiving res.users login={user.login} '
+                        f'(emp bitrix_id={emp.x_bitrix_id}): {e}'
                     )
             self.commit_checkpoint(archived)
 
         self.updated_count += archived
-        self.log(f'Archived employees: {archived}')
+        self.log(
+            f'Archived employees: {archived}, users: {archived_users}, '
+            f'skipped users (protected): {skipped_users_protected}, '
+            f'skipped users (shared with active employee): {skipped_users_shared}'
+        )
         self.log_stats()
+
+    def _get_protected_user_ids(self):
+        """res.users that must never be archived (admin/root/public)."""
+        protected = set()
+        for xmlid in ('base.user_admin', 'base.user_root', 'base.public_user'):
+            user = self.env.ref(xmlid, raise_if_not_found=False)
+            if user:
+                protected.add(user.id)
+        return protected
 
     def _build_employee_vals(self, emp, dept_id=None, odoo_user_id=None, telegram=None):
         """Map Bitrix employee contacts to the closest Odoo employee fields."""
