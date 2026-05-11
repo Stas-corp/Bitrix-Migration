@@ -548,6 +548,14 @@ class BitrixMySQLExtractor:
         ORDER BY u.ID
     """
 
+    # ── Fired (inactive) Bitrix users ─────────────────────────────────
+    SQL_FIRED_EMPLOYEE_IDS = """
+        SELECT u.ID AS user_id
+        FROM b_user u
+        WHERE u.ACTIVE = 'N'
+        ORDER BY u.ID
+    """
+
     # ── Employee Avatars ───────────────────────────────────────────────
     # Filtered to the same population as SQL_EMPLOYEES (active + has department).
     SQL_EMPLOYEE_AVATARS = """
@@ -1007,6 +1015,10 @@ class BitrixMySQLExtractor:
 
     def get_employees(self):
         return self._execute(self.SQL_EMPLOYEES)
+
+    def get_fired_employee_ids(self):
+        """Return Bitrix user IDs marked ACTIVE='N' (fired/blocked)."""
+        return self._execute(self.SQL_FIRED_EMPLOYEE_IDS)
 
     def get_employee_avatars(self):
         """Returns list of {user_id, photo_path, content_type}."""

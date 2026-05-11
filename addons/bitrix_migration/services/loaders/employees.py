@@ -142,6 +142,50 @@ class EmployeeLoader(BaseLoader):
 
         self.log_stats()
 
+    def archive_fired(self):
+        """Set active=False on hr.employee whose Bitrix user is ACTIVE='N'.
+
+        Only touches already-migrated employees (matched by x_bitrix_id).
+        Idempotent: skips employees that are already archived.
+        """
+        self.log('Extracting Bitrix fired user IDs (ACTIVE="N")...')
+        rows = self.extractor.get_fired_employee_ids()
+        self.log(f'Found {len(rows)} inactive Bitrix users')
+        if not rows:
+            return
+
+        fired_bitrix_ids = [int(r['user_id']) for r in rows if r.get('user_id')]
+        if not fired_bitrix_ids:
+            return
+
+        Employee = self.env['hr.employee'].sudo().with_context(active_test=False)
+        employees = Employee.search([
+            ('x_bitrix_id', 'in', fired_bitrix_ids),
+            ('active', '=', True),
+        ])
+        self.log(f'Matched {len(employees)} migrated employees to archive')
+
+        archived = 0
+        for batch in self._batched(employees, self.batch_size):
+            for emp in batch:
+                if self.dry_run:
+                    archived += 1
+                    continue
+                try:
+                    emp.write({'active': False})
+                    archived += 1
+                except Exception as e:
+                    self.error_count += 1
+                    self.errors.append((emp.x_bitrix_id, str(e)))
+                    self.log(
+                        f'ERROR archiving hr.employee bitrix_id={emp.x_bitrix_id}: {e}'
+                    )
+            self.commit_checkpoint(archived)
+
+        self.updated_count += archived
+        self.log(f'Archived employees: {archived}')
+        self.log_stats()
+
     def _build_employee_vals(self, emp, dept_id=None, odoo_user_id=None, telegram=None):
         """Map Bitrix employee contacts to the closest Odoo employee fields."""
         vals = {

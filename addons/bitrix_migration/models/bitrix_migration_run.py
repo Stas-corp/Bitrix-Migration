@@ -19,6 +19,7 @@ class BitrixMigrationRun(models.Model):
         'hr',
         'departments_only',
         'employees_only',
+        'archive_employees',
         'full',
         'meetings',
         'fix_roles',
@@ -30,6 +31,7 @@ class BitrixMigrationRun(models.Model):
         ('hr', 'HR: Departments + Employees'),
         ('departments_only', 'HR: Departments Only'),
         ('employees_only', 'HR: Employees Only'),
+        ('archive_employees', 'HR: Archive Fired Employees'),
         ('full', 'Full Migration'),
         ('meetings', 'Meetings Only'),
         ('fix_roles', 'Fix Roles (re-sync task roles)'),
@@ -231,6 +233,8 @@ class BitrixMigrationRun(models.Model):
                 self._run_departments_only(extractor)
             elif self.mode == 'employees_only':
                 self._run_employees_only(extractor)
+            elif self.mode == 'archive_employees':
+                self._run_archive_employees(extractor)
             elif self.mode == 'fix_roles':
                 self._run_fix_roles(extractor)
             elif self.mode == 'fix_attachments':
@@ -1004,6 +1008,19 @@ class BitrixMigrationRun(models.Model):
 
         if not dry_run:
             self._schedule_avatar_sync(extractor)
+
+    def _run_archive_employees(self, extractor):
+        """Archive hr.employee records whose Bitrix user is ACTIVE='N'."""
+        from ..services.loaders.employees import EmployeeLoader
+
+        dry_run = self.mode == 'dry_run'
+        self._append_log('\n--- Archive Fired Employees ---')
+        emp_loader = EmployeeLoader(
+            self.env, extractor,
+            dry_run=dry_run,
+            log_callback=self._append_log,
+        )
+        emp_loader.archive_fired()
 
     def _run_department_manager_sync(self, extractor):
         """Backfill hr.department.manager_id from Bitrix UF_HEAD."""
