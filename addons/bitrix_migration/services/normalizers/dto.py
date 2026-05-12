@@ -1,8 +1,13 @@
 import re
 from datetime import datetime
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 from pydantic import AliasChoices, BaseModel, Field, field_validator, model_validator
+
+
+BITRIX_TZ = ZoneInfo('Europe/Kyiv')
+_UTC = ZoneInfo('UTC')
 
 
 def _clean_str(v):
@@ -16,19 +21,30 @@ def _clean_str(v):
     return v
 
 
+def _normalize_to_utc_naive(dt):
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=BITRIX_TZ)
+    return dt.astimezone(_UTC).replace(tzinfo=None)
+
+
 def _to_datetime(v):
-    """Normalize MySQL datetime to Python datetime."""
+    """Normalize MySQL datetime to a UTC-naive Python datetime.
+
+    Bitrix DATETIME columns store wall-clock time in the server's local TZ
+    (Europe/Kyiv). Odoo persists Datetime fields as UTC-naive, so we reinterpret
+    the naive value as Kyiv local and convert to UTC before handing it to Odoo.
+    """
     if v is None:
         return None
     if isinstance(v, datetime):
-        return v
+        return _normalize_to_utc_naive(v)
     if isinstance(v, str):
         v = v.strip()
         if not v or v in ('NULL', 'null', '0000-00-00 00:00:00'):
             return None
         for fmt in ('%Y-%m-%d %H:%M:%S', '%Y-%m-%d'):
             try:
-                return datetime.strptime(v, fmt)
+                return _normalize_to_utc_naive(datetime.strptime(v, fmt))
             except ValueError:
                 continue
     return None

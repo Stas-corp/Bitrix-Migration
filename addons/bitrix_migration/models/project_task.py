@@ -310,12 +310,6 @@ class ProjectTask(models.Model):
             if missing_task_partner_ids:
                 task.message_subscribe(partner_ids=missing_task_partner_ids)
 
-            if task.project_id:
-                existing_project_partner_ids = set(task.project_id.message_partner_ids.ids)
-                missing_project_partner_ids = sorted(partner_ids - existing_project_partner_ids)
-                if missing_project_partner_ids:
-                    task.project_id.message_subscribe(partner_ids=missing_project_partner_ids)
-
     def _add_task_watchers_from_users(self, user_ids):
         if 'x_task_watcher_user_ids' not in self._fields or not user_ids:
             return

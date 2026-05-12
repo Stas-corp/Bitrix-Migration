@@ -42,7 +42,6 @@ class TaskLoader(BaseLoader):
         self.fallback_project_id = fallback_project_id
         self.fallback_stage_ids = fallback_stage_ids or {}
         self.fallback_count = 0
-        self._project_follower_cache = {}
 
     @classmethod
     def get_fallback_stage_name_for_status(cls, status_code):
@@ -332,7 +331,13 @@ class TaskLoader(BaseLoader):
         return merged
 
     def _subscribe_access_followers(self, task, user_ids):
-        """Subscribe task/project followers required by Odoo native rules."""
+        """Subscribe task followers required by Odoo native task rule.
+
+        Access is granted via follower-of-task only. Project followers are
+        intentionally NOT added: Odoo's standard rule treats project followers
+        as having access to ALL tasks in the project, which breaks per-task
+        isolation.
+        """
         if not task or not user_ids:
             return
 
@@ -342,7 +347,6 @@ class TaskLoader(BaseLoader):
             return
 
         self._subscribe_task_followers(task, partner_ids)
-        self._subscribe_project_followers(task.project_id, user_ids)
 
     def _subscribe_task_followers(self, task, partner_ids):
         if not task or not partner_ids:
@@ -352,25 +356,6 @@ class TaskLoader(BaseLoader):
         missing_partner_ids = sorted(set(partner_ids) - existing_partner_ids)
         if missing_partner_ids:
             task.sudo().message_subscribe(partner_ids=missing_partner_ids)
-
-    def _subscribe_project_followers(self, project, user_ids):
-        if not project or not user_ids:
-            return
-
-        users = self.env['res.users'].sudo().browse(user_ids).exists()
-        partner_ids = set(users.mapped('partner_id').ids)
-        if not partner_ids:
-            return
-
-        cached = self._project_follower_cache.get(project.id)
-        if cached is None:
-            cached = set(project.sudo().message_partner_ids.ids)
-            self._project_follower_cache[project.id] = cached
-
-        missing_partner_ids = sorted(partner_ids - cached)
-        if missing_partner_ids:
-            project.sudo().message_subscribe(partner_ids=missing_partner_ids)
-            cached.update(missing_partner_ids)
 
     def _sync_creator(self, record, task, employee_map):
         """Set x_bitrix_creator_employee_id from task.creator_bitrix_id."""

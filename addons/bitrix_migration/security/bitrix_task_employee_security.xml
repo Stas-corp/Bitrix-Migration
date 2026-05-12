@@ -2,41 +2,72 @@
 <odoo>
     <record id="group_bitrix_task_employee" model="res.groups">
         <field name="name">Bitrix Task Employee</field>
-        <field name="comment">Restricted internal access to Bitrix tasks explicitly assigned to the employee.</field>
-        <field name="implied_ids" eval="[(4, ref('base.group_user')), (4, ref('project.group_project_user'))]"/>
+        <field name="comment">Internal scope: bachit tilki zavdannya, de vin assignee/follower, i proekti z tsimi zavdannyami.</field>
+        <field name="implied_ids" eval="[(6, 0, [ref('project.group_project_user')])]"/>
     </record>
 
+    <!--
+        Make every Internal User automatically a member of our group.
+        Done via explicit write to avoid the declarative inverse interfering
+        when our group already implies base.group_user historically.
+    -->
     <function model="res.groups" name="write">
         <function model="res.groups" name="search">
-            <value eval="[('id', '=', ref('bitrix_migration.group_bitrix_task_employee'))]"/>
+            <value eval="[('id', '=', ref('base.group_user'))]"/>
         </function>
-        <value eval="{'implied_ids': [(4, ref('base.group_user')), (4, ref('project.group_project_user'))]}"/>
+        <value eval="{'implied_ids': [(4, ref('bitrix_migration.group_bitrix_task_employee'))]}"/>
     </function>
 
-    <record id="rule_project_task_bitrix_task_employee_guard" model="ir.rule">
-        <field name="name">Bitrix task employee: guard task visibility</field>
-        <field name="model_id" ref="project.model_project_task"/>
-        <field name="domain_force">[(1, '=', 1)] if (not user.has_group('bitrix_migration.group_bitrix_task_employee') or user.has_group('project.group_project_manager') or user.has_group('base.group_system')) else ['|', '|', '|', '|', '|', '|', '|', '|', ('create_uid', '=', user.id), ('message_partner_ids', 'in', user.partner_id.id), ('user_ids', 'in', user.id), ('x_task_watcher_user_ids', 'in', user.id), ('x_bitrix_auditor_employee_ids.user_id', '=', user.id), ('x_bitrix_originator_employee_id.user_id', '=', user.id), ('x_bitrix_creator_employee_id.user_id', '=', user.id), ('project_id.user_id', '=', user.id), ('project_id.create_uid', '=', user.id)]</field>
-        <field name="perm_read" eval="True"/>
-        <field name="perm_write" eval="True"/>
-        <field name="perm_create" eval="False"/>
-        <field name="perm_unlink" eval="False"/>
-    </record>
+    <!-- Backfill our group onto already-existing Internal users on upgrade -->
+    <function model="res.users" name="write">
+        <function model="res.users" name="search">
+            <value eval="[('group_ids', 'in', ref('base.group_user'))]"/>
+        </function>
+        <value eval="{'group_ids': [(4, ref('bitrix_migration.group_bitrix_task_employee'))]}"/>
+    </function>
 
+    <!--
+        Project visibility: see a project if you have a task in it, are owner,
+        or are a collaborator. Odoo standard does not cover the "task → project
+        visibility" link, so this custom rule is required.
+    -->
     <record id="rule_project_project_bitrix_task_employee_guard" model="ir.rule">
-        <field name="name">Bitrix task employee: guard project visibility</field>
+        <field name="name">Bitrix task employee: project visibility via own task</field>
         <field name="model_id" ref="project.model_project_project"/>
-        <field name="domain_force">[(1, '=', 1)] if (not user.has_group('bitrix_migration.group_bitrix_task_employee') or user.has_group('project.group_project_manager') or user.has_group('base.group_system')) else ['|', '|', '|', '|', '|', '|', '|', '|', '|', ('user_id', '=', user.id), ('create_uid', '=', user.id), ('message_partner_ids', 'in', user.partner_id.id), ('task_ids.user_ids', 'in', user.id), ('task_ids.x_task_watcher_user_ids', 'in', user.id), ('task_ids.message_partner_ids', 'in', user.partner_id.id), ('task_ids.x_bitrix_auditor_employee_ids.user_id', '=', user.id), ('task_ids.x_bitrix_originator_employee_id.user_id', '=', user.id), ('task_ids.x_bitrix_creator_employee_id.user_id', '=', user.id), ('collaborator_ids.partner_id', '=', user.partner_id.id)]</field>
+        <field name="groups" eval="[(4, ref('bitrix_migration.group_bitrix_task_employee'))]"/>
+        <field name="domain_force">[(1, '=', 1)] if (user.has_group('project.group_project_manager') or user.has_group('base.group_system')) else ['|', '|', '|', '|', '|', '|', '|', '|', '|', ('user_id', '=', user.id), ('create_uid', '=', user.id), ('message_partner_ids', 'in', user.partner_id.id), ('task_ids.user_ids', 'in', user.id), ('task_ids.x_task_watcher_user_ids', 'in', user.id), ('task_ids.message_partner_ids', 'in', user.partner_id.id), ('task_ids.x_bitrix_auditor_employee_ids.user_id', '=', user.id), ('task_ids.x_bitrix_originator_employee_id.user_id', '=', user.id), ('task_ids.x_bitrix_creator_employee_id.user_id', '=', user.id), ('collaborator_ids.partner_id', '=', user.partner_id.id)]</field>
         <field name="perm_read" eval="True"/>
         <field name="perm_write" eval="False"/>
         <field name="perm_create" eval="False"/>
         <field name="perm_unlink" eval="False"/>
     </record>
 
+    <!--
+        Create-side rule for tasks. Standard Odoo rule
+        `project.task_visibility_employees` requires the creator to already be
+        in user_ids or in followers at the moment of CREATE, otherwise it
+        denies. mail auto-subscribe runs AFTER the check, and the UI cannot
+        write mail.followers directly (ACL restricts that to admin). To allow
+        members of our group to create tasks (with someone else as
+        responsible), we add a permissive create-only rule. Read/write
+        remain governed by the standard rule.
+    -->
+    <record id="rule_project_task_bitrix_task_employee_create" model="ir.rule">
+        <field name="name">Bitrix task employee: allow task creation by self</field>
+        <field name="model_id" ref="project.model_project_task"/>
+        <field name="groups" eval="[(4, ref('bitrix_migration.group_bitrix_task_employee'))]"/>
+        <field name="domain_force">[('create_uid', '=', user.id)]</field>
+        <field name="perm_read" eval="False"/>
+        <field name="perm_write" eval="False"/>
+        <field name="perm_create" eval="True"/>
+        <field name="perm_unlink" eval="False"/>
+    </record>
+
     <record id="rule_project_collaborator_bitrix_task_employee_guard" model="ir.rule">
         <field name="name">Bitrix task employee: guard collaborator visibility</field>
         <field name="model_id" ref="project.model_project_collaborator"/>
-        <field name="domain_force">[(1, '=', 1)] if (not user.has_group('bitrix_migration.group_bitrix_task_employee') or user.has_group('project.group_project_manager') or user.has_group('base.group_system')) else ['|', '|', '|', '|', '|', '|', '|', '|', '|', '|', ('partner_id', '=', user.partner_id.id), ('project_id.user_id', '=', user.id), ('project_id.create_uid', '=', user.id), ('project_id.message_partner_ids', 'in', user.partner_id.id), ('project_id.task_ids.user_ids', 'in', user.id), ('project_id.task_ids.x_task_watcher_user_ids', 'in', user.id), ('project_id.task_ids.message_partner_ids', 'in', user.partner_id.id), ('project_id.task_ids.x_bitrix_auditor_employee_ids.user_id', '=', user.id), ('project_id.task_ids.x_bitrix_originator_employee_id.user_id', '=', user.id), ('project_id.task_ids.x_bitrix_creator_employee_id.user_id', '=', user.id), ('project_id.collaborator_ids.partner_id', '=', user.partner_id.id)]</field>
+        <field name="groups" eval="[(4, ref('bitrix_migration.group_bitrix_task_employee'))]"/>
+        <field name="domain_force">[(1, '=', 1)] if (user.has_group('project.group_project_manager') or user.has_group('base.group_system')) else ['|', '|', '|', '|', '|', '|', '|', '|', '|', '|', ('partner_id', '=', user.partner_id.id), ('project_id.user_id', '=', user.id), ('project_id.create_uid', '=', user.id), ('project_id.message_partner_ids', 'in', user.partner_id.id), ('project_id.task_ids.user_ids', 'in', user.id), ('project_id.task_ids.x_task_watcher_user_ids', 'in', user.id), ('project_id.task_ids.message_partner_ids', 'in', user.partner_id.id), ('project_id.task_ids.x_bitrix_auditor_employee_ids.user_id', '=', user.id), ('project_id.task_ids.x_bitrix_originator_employee_id.user_id', '=', user.id), ('project_id.task_ids.x_bitrix_creator_employee_id.user_id', '=', user.id), ('project_id.collaborator_ids.partner_id', '=', user.partner_id.id)]</field>
         <field name="perm_read" eval="True"/>
         <field name="perm_write" eval="False"/>
         <field name="perm_create" eval="False"/>
