@@ -61,7 +61,7 @@ docker compose logs -f odoo
 docker compose restart odoo
 
 # Применить XML/структурные изменения модуля
-docker compose exec odoo odoo -u bitrix_migration -d odoo --stop-after-init
+docker compose run --rm odoo odoo -d odoo -u bitrix_migration --stop-after-init
 
 # Odoo shell
 docker compose exec odoo odoo shell -d odoo

@@ -146,6 +146,10 @@ def normalize_bitrix_markup(text, employee_name_map=None):
         flags=re.DOTALL | re.IGNORECASE,
     )
 
+    # Drop orphan [*] markers left outside of a [LIST] block — inside [LIST]
+    # they've already been consumed by _replace_list above.
+    text = re.sub(r'\[\*\]', '', text)
+
     # Remove any remaining unknown BBCode tags
     text = re.sub(r'\[/?[A-Z_]+(?:=[^\]]+)?\]', '', text, flags=re.IGNORECASE)
 

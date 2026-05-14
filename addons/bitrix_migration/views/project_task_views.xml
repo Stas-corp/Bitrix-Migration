@@ -137,16 +137,5 @@
         <field name="context">{'create': False}</field>
     </record>
 
-    <record id="menu_my_bitrix_tasks" model="ir.ui.menu">
-        <field name="active" eval="False"/>
-    </record>
-
-    <record id="menu_my_bitrix_watched_tasks" model="ir.ui.menu">
-        <field name="active" eval="False"/>
-    </record>
-
-    <record id="menu_my_bitrix_projects" model="ir.ui.menu">
-        <field name="active" eval="False"/>
-    </record>
 
 </odoo>

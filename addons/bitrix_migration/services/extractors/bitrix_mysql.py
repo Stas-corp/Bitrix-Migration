@@ -384,6 +384,12 @@ class BitrixMySQLExtractor:
     """
 
     # ── Meetings ──────────────────────────────────────────────────────
+    # Bitrix sometimes leaves IS_MEETING=NULL for events created via the
+    # calendar even when MEETING_HOST is set. Such records are still meetings
+    # semantically (they have an organizer), so we treat
+    # MEETING_HOST IS NOT NULL as the second eligibility criterion alongside
+    # IS_MEETING='1'. The same relaxed condition applies in every meeting-
+    # related SQL (comments, attachments, counters) below to stay consistent.
     SQL_MEETINGS_TEMPLATE = """
         SELECT
             ce.ID AS external_id,
@@ -399,7 +405,7 @@ class BitrixMySQLExtractor:
             ce.DESCRIPTION AS description,
             {forum_topic_expr}
         FROM b_calendar_event ce
-        WHERE ce.IS_MEETING = '1'
+        WHERE (ce.IS_MEETING = '1' OR ce.MEETING_HOST IS NOT NULL)
           AND ce.DELETED = 'N'
           AND ce.ID = ce.PARENT_ID
           AND {meeting_where_clause}
@@ -419,7 +425,7 @@ class BitrixMySQLExtractor:
         STRAIGHT_JOIN b_calendar_event ce ON ce.FORUM_TOPIC_ID = fm.TOPIC_ID
         WHERE fm.SERVICE_TYPE IS NULL
           AND fm.NEW_TOPIC = 'N'
-          AND ce.IS_MEETING = '1'
+          AND (ce.IS_MEETING = '1' OR ce.MEETING_HOST IS NOT NULL)
           AND ce.DELETED = 'N'
           AND ce.ID = ce.PARENT_ID
           AND {meeting_where_clause}
@@ -439,7 +445,7 @@ class BitrixMySQLExtractor:
         JOIN b_sonet_log_comment slc ON slc.LOG_ID = sl.ID
         JOIN b_calendar_event ce ON ce.ID = sl.SOURCE_ID
         WHERE sl.MODULE_ID = 'calendar'
-          AND ce.IS_MEETING = '1'
+          AND (ce.IS_MEETING = '1' OR ce.MEETING_HOST IS NOT NULL)
           AND ce.DELETED = 'N'
           AND ce.ID = ce.PARENT_ID
           AND {meeting_where_clause}
@@ -458,7 +464,7 @@ class BitrixMySQLExtractor:
         JOIN b_disk_object do ON do.ID = ao.OBJECT_ID
         JOIN b_file bf ON bf.ID = do.FILE_ID
         JOIN b_calendar_event ce ON ce.ID = ao.ENTITY_ID
-                                AND ce.IS_MEETING = '1'
+                                AND (ce.IS_MEETING = '1' OR ce.MEETING_HOST IS NOT NULL)
                                 AND ce.DELETED = 'N'
                                 AND ce.ID = ce.PARENT_ID
                                 AND {meeting_where_clause}
@@ -480,7 +486,7 @@ class BitrixMySQLExtractor:
         JOIN b_file bf ON bf.ID = do.FILE_ID
         JOIN b_forum_message fm ON fm.ID = ao.ENTITY_ID
         JOIN b_calendar_event ce ON ce.FORUM_TOPIC_ID = fm.TOPIC_ID
-                                AND ce.IS_MEETING = '1'
+                                AND (ce.IS_MEETING = '1' OR ce.MEETING_HOST IS NOT NULL)
                                 AND ce.DELETED = 'N'
                                 AND ce.ID = ce.PARENT_ID
                                 AND {meeting_where_clause}
@@ -503,7 +509,7 @@ class BitrixMySQLExtractor:
         JOIN b_sonet_log_comment slc ON slc.ID = ao.ENTITY_ID
         JOIN b_sonet_log sl ON sl.ID = slc.LOG_ID
         JOIN b_calendar_event ce ON ce.ID = sl.SOURCE_ID
-                                AND ce.IS_MEETING = '1'
+                                AND (ce.IS_MEETING = '1' OR ce.MEETING_HOST IS NOT NULL)
                                 AND ce.DELETED = 'N'
                                 AND ce.ID = ce.PARENT_ID
                                 AND {meeting_where_clause}
@@ -658,7 +664,7 @@ class BitrixMySQLExtractor:
     SQL_COUNT_MEETINGS_TEMPLATE = """
         SELECT COUNT(*) AS cnt
         FROM b_calendar_event ce
-        WHERE ce.IS_MEETING = '1'
+        WHERE (ce.IS_MEETING = '1' OR ce.MEETING_HOST IS NOT NULL)
           AND ce.DELETED = 'N'
           AND ce.ID = ce.PARENT_ID
           AND {meeting_where_clause}
@@ -667,7 +673,7 @@ class BitrixMySQLExtractor:
         SELECT COUNT(*) AS cnt FROM b_forum_message fm
         STRAIGHT_JOIN b_calendar_event ce ON ce.FORUM_TOPIC_ID = fm.TOPIC_ID
         WHERE fm.SERVICE_TYPE IS NULL AND fm.NEW_TOPIC = 'N'
-          AND ce.IS_MEETING = '1' AND ce.DELETED = 'N' AND ce.ID = ce.PARENT_ID
+          AND (ce.IS_MEETING = '1' OR ce.MEETING_HOST IS NOT NULL) AND ce.DELETED = 'N' AND ce.ID = ce.PARENT_ID
           AND {meeting_where_clause}
     """
     SQL_COUNT_MEETING_SONET_COMMENTS_TEMPLATE = """
@@ -676,7 +682,7 @@ class BitrixMySQLExtractor:
         JOIN b_sonet_log_comment slc ON slc.LOG_ID = sl.ID
         JOIN b_calendar_event ce ON ce.ID = sl.SOURCE_ID
         WHERE sl.MODULE_ID = 'calendar'
-          AND ce.IS_MEETING = '1'
+          AND (ce.IS_MEETING = '1' OR ce.MEETING_HOST IS NOT NULL)
           AND ce.DELETED = 'N'
           AND ce.ID = ce.PARENT_ID
           AND {meeting_where_clause}
