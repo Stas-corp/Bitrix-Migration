@@ -20,6 +20,8 @@ class BitrixMigrationMapping(models.Model):
         ('meeting', 'Meeting'),
         ('department', 'Department'),
         ('employee', 'Employee'),
+        ('disk_folder', 'Disk Folder'),
+        ('disk_file', 'Disk File'),
     ], required=True, string='Entity Type')
     extra_data = fields.Text(string='Extra Data (JSON)')
 

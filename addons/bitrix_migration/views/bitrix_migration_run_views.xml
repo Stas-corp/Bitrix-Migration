@@ -148,6 +148,35 @@
                                 </group>
                             </group>
                         </page>
+                        <page string="Disk Import" invisible="mode != 'disk'">
+                            <div class="alert alert-info" role="alert">
+                                <strong>Bitrix Disk → Documents</strong>
+                                <p style="margin:8px 0 0 0;">
+                                    DevOps повинен заздалегідь скопіювати Bitrix
+                                    upload-кореню (наприклад, /home/bitrix/www/upload/main)
+                                    в Odoo-контейнер і змонтувати її як read-only volume
+                                    (наприклад, /mnt/bitrix-disk).
+                                </p>
+                                <p style="margin:4px 0 0 0;">
+                                    Loader сам нічого не качає по SFTP — він читає
+                                    структуру з MySQL Bitrix і бере бінарники з
+                                    локального FS за шляхом
+                                    <code>&lt;Disk Local Root&gt;/&lt;SUBDIR&gt;/&lt;FILE_NAME&gt;</code>.
+                                </p>
+                            </div>
+                            <group>
+                                <group>
+                                    <field name="disk_local_root"
+                                           placeholder="/mnt/bitrix-disk"/>
+                                    <field name="disk_skip_transfer"/>
+                                </group>
+                                <group>
+                                    <field name="disk_storage_ids_csv"
+                                           placeholder="e.g. 3,7,12"/>
+                                    <field name="disk_include_trashed"/>
+                                </group>
+                            </group>
+                        </page>
                         <page string="Log Output">
                             <field name="log_output" readonly="1"
                                    widget="text" nolabel="1"

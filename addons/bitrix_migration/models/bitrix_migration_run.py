@@ -25,6 +25,7 @@ class BitrixMigrationRun(models.Model):
         'fix_roles',
         'fix_attachments',
         'fix_descriptions',
+        'disk',
     }
 
     mode = fields.Selection([
@@ -37,6 +38,7 @@ class BitrixMigrationRun(models.Model):
         ('fix_roles', 'Fix Roles (re-sync task roles)'),
         ('fix_attachments', 'Fix Attachments (relink comment attachments)'),
         ('fix_descriptions', 'Fix Descriptions (repair empty descriptions with attachments)'),
+        ('disk', 'Bitrix Disk → Documents'),
     ], required=True, default='full', string='Mode',
         help='Режим виконання міграції.')
 
@@ -78,6 +80,31 @@ class BitrixMigrationRun(models.Model):
         string='Avatar HTTP Headers',
         help='Необовʼязково. Додаткові HTTP headers для фото у форматі JSON '
              'або Key: Value по рядках.',
+    )
+
+    # Bitrix Disk → Documents
+    disk_local_root = fields.Char(
+        string='Disk Local Root',
+        help='Шлях усередині Odoo-контейнера до перенесеного Bitrix upload-кореня '
+             '(наприклад /mnt/bitrix-disk, де далі лежить main/...).',
+    )
+    disk_skip_transfer = fields.Boolean(
+        string='Skip File Transfer (FS already prepared by DevOps)',
+        default=False,
+        help='Декларативний прапорець: підтверджує, що DevOps вже скопіював '
+             'Bitrix upload-кореню в Odoo-контейнер. Loader сам нічого не качає; '
+             'без цього прапорця action_run кине UserError, щоб уникнути запуску '
+             'на не підготовлену файлову систему.',
+    )
+    disk_storage_ids_csv = fields.Char(
+        string='Disk Storage IDs (CSV, optional)',
+        help='Якщо вказано — імпортувати лише ці b_disk_storage.ID через кому '
+             '(наприклад: 3,7,12). Порожнє = всі сховища.',
+    )
+    disk_include_trashed = fields.Boolean(
+        string='Include Trashed (DELETED_TYPE != 0)',
+        default=False,
+        help='За замовч.: пропускати корзину Bitrix.',
     )
 
     # Options
@@ -243,6 +270,8 @@ class BitrixMigrationRun(models.Model):
                 self._run_fix_descriptions(extractor)
             elif self.mode == 'meetings':
                 self._run_meetings(extractor)
+            elif self.mode == 'disk':
+                self._run_disk(extractor)
 
             self.state = 'done'
             self.progress = 100.0
@@ -1234,6 +1263,60 @@ class BitrixMigrationRun(models.Model):
                 'SFTP attachments are loaded by the background attachment queue. '
                 'Use "Start/Resume Attachments" after meeting import finishes.'
             )
+
+    def _run_disk(self, extractor):
+        """Import Bitrix Disk objects (b_disk_object + b_file) into
+        document.folder / document.file.
+
+        Reads binaries from a locally-mounted directory prepared by DevOps;
+        no SFTP transfer is performed by the loader itself.
+        """
+        from ..services.loaders.disk import DiskLoader
+
+        if not self.disk_skip_transfer:
+            raise UserError(
+                'Set "Skip File Transfer" once DevOps has copied the Bitrix '
+                'upload directory into the Odoo container. This run does not '
+                'perform SFTP transfer itself.'
+            )
+        if not self.disk_local_root:
+            raise UserError(
+                'Disk Local Root must be set before running the disk import.'
+            )
+        if not os.path.isdir(self.disk_local_root):
+            raise UserError(
+                f'Disk Local Root not found inside container: {self.disk_local_root}'
+            )
+
+        storage_filter = None
+        if self.disk_storage_ids_csv:
+            try:
+                storage_filter = [
+                    int(x.strip())
+                    for x in self.disk_storage_ids_csv.split(',')
+                    if x.strip()
+                ]
+            except ValueError as e:
+                raise UserError(
+                    f'Disk Storage IDs must be a comma-separated list of integers: {e}'
+                )
+
+        self._append_log('\n--- Bitrix Disk → Documents ---')
+        if storage_filter:
+            self._append_log(f'Storage filter: {storage_filter}')
+        if self.disk_include_trashed:
+            self._append_log('Including trashed (DELETED_TYPE != 0)')
+
+        loader = DiskLoader(
+            env=self.env,
+            extractor=extractor,
+            local_root=self.disk_local_root,
+            storage_filter=storage_filter,
+            include_trashed=self.disk_include_trashed,
+            log_callback=self._append_log,
+        )
+        loader.run()
+        loader.log_stats()
 
     def _run_fix_roles(self, extractor):
         """Re-sync roles for already imported tasks without re-creating them."""

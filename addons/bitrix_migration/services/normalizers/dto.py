@@ -1,6 +1,6 @@
 import re
 from datetime import datetime
-from typing import Optional
+from typing import Literal, Optional
 from zoneinfo import ZoneInfo
 
 from pydantic import AliasChoices, BaseModel, Field, field_validator, model_validator
@@ -344,3 +344,93 @@ class BitrixAttachment(BaseModel):
     @classmethod
     def clean_date(cls, v):
         return _to_datetime(v)
+
+
+class BitrixDiskStorage(BaseModel):
+    external_id: int
+    entity_type: Optional[str] = None  # 'group' / 'user' / 'common'
+    entity_id: Optional[int] = None
+    name: str
+    root_object_id: Optional[int] = None
+
+    @field_validator('name', mode='before')
+    @classmethod
+    def clean_name(cls, v):
+        return _clean_str(v) or 'Untitled Storage'
+
+    @field_validator('entity_type', mode='before')
+    @classmethod
+    def clean_entity_type(cls, v):
+        return _clean_str(v)
+
+    @field_validator('entity_id', 'root_object_id', mode='before')
+    @classmethod
+    def clean_int(cls, v):
+        return _to_int_or_none(v)
+
+
+class BitrixDiskObject(BaseModel):
+    external_id: int
+    parent_external_id: Optional[int] = None
+    storage_id: int
+    type: Literal['folder', 'file']
+    name: str
+    file_subdir: Optional[str] = None
+    file_diskname: Optional[str] = None
+    file_original_name: Optional[str] = None
+    file_content_type: Optional[str] = None
+    file_size: Optional[int] = None
+    creator_bitrix_id: Optional[int] = None
+    created_at: Optional[datetime] = None
+    deleted_type: int = 0
+
+    @field_validator('type', mode='before')
+    @classmethod
+    def parse_type(cls, v):
+        # Bitrix Disk encoding observed on the current installation:
+        #   TYPE=2 → folder, TYPE=3 → file.
+        if isinstance(v, str):
+            s = v.strip().lower()
+            if s in ('folder', 'file'):
+                return s
+            if s == '2':
+                return 'folder'
+            if s == '3':
+                return 'file'
+        if v == 2:
+            return 'folder'
+        if v == 3:
+            return 'file'
+        raise ValueError(f'unknown disk object TYPE: {v!r}')
+
+    @field_validator('name', mode='before')
+    @classmethod
+    def clean_name(cls, v):
+        return _clean_str(v) or 'Untitled'
+
+    @field_validator('parent_external_id', 'creator_bitrix_id', 'file_size',
+                     mode='before')
+    @classmethod
+    def clean_int(cls, v):
+        return _to_int_or_none(v)
+
+    @field_validator('file_subdir', 'file_diskname', 'file_original_name',
+                     'file_content_type', mode='before')
+    @classmethod
+    def clean_str(cls, v):
+        return _clean_str(v)
+
+    @field_validator('created_at', mode='before')
+    @classmethod
+    def clean_date(cls, v):
+        return _to_datetime(v)
+
+    @field_validator('deleted_type', mode='before')
+    @classmethod
+    def clean_deleted(cls, v):
+        if v is None or v == '':
+            return 0
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return 0

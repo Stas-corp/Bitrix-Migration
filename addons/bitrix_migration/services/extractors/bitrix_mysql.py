@@ -688,6 +688,75 @@ class BitrixMySQLExtractor:
           AND {meeting_where_clause}
     """
 
+    # ── Bitrix Disk ────────────────────────────────────────────────────
+    SQL_DISK_STORAGES_TEMPLATE = """
+        SELECT s.ID AS external_id,
+               s.ENTITY_TYPE AS entity_type,
+               s.ENTITY_ID AS entity_id,
+               s.NAME AS name,
+               s.ROOT_OBJECT_ID AS root_object_id
+        FROM b_disk_storage s
+        WHERE 1 = 1 {storage_clause}
+        ORDER BY s.ID
+    """
+    SQL_DISK_OBJECTS_TEMPLATE = """
+        SELECT o.ID AS external_id,
+               o.PARENT_ID AS parent_external_id,
+               o.STORAGE_ID AS storage_id,
+               o.TYPE AS type,
+               o.NAME AS name,
+               o.CREATED_BY AS creator_bitrix_id,
+               o.CREATE_TIME AS created_at,
+               o.DELETED_TYPE AS deleted_type,
+               f.SUBDIR AS file_subdir,
+               f.FILE_NAME AS file_diskname,
+               f.ORIGINAL_NAME AS file_original_name,
+               f.CONTENT_TYPE AS file_content_type,
+               f.FILE_SIZE AS file_size
+        FROM b_disk_object o
+        LEFT JOIN b_disk_version v ON v.OBJECT_ID = o.ID
+            AND v.GLOBAL_CONTENT_VERSION = (
+                SELECT MAX(v2.GLOBAL_CONTENT_VERSION)
+                FROM b_disk_version v2
+                WHERE v2.OBJECT_ID = o.ID
+            )
+        LEFT JOIN b_file f ON f.ID = v.FILE_ID
+        WHERE o.STORAGE_ID = %s {trash_clause}
+        ORDER BY o.ID
+    """
+    SQL_COUNT_DISK_OBJECTS_TEMPLATE = """
+        SELECT COUNT(*) AS cnt FROM b_disk_object
+        WHERE STORAGE_ID = %s {trash_clause}
+    """
+    SQL_DISK_STORAGE_OVERVIEW = """
+        SELECT s.ID AS storage_id,
+               s.ENTITY_TYPE AS entity_type,
+               s.ENTITY_ID AS entity_id,
+               s.NAME AS name,
+               SUM(CASE WHEN o.DELETED_TYPE = 0 THEN 1 ELSE 0 END) AS objects_alive,
+               SUM(CASE WHEN o.DELETED_TYPE = 0 AND o.TYPE = 2 THEN 1 ELSE 0 END) AS folders_alive,
+               SUM(CASE WHEN o.DELETED_TYPE = 0 AND o.TYPE = 3 THEN 1 ELSE 0 END) AS files_alive
+        FROM b_disk_storage s
+        LEFT JOIN b_disk_object o ON o.STORAGE_ID = s.ID
+        GROUP BY s.ID, s.ENTITY_TYPE, s.ENTITY_ID, s.NAME
+        ORDER BY objects_alive DESC, s.ID
+    """
+    # Bitrix Disk b_disk_object.TYPE encoding (observed on this installation):
+    # TYPE=2 → folder, TYPE=3 → file. FILE_ID on b_disk_object is NULL;
+    # the actual b_file reference lives in b_disk_version (latest version).
+    SQL_DISK_TOTAL_BYTES = """
+        SELECT COUNT(DISTINCT o.ID) AS files,
+               COALESCE(SUM(f.FILE_SIZE), 0) AS total_bytes
+        FROM b_disk_object o
+        JOIN b_disk_version v ON v.OBJECT_ID = o.ID
+        INNER JOIN (
+            SELECT OBJECT_ID, MAX(GLOBAL_CONTENT_VERSION) AS maxv
+            FROM b_disk_version GROUP BY OBJECT_ID
+        ) mv ON mv.OBJECT_ID = v.OBJECT_ID AND v.GLOBAL_CONTENT_VERSION = mv.maxv
+        JOIN b_file f ON f.ID = v.FILE_ID
+        WHERE o.TYPE = 3 AND o.DELETED_TYPE = 0
+    """
+
     def __init__(self, host, port, user, password, database, date_from=None):
         self.host = host
         self.port = port
@@ -1203,3 +1272,34 @@ class BitrixMySQLExtractor:
 
     def count_employees(self):
         return self._count(self.SQL_COUNT_EMPLOYEES)
+
+    # ── Bitrix Disk ────────────────────────────────────────────────────
+
+    def get_disk_storages(self, storage_filter=None):
+        storage_clause = ''
+        params = ()
+        if storage_filter:
+            storage_clause = ' AND s.ID IN ({})'.format(
+                ', '.join(['%s'] * len(storage_filter))
+            )
+            params = tuple(int(x) for x in storage_filter)
+        sql = self.SQL_DISK_STORAGES_TEMPLATE.format(storage_clause=storage_clause)
+        return self._execute(sql, params if params else None)
+
+    def get_disk_objects(self, storage_id, include_trashed=False):
+        trash_clause = '' if include_trashed else ' AND o.DELETED_TYPE = 0'
+        sql = self.SQL_DISK_OBJECTS_TEMPLATE.format(trash_clause=trash_clause)
+        return self._execute(sql, (int(storage_id),))
+
+    def count_disk_objects(self, storage_id, include_trashed=False):
+        trash_clause = '' if include_trashed else ' AND DELETED_TYPE = 0'
+        sql = self.SQL_COUNT_DISK_OBJECTS_TEMPLATE.format(trash_clause=trash_clause)
+        result = self._execute(sql, (int(storage_id),))
+        return result[0]['cnt'] if result else 0
+
+    def get_disk_storage_overview(self):
+        return self._execute(self.SQL_DISK_STORAGE_OVERVIEW)
+
+    def get_disk_total_bytes(self):
+        result = self._execute(self.SQL_DISK_TOTAL_BYTES)
+        return result[0] if result else {'files': 0, 'total_bytes': 0}
