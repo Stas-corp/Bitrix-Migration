@@ -11,6 +11,14 @@ _logger = logging.getLogger(__name__)
 
 ROOT_FOLDER_NAME = 'Bitrix Import'
 
+# Human-readable labels for b_disk_storage.ENTITY_TYPE (raw values are PHP class names).
+ENTITY_TYPE_LABEL = {
+    'Bitrix\\Disk\\ProxyType\\User': 'User',
+    'Bitrix\\Disk\\ProxyType\\Common': 'Common',
+    'Bitrix\\Disk\\ProxyType\\Group': 'Group',
+    'Bitrix\\Im\\Disk\\ProxyType\\Im': 'IM',
+}
+
 
 class DiskLoader(BaseLoader):
     """Imports Bitrix Disk objects (b_disk_object + b_file) into
@@ -79,7 +87,8 @@ class DiskLoader(BaseLoader):
 
     def _ensure_storage_folder(self, root, storage):
         suffix = storage.name or f'storage-{storage.external_id}'
-        name = f'Bitrix: {storage.entity_type or "storage"} #{storage.external_id} — {suffix}'
+        label = ENTITY_TYPE_LABEL.get(storage.entity_type, storage.entity_type or 'storage')
+        name = f'Bitrix: {label} #{storage.external_id} — {suffix}'
         folder, _ = self.get_or_create(
             'document.folder',
             domain=[('parent_id', '=', root.id), ('name', '=', name)],
