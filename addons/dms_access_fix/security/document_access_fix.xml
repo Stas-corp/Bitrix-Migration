@@ -1,0 +1,490 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+
+    <!--
+        Все записи здесь используют XML IDs модуля
+        `odoo_document_management_cloud_sync` (платный, в .gitignore проекта).
+        Это override-pattern: наш модуль является bridge'ом, который через
+        depends гарантированно загружается ПОСЛЕ оригинала, и через `<record>`
+        с XML IDs оригинала перезаписывает его записи правильными значениями.
+
+        Группа Document User по умолчанию имеет implied_ids → base.group_user.
+        Поэтому НЕЛЬЗЯ оставлять любые ACL `Role / User` на document.* —
+        Document User получит их через цепочку implied. Старые
+        `Role / User` ACL чистятся в hooks/post_init.py.
+    -->
+
+    <data noupdate="1">
+
+        <!-- ===================================================== -->
+        <!-- Group fix: Document Manager должен implies Document User -->
+        <!-- ===================================================== -->
+
+        <record id="odoo_document_management_cloud_sync.group_document_manager" model="res.groups">
+            <field name="implied_ids" eval="[(4, ref('odoo_document_management_cloud_sync.group_document_user'))]"/>
+        </record>
+
+        <!-- ===================================================== -->
+        <!-- Override 12 ACL для group_document_user                -->
+        <!-- ===================================================== -->
+
+        <record id="odoo_document_management_cloud_sync.access_document_folder_user" model="ir.model.access">
+            <field name="name">document.folder.user</field>
+            <field name="model_id" search="[('model', '=', 'document.folder')]" model="ir.model"/>
+            <field name="group_id" ref="odoo_document_management_cloud_sync.group_document_user"/>
+            <field name="perm_read" eval="True"/>
+            <field name="perm_write" eval="True"/>
+            <field name="perm_create" eval="True"/>
+            <field name="perm_unlink" eval="True"/>
+        </record>
+
+        <record id="odoo_document_management_cloud_sync.access_document_file_user" model="ir.model.access">
+            <field name="name">document.file.user</field>
+            <field name="model_id" search="[('model', '=', 'document.file')]" model="ir.model"/>
+            <field name="group_id" ref="odoo_document_management_cloud_sync.group_document_user"/>
+            <field name="perm_read" eval="True"/>
+            <field name="perm_write" eval="True"/>
+            <field name="perm_create" eval="True"/>
+            <field name="perm_unlink" eval="True"/>
+        </record>
+
+        <record id="odoo_document_management_cloud_sync.access_document_share_user" model="ir.model.access">
+            <field name="name">document.share.user</field>
+            <field name="model_id" search="[('model', '=', 'document.share')]" model="ir.model"/>
+            <field name="group_id" ref="odoo_document_management_cloud_sync.group_document_user"/>
+            <field name="perm_read" eval="True"/>
+            <field name="perm_write" eval="True"/>
+            <field name="perm_create" eval="True"/>
+            <field name="perm_unlink" eval="True"/>
+        </record>
+
+        <record id="odoo_document_management_cloud_sync.access_document_tag_user" model="ir.model.access">
+            <field name="name">document.tag.user</field>
+            <field name="model_id" search="[('model', '=', 'document.tag')]" model="ir.model"/>
+            <field name="group_id" ref="odoo_document_management_cloud_sync.group_document_user"/>
+            <field name="perm_read" eval="True"/>
+            <field name="perm_write" eval="True"/>
+            <field name="perm_create" eval="True"/>
+            <field name="perm_unlink" eval="False"/>
+        </record>
+
+        <record id="odoo_document_management_cloud_sync.access_document_cloud_sync_user" model="ir.model.access">
+            <field name="name">document.cloud.sync.user</field>
+            <field name="model_id" search="[('model', '=', 'document.cloud.sync')]" model="ir.model"/>
+            <field name="group_id" ref="odoo_document_management_cloud_sync.group_document_user"/>
+            <field name="perm_read" eval="True"/>
+            <field name="perm_write" eval="False"/>
+            <field name="perm_create" eval="False"/>
+            <field name="perm_unlink" eval="False"/>
+        </record>
+
+        <record id="odoo_document_management_cloud_sync.access_document_folder_favorite_user" model="ir.model.access">
+            <field name="name">document.folder.favorite.user</field>
+            <field name="model_id" search="[('model', '=', 'document.folder.favorite')]" model="ir.model"/>
+            <field name="group_id" ref="odoo_document_management_cloud_sync.group_document_user"/>
+            <field name="perm_read" eval="True"/>
+            <field name="perm_write" eval="True"/>
+            <field name="perm_create" eval="True"/>
+            <field name="perm_unlink" eval="True"/>
+        </record>
+
+        <record id="odoo_document_management_cloud_sync.access_document_file_favorite_user" model="ir.model.access">
+            <field name="name">document.file.favorite.user</field>
+            <field name="model_id" search="[('model', '=', 'document.file.favorite')]" model="ir.model"/>
+            <field name="group_id" ref="odoo_document_management_cloud_sync.group_document_user"/>
+            <field name="perm_read" eval="True"/>
+            <field name="perm_write" eval="True"/>
+            <field name="perm_create" eval="True"/>
+            <field name="perm_unlink" eval="True"/>
+        </record>
+
+        <record id="odoo_document_management_cloud_sync.access_document_activity_user" model="ir.model.access">
+            <field name="name">document.activity.user</field>
+            <field name="model_id" search="[('model', '=', 'document.activity')]" model="ir.model"/>
+            <field name="group_id" ref="odoo_document_management_cloud_sync.group_document_user"/>
+            <field name="perm_read" eval="True"/>
+            <field name="perm_write" eval="False"/>
+            <field name="perm_create" eval="True"/>
+            <field name="perm_unlink" eval="False"/>
+        </record>
+
+        <record id="odoo_document_management_cloud_sync.access_document_comment_user" model="ir.model.access">
+            <field name="name">document.comment.user</field>
+            <field name="model_id" search="[('model', '=', 'document.comment')]" model="ir.model"/>
+            <field name="group_id" ref="odoo_document_management_cloud_sync.group_document_user"/>
+            <field name="perm_read" eval="True"/>
+            <field name="perm_write" eval="True"/>
+            <field name="perm_create" eval="True"/>
+            <field name="perm_unlink" eval="True"/>
+        </record>
+
+        <record id="odoo_document_management_cloud_sync.access_document_file_lock_user" model="ir.model.access">
+            <field name="name">document.file.lock.user</field>
+            <field name="model_id" search="[('model', '=', 'document.file.lock')]" model="ir.model"/>
+            <field name="group_id" ref="odoo_document_management_cloud_sync.group_document_user"/>
+            <field name="perm_read" eval="True"/>
+            <field name="perm_write" eval="True"/>
+            <field name="perm_create" eval="True"/>
+            <field name="perm_unlink" eval="False"/>
+        </record>
+
+        <record id="odoo_document_management_cloud_sync.access_document_file_filter_user" model="ir.model.access">
+            <field name="name">document.file.filter.user</field>
+            <field name="model_id" search="[('model', '=', 'document.file.filter')]" model="ir.model"/>
+            <field name="group_id" ref="odoo_document_management_cloud_sync.group_document_user"/>
+            <field name="perm_read" eval="True"/>
+            <field name="perm_write" eval="True"/>
+            <field name="perm_create" eval="True"/>
+            <field name="perm_unlink" eval="True"/>
+        </record>
+
+        <record id="odoo_document_management_cloud_sync.access_document_model_config_user" model="ir.model.access">
+            <field name="name">document.model.config.user</field>
+            <field name="model_id" search="[('model', '=', 'document.model.config')]" model="ir.model"/>
+            <field name="group_id" ref="odoo_document_management_cloud_sync.group_document_user"/>
+            <field name="perm_read" eval="True"/>
+            <field name="perm_write" eval="False"/>
+            <field name="perm_create" eval="False"/>
+            <field name="perm_unlink" eval="False"/>
+        </record>
+
+        <!-- ===================================================== -->
+        <!-- Override 2 ACL для group_document_model_user           -->
+        <!-- ===================================================== -->
+
+        <record id="odoo_document_management_cloud_sync.access_document_folder_model_user" model="ir.model.access">
+            <field name="name">document.folder.model.user</field>
+            <field name="model_id" search="[('model', '=', 'document.folder')]" model="ir.model"/>
+            <field name="group_id" ref="odoo_document_management_cloud_sync.group_document_model_user"/>
+            <field name="perm_read" eval="True"/>
+            <field name="perm_write" eval="True"/>
+            <field name="perm_create" eval="True"/>
+            <field name="perm_unlink" eval="True"/>
+        </record>
+
+        <record id="odoo_document_management_cloud_sync.access_document_file_model_user" model="ir.model.access">
+            <field name="name">document.file.model.user</field>
+            <field name="model_id" search="[('model', '=', 'document.file')]" model="ir.model"/>
+            <field name="group_id" ref="odoo_document_management_cloud_sync.group_document_model_user"/>
+            <field name="perm_read" eval="True"/>
+            <field name="perm_write" eval="True"/>
+            <field name="perm_create" eval="True"/>
+            <field name="perm_unlink" eval="True"/>
+        </record>
+
+        <!-- ===================================================== -->
+        <!-- Manager ACL для моделей, где их не было в оригинале    -->
+        <!-- (используем namespace оригинала, чтобы при наличии XID -->
+        <!-- в БД от dev-форка fix-модуль перезаписал их же запись) -->
+        <!-- ===================================================== -->
+
+        <record id="access_document_activity_manager" model="ir.model.access">
+            <field name="name">document.activity.manager</field>
+            <field name="model_id" search="[('model', '=', 'document.activity')]" model="ir.model"/>
+            <field name="group_id" ref="odoo_document_management_cloud_sync.group_document_manager"/>
+            <field name="perm_read" eval="True"/>
+            <field name="perm_write" eval="True"/>
+            <field name="perm_create" eval="True"/>
+            <field name="perm_unlink" eval="True"/>
+        </record>
+
+        <record id="access_document_comment_manager" model="ir.model.access">
+            <field name="name">document.comment.manager</field>
+            <field name="model_id" search="[('model', '=', 'document.comment')]" model="ir.model"/>
+            <field name="group_id" ref="odoo_document_management_cloud_sync.group_document_manager"/>
+            <field name="perm_read" eval="True"/>
+            <field name="perm_write" eval="True"/>
+            <field name="perm_create" eval="True"/>
+            <field name="perm_unlink" eval="True"/>
+        </record>
+
+        <record id="access_document_file_lock_manager" model="ir.model.access">
+            <field name="name">document.file.lock.manager</field>
+            <field name="model_id" search="[('model', '=', 'document.file.lock')]" model="ir.model"/>
+            <field name="group_id" ref="odoo_document_management_cloud_sync.group_document_manager"/>
+            <field name="perm_read" eval="True"/>
+            <field name="perm_write" eval="True"/>
+            <field name="perm_create" eval="True"/>
+            <field name="perm_unlink" eval="True"/>
+        </record>
+
+        <record id="access_document_file_filter_manager" model="ir.model.access">
+            <field name="name">document.file.filter.manager</field>
+            <field name="model_id" search="[('model', '=', 'document.file.filter')]" model="ir.model"/>
+            <field name="group_id" ref="odoo_document_management_cloud_sync.group_document_manager"/>
+            <field name="perm_read" eval="True"/>
+            <field name="perm_write" eval="True"/>
+            <field name="perm_create" eval="True"/>
+            <field name="perm_unlink" eval="True"/>
+        </record>
+
+        <!-- ===================================================== -->
+        <!-- Record rules — Manager                                 -->
+        <!-- ===================================================== -->
+
+        <record id="odoo_document_management_cloud_sync.document_folder_manager_rule" model="ir.rule">
+            <field name="name">Document Folder: Manager Access</field>
+            <field name="model_id" search="[('model', '=', 'document.folder')]" model="ir.model"/>
+            <field name="domain_force">[(1, '=', 1)]</field>
+            <field name="groups" eval="[(4, ref('odoo_document_management_cloud_sync.group_document_manager'))]"/>
+        </record>
+
+        <record id="odoo_document_management_cloud_sync.document_file_manager_rule" model="ir.rule">
+            <field name="name">Document File: Manager Access</field>
+            <field name="model_id" search="[('model', '=', 'document.file')]" model="ir.model"/>
+            <field name="domain_force">[(1, '=', 1)]</field>
+            <field name="groups" eval="[(4, ref('odoo_document_management_cloud_sync.group_document_manager'))]"/>
+        </record>
+
+        <record id="document_share_manager_rule" model="ir.rule">
+            <field name="name">Document Share: Manager Access</field>
+            <field name="model_id" search="[('model', '=', 'document.share')]" model="ir.model"/>
+            <field name="domain_force">[(1, '=', 1)]</field>
+            <field name="groups" eval="[(4, ref('odoo_document_management_cloud_sync.group_document_manager'))]"/>
+        </record>
+
+        <record id="odoo_document_management_cloud_sync.document_model_config_manager_rule" model="ir.rule">
+            <field name="name">Document Model Config: Manager Access</field>
+            <field name="model_id" search="[('model', '=', 'document.model.config')]" model="ir.model"/>
+            <field name="domain_force">[(1, '=', 1)]</field>
+            <field name="groups" eval="[(4, ref('odoo_document_management_cloud_sync.group_document_manager'))]"/>
+        </record>
+
+        <!-- ===================================================== -->
+        <!-- Two-tier ir.rule — Document User                       -->
+        <!-- ===================================================== -->
+
+        <record id="document_folder_user_read_rule" model="ir.rule">
+            <field name="name">Document Folder: User Read/Create</field>
+            <field name="model_id" search="[('model', '=', 'document.folder')]" model="ir.model"/>
+            <field name="domain_force">['|', '|',
+                ('user_id', '=', user.id),
+                ('user_ids', 'in', [user.id]),
+                ('group_ids', 'in', user.group_ids.ids)]</field>
+            <field name="groups" eval="[(4, ref('odoo_document_management_cloud_sync.group_document_user'))]"/>
+            <field name="perm_read" eval="True"/>
+            <field name="perm_write" eval="False"/>
+            <field name="perm_create" eval="True"/>
+            <field name="perm_unlink" eval="False"/>
+        </record>
+
+        <record id="document_folder_user_write_rule" model="ir.rule">
+            <field name="name">Document Folder: User Write/Unlink (owner)</field>
+            <field name="model_id" search="[('model', '=', 'document.folder')]" model="ir.model"/>
+            <field name="domain_force">[('user_id', '=', user.id)]</field>
+            <field name="groups" eval="[(4, ref('odoo_document_management_cloud_sync.group_document_user'))]"/>
+            <field name="perm_read" eval="False"/>
+            <field name="perm_write" eval="True"/>
+            <field name="perm_create" eval="False"/>
+            <field name="perm_unlink" eval="True"/>
+        </record>
+
+        <record id="document_file_user_read_rule" model="ir.rule">
+            <field name="name">Document File: User Read/Create</field>
+            <field name="model_id" search="[('model', '=', 'document.file')]" model="ir.model"/>
+            <field name="domain_force">['|',
+                ('user_id', '=', user.id),
+                ('folder_id', 'in', user.env['document.folder'].search([
+                    '|', '|',
+                    ('user_id', '=', user.id),
+                    ('user_ids', 'in', [user.id]),
+                    ('group_ids', 'in', user.group_ids.ids)
+                ]).ids)]</field>
+            <field name="groups" eval="[(4, ref('odoo_document_management_cloud_sync.group_document_user'))]"/>
+            <field name="perm_read" eval="True"/>
+            <field name="perm_write" eval="False"/>
+            <field name="perm_create" eval="True"/>
+            <field name="perm_unlink" eval="False"/>
+        </record>
+
+        <record id="document_file_user_write_rule" model="ir.rule">
+            <field name="name">Document File: User Write/Unlink</field>
+            <field name="model_id" search="[('model', '=', 'document.file')]" model="ir.model"/>
+            <field name="domain_force">['|',
+                ('user_id', '=', user.id),
+                ('folder_id.user_id', '=', user.id)]</field>
+            <field name="groups" eval="[(4, ref('odoo_document_management_cloud_sync.group_document_user'))]"/>
+            <field name="perm_read" eval="False"/>
+            <field name="perm_write" eval="True"/>
+            <field name="perm_create" eval="False"/>
+            <field name="perm_unlink" eval="True"/>
+        </record>
+
+        <record id="document_share_user_read_rule" model="ir.rule">
+            <field name="name">Document Share: User Read</field>
+            <field name="model_id" search="[('model', '=', 'document.share')]" model="ir.model"/>
+            <field name="domain_force">['|', '|',
+                ('user_id', '=', user.id),
+                ('folder_id', 'in', user.env['document.folder'].search([
+                    '|', '|',
+                    ('user_id', '=', user.id),
+                    ('user_ids', 'in', [user.id]),
+                    ('group_ids', 'in', user.group_ids.ids)
+                ]).ids),
+                ('file_id.user_id', '=', user.id)]</field>
+            <field name="groups" eval="[(4, ref('odoo_document_management_cloud_sync.group_document_user'))]"/>
+            <field name="perm_read" eval="True"/>
+            <field name="perm_write" eval="False"/>
+            <field name="perm_create" eval="False"/>
+            <field name="perm_unlink" eval="False"/>
+        </record>
+
+        <record id="document_share_user_create_rule" model="ir.rule">
+            <field name="name">Document Share: User Create</field>
+            <field name="model_id" search="[('model', '=', 'document.share')]" model="ir.model"/>
+            <field name="domain_force">['|',
+                ('folder_id.user_id', '=', user.id),
+                ('file_id.user_id', '=', user.id)]</field>
+            <field name="groups" eval="[(4, ref('odoo_document_management_cloud_sync.group_document_user'))]"/>
+            <field name="perm_read" eval="False"/>
+            <field name="perm_write" eval="False"/>
+            <field name="perm_create" eval="True"/>
+            <field name="perm_unlink" eval="False"/>
+        </record>
+
+        <record id="document_share_user_write_rule" model="ir.rule">
+            <field name="name">Document Share: User Write/Unlink (creator)</field>
+            <field name="model_id" search="[('model', '=', 'document.share')]" model="ir.model"/>
+            <field name="domain_force">[('user_id', '=', user.id)]</field>
+            <field name="groups" eval="[(4, ref('odoo_document_management_cloud_sync.group_document_user'))]"/>
+            <field name="perm_read" eval="False"/>
+            <field name="perm_write" eval="True"/>
+            <field name="perm_create" eval="False"/>
+            <field name="perm_unlink" eval="True"/>
+        </record>
+
+        <record id="document_folder_favorite_user_rule" model="ir.rule">
+            <field name="name">Document Folder Favorite: Own only</field>
+            <field name="model_id" search="[('model', '=', 'document.folder.favorite')]" model="ir.model"/>
+            <field name="domain_force">[('user_id', '=', user.id)]</field>
+            <field name="groups" eval="[(4, ref('odoo_document_management_cloud_sync.group_document_user'))]"/>
+        </record>
+
+        <record id="document_file_favorite_user_rule" model="ir.rule">
+            <field name="name">Document File Favorite: Own only</field>
+            <field name="model_id" search="[('model', '=', 'document.file.favorite')]" model="ir.model"/>
+            <field name="domain_force">[('user_id', '=', user.id)]</field>
+            <field name="groups" eval="[(4, ref('odoo_document_management_cloud_sync.group_document_user'))]"/>
+        </record>
+
+        <record id="document_comment_user_read_rule" model="ir.rule">
+            <field name="name">Document Comment: User Read/Create</field>
+            <field name="model_id" search="[('model', '=', 'document.comment')]" model="ir.model"/>
+            <field name="domain_force">[('file_id', 'in', user.env['document.file'].search([
+                '|',
+                ('user_id', '=', user.id),
+                ('folder_id', 'in', user.env['document.folder'].search([
+                    '|', '|',
+                    ('user_id', '=', user.id),
+                    ('user_ids', 'in', [user.id]),
+                    ('group_ids', 'in', user.group_ids.ids)
+                ]).ids)
+            ]).ids)]</field>
+            <field name="groups" eval="[(4, ref('odoo_document_management_cloud_sync.group_document_user'))]"/>
+            <field name="perm_read" eval="True"/>
+            <field name="perm_write" eval="False"/>
+            <field name="perm_create" eval="True"/>
+            <field name="perm_unlink" eval="False"/>
+        </record>
+
+        <record id="document_comment_user_write_rule" model="ir.rule">
+            <field name="name">Document Comment: User Write/Unlink (own)</field>
+            <field name="model_id" search="[('model', '=', 'document.comment')]" model="ir.model"/>
+            <field name="domain_force">[('user_id', '=', user.id)]</field>
+            <field name="groups" eval="[(4, ref('odoo_document_management_cloud_sync.group_document_user'))]"/>
+            <field name="perm_read" eval="False"/>
+            <field name="perm_write" eval="True"/>
+            <field name="perm_create" eval="False"/>
+            <field name="perm_unlink" eval="True"/>
+        </record>
+
+        <record id="document_file_lock_user_rule" model="ir.rule">
+            <field name="name">Document File Lock: User Own</field>
+            <field name="model_id" search="[('model', '=', 'document.file.lock')]" model="ir.model"/>
+            <field name="domain_force">[('locked_by', '=', user.id)]</field>
+            <field name="groups" eval="[(4, ref('odoo_document_management_cloud_sync.group_document_user'))]"/>
+        </record>
+
+        <record id="document_file_filter_user_rule" model="ir.rule">
+            <field name="name">Document File Filter: Own only</field>
+            <field name="model_id" search="[('model', '=', 'document.file.filter')]" model="ir.model"/>
+            <field name="domain_force">[('user_id', '=', user.id)]</field>
+            <field name="groups" eval="[(4, ref('odoo_document_management_cloud_sync.group_document_user'))]"/>
+        </record>
+
+        <record id="odoo_document_management_cloud_sync.document_model_config_user_rule" model="ir.rule">
+            <field name="name">Document Model Config: User Read</field>
+            <field name="model_id" search="[('model', '=', 'document.model.config')]" model="ir.model"/>
+            <field name="domain_force">[('active', '=', True)]</field>
+            <field name="groups" eval="[(4, ref('odoo_document_management_cloud_sync.group_document_user'))]"/>
+        </record>
+
+        <record id="odoo_document_management_cloud_sync.document_model_config_model_user_rule" model="ir.rule">
+            <field name="name">Document Model Config: Model User Read</field>
+            <field name="model_id" search="[('model', '=', 'document.model.config')]" model="ir.model"/>
+            <field name="domain_force">[('active', '=', True)]</field>
+            <field name="groups" eval="[(4, ref('odoo_document_management_cloud_sync.group_document_model_user'))]"/>
+        </record>
+
+        <!-- ===================================================== -->
+        <!-- Two-tier ir.rule — Document Model User                 -->
+        <!-- ===================================================== -->
+
+        <record id="document_folder_model_user_read_rule" model="ir.rule">
+            <field name="name">Document Folder: Model User Read/Create</field>
+            <field name="model_id" search="[('model', '=', 'document.folder')]" model="ir.model"/>
+            <field name="domain_force">['|', '|',
+                ('user_id', '=', user.id),
+                ('user_ids', 'in', [user.id]),
+                ('group_ids', 'in', user.group_ids.ids)]</field>
+            <field name="groups" eval="[(4, ref('odoo_document_management_cloud_sync.group_document_model_user'))]"/>
+            <field name="perm_read" eval="True"/>
+            <field name="perm_write" eval="False"/>
+            <field name="perm_create" eval="True"/>
+            <field name="perm_unlink" eval="False"/>
+        </record>
+
+        <record id="document_folder_model_user_write_rule" model="ir.rule">
+            <field name="name">Document Folder: Model User Write/Unlink (owner)</field>
+            <field name="model_id" search="[('model', '=', 'document.folder')]" model="ir.model"/>
+            <field name="domain_force">[('user_id', '=', user.id)]</field>
+            <field name="groups" eval="[(4, ref('odoo_document_management_cloud_sync.group_document_model_user'))]"/>
+            <field name="perm_read" eval="False"/>
+            <field name="perm_write" eval="True"/>
+            <field name="perm_create" eval="False"/>
+            <field name="perm_unlink" eval="True"/>
+        </record>
+
+        <record id="document_file_model_user_read_rule" model="ir.rule">
+            <field name="name">Document File: Model User Read/Create</field>
+            <field name="model_id" search="[('model', '=', 'document.file')]" model="ir.model"/>
+            <field name="domain_force">['|',
+                ('user_id', '=', user.id),
+                ('folder_id', 'in', user.env['document.folder'].search([
+                    '|', '|',
+                    ('user_id', '=', user.id),
+                    ('user_ids', 'in', [user.id]),
+                    ('group_ids', 'in', user.group_ids.ids)
+                ]).ids)]</field>
+            <field name="groups" eval="[(4, ref('odoo_document_management_cloud_sync.group_document_model_user'))]"/>
+            <field name="perm_read" eval="True"/>
+            <field name="perm_write" eval="False"/>
+            <field name="perm_create" eval="True"/>
+            <field name="perm_unlink" eval="False"/>
+        </record>
+
+        <record id="document_file_model_user_write_rule" model="ir.rule">
+            <field name="name">Document File: Model User Write/Unlink</field>
+            <field name="model_id" search="[('model', '=', 'document.file')]" model="ir.model"/>
+            <field name="domain_force">['|',
+                ('user_id', '=', user.id),
+                ('folder_id.user_id', '=', user.id)]</field>
+            <field name="groups" eval="[(4, ref('odoo_document_management_cloud_sync.group_document_model_user'))]"/>
+            <field name="perm_read" eval="False"/>
+            <field name="perm_write" eval="True"/>
+            <field name="perm_create" eval="False"/>
+            <field name="perm_unlink" eval="True"/>
+        </record>
+
+    </data>
+</odoo>

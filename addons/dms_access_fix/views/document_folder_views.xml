@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <record id="view_document_folder_form_access_fix" model="ir.ui.view">
+        <field name="name">document.folder.form.access.fix</field>
+        <field name="model">document.folder</field>
+        <field name="inherit_id" ref="odoo_document_management_cloud_sync.view_document_folder_form"/>
+        <field name="arch" type="xml">
+            <field name="group_ids" position="before">
+                <field name="can_manage_access" invisible="1"/>
+            </field>
+            <field name="user_ids" position="attributes">
+                <attribute name="readonly">not can_manage_access</attribute>
+            </field>
+            <field name="group_ids" position="attributes">
+                <attribute name="readonly">not can_manage_access</attribute>
+            </field>
+        </field>
+    </record>
+</odoo>
