@@ -292,18 +292,21 @@ class BitrixMeeting(BaseModel):
     organizer_bitrix_id: Optional[int] = None
     description: Optional[str] = None
     forum_topic_id: Optional[int] = None
+    rrule: Optional[str] = None
+    exdate: Optional[str] = None
+    section_id: Optional[int] = None
 
     @field_validator('name', mode='before')
     @classmethod
     def clean_name(cls, v):
         return _clean_str(v) or 'Untitled Meeting'
 
-    @field_validator('organizer_bitrix_id', 'forum_topic_id', mode='before')
+    @field_validator('organizer_bitrix_id', 'forum_topic_id', 'section_id', mode='before')
     @classmethod
     def clean_int(cls, v):
         return _to_int_or_none(v)
 
-    @field_validator('participant_bitrix_ids', 'description', mode='before')
+    @field_validator('participant_bitrix_ids', 'description', 'rrule', 'exdate', mode='before')
     @classmethod
     def clean_str(cls, v):
         return _clean_str(v)

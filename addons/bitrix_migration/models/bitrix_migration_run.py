@@ -2269,6 +2269,35 @@ class BitrixMigrationRun(models.Model):
 
         return deleted
 
+    def _purge_orphaned_calendar_recurrences(self):
+        # Occurrences expanded by Odoo's calendar.recurrence engine inherit copy=False
+        # for x_bitrix_id, so once the original base event is gone they cannot be matched
+        # by domain/mapping purge. Sweep them via SQL.
+        self.env.cr.execute("""
+            DELETE FROM calendar_event
+            WHERE recurrence_id IS NOT NULL
+              AND (x_bitrix_id IS NULL OR x_bitrix_id = '')
+        """)
+        orphan_events = self.env.cr.rowcount
+        if orphan_events:
+            self._append_log(f'Purged orphaned calendar_event occurrences: {orphan_events}')
+
+        self.env.cr.execute("""
+            DELETE FROM calendar_recurrence
+            WHERE base_event_id IS NULL
+               OR id NOT IN (
+                   SELECT DISTINCT recurrence_id
+                   FROM calendar_event
+                   WHERE recurrence_id IS NOT NULL
+               )
+        """)
+        orphan_recurrences = self.env.cr.rowcount
+        if orphan_recurrences:
+            self._append_log(f'Purged orphaned calendar_recurrence: {orphan_recurrences}')
+
+        self.env.cr.commit()
+        return orphan_events, orphan_recurrences
+
     def _clear_named_checkpoints(self, checkpoint_keys):
         params = self.env['ir.config_parameter'].sudo()
         for key in checkpoint_keys:
@@ -2529,11 +2558,13 @@ class BitrixMigrationRun(models.Model):
             )
 
             self._append_log('Removing imported meetings...')
+            self._purge_records_by_mapping('meeting', 'calendar.event', 'meetings (by mapping)')
             self._purge_records_by_domain(
                 'calendar.event',
                 [('x_bitrix_id', '!=', False)],
-                'meetings',
+                'meetings (by x_bitrix_id)',
             )
+            self._purge_orphaned_calendar_recurrences()
 
             self._append_log('Removing imported tasks...')
             self._purge_records_by_domain(

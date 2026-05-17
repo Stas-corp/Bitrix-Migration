@@ -384,12 +384,30 @@ class BitrixMySQLExtractor:
     """
 
     # ── Meetings ──────────────────────────────────────────────────────
-    # Bitrix sometimes leaves IS_MEETING=NULL for events created via the
-    # calendar even when MEETING_HOST is set. Such records are still meetings
-    # semantically (they have an organizer), so we treat
-    # MEETING_HOST IS NOT NULL as the second eligibility criterion alongside
-    # IS_MEETING='1'. The same relaxed condition applies in every meeting-
-    # related SQL (comments, attachments, counters) below to stay consistent.
+    # A Bitrix meeting eligible for migration must:
+    #   1. have an organizer (MEETING_HOST IS NOT NULL);
+    #   2. be the canonical master row (ID = PARENT_ID) and not deleted;
+    #   3. live in a section that is NOT a remote-calendar subscription —
+    #      holiday / "Holidays in Ukraine" / "Свята в Україні" events are
+    #      duplicated into every user's calendar via Google-calendar sync
+    #      (b_calendar_section.EXTERNAL_TYPE IN 'google', 'google_readonly',
+    #      …). Excluding those sections drops thousands of holiday rows
+    #      stretching out to 2031 while keeping legitimate user/group
+    #      meetings (EXTERNAL_TYPE = 'local' / NULL).
+    # The same guard (_MEETING_GUARD) is reused by every meeting-related
+    # SQL below for consistency.
+    _MEETING_GUARD = """ce.MEETING_HOST IS NOT NULL
+          AND ce.DELETED = 'N'
+          AND ce.ID = ce.PARENT_ID
+          AND NOT EXISTS (
+              SELECT 1 FROM b_calendar_section sec
+              WHERE sec.ID = ce.SECTION_ID
+                AND sec.EXTERNAL_TYPE IN (
+                    'google', 'google_readonly',
+                    'icloud', 'caldav', 'exchange'
+                )
+          )"""
+
     SQL_MEETINGS_TEMPLATE = """
         SELECT
             ce.ID AS external_id,
@@ -403,11 +421,12 @@ class BitrixMySQLExtractor:
                AND child.ID != child.PARENT_ID) AS participant_bitrix_ids,
             ce.MEETING_HOST AS organizer_bitrix_id,
             ce.DESCRIPTION AS description,
+            ce.RRULE AS rrule,
+            ce.EXDATE AS exdate,
+            ce.SECTION_ID AS section_id,
             {forum_topic_expr}
         FROM b_calendar_event ce
-        WHERE (ce.IS_MEETING = '1' OR ce.MEETING_HOST IS NOT NULL)
-          AND ce.DELETED = 'N'
-          AND ce.ID = ce.PARENT_ID
+        WHERE {meeting_guard}
           AND {meeting_where_clause}
         ORDER BY ce.DATE_FROM
     """
@@ -425,9 +444,7 @@ class BitrixMySQLExtractor:
         STRAIGHT_JOIN b_calendar_event ce ON ce.FORUM_TOPIC_ID = fm.TOPIC_ID
         WHERE fm.SERVICE_TYPE IS NULL
           AND fm.NEW_TOPIC = 'N'
-          AND (ce.IS_MEETING = '1' OR ce.MEETING_HOST IS NOT NULL)
-          AND ce.DELETED = 'N'
-          AND ce.ID = ce.PARENT_ID
+          AND {meeting_guard}
           AND {meeting_where_clause}
         ORDER BY fm.POST_DATE
     """
@@ -445,9 +462,7 @@ class BitrixMySQLExtractor:
         JOIN b_sonet_log_comment slc ON slc.LOG_ID = sl.ID
         JOIN b_calendar_event ce ON ce.ID = sl.SOURCE_ID
         WHERE sl.MODULE_ID = 'calendar'
-          AND (ce.IS_MEETING = '1' OR ce.MEETING_HOST IS NOT NULL)
-          AND ce.DELETED = 'N'
-          AND ce.ID = ce.PARENT_ID
+          AND {meeting_guard}
           AND {meeting_where_clause}
         ORDER BY slc.LOG_DATE
     """
@@ -464,9 +479,7 @@ class BitrixMySQLExtractor:
         JOIN b_disk_object do ON do.ID = ao.OBJECT_ID
         JOIN b_file bf ON bf.ID = do.FILE_ID
         JOIN b_calendar_event ce ON ce.ID = ao.ENTITY_ID
-                                AND (ce.IS_MEETING = '1' OR ce.MEETING_HOST IS NOT NULL)
-                                AND ce.DELETED = 'N'
-                                AND ce.ID = ce.PARENT_ID
+                                AND {meeting_guard}
                                 AND {meeting_where_clause}
         WHERE ao.ENTITY_TYPE = %s
         ORDER BY ao.CREATE_TIME, ao.ID
@@ -486,9 +499,7 @@ class BitrixMySQLExtractor:
         JOIN b_file bf ON bf.ID = do.FILE_ID
         JOIN b_forum_message fm ON fm.ID = ao.ENTITY_ID
         JOIN b_calendar_event ce ON ce.FORUM_TOPIC_ID = fm.TOPIC_ID
-                                AND (ce.IS_MEETING = '1' OR ce.MEETING_HOST IS NOT NULL)
-                                AND ce.DELETED = 'N'
-                                AND ce.ID = ce.PARENT_ID
+                                AND {meeting_guard}
                                 AND {meeting_where_clause}
         WHERE ao.ENTITY_TYPE = 'Bitrix\\\\Disk\\\\Uf\\\\ForumMessageConnector'
         ORDER BY ao.CREATE_TIME, ao.ID
@@ -509,9 +520,7 @@ class BitrixMySQLExtractor:
         JOIN b_sonet_log_comment slc ON slc.ID = ao.ENTITY_ID
         JOIN b_sonet_log sl ON sl.ID = slc.LOG_ID
         JOIN b_calendar_event ce ON ce.ID = sl.SOURCE_ID
-                                AND (ce.IS_MEETING = '1' OR ce.MEETING_HOST IS NOT NULL)
-                                AND ce.DELETED = 'N'
-                                AND ce.ID = ce.PARENT_ID
+                                AND {meeting_guard}
                                 AND {meeting_where_clause}
         WHERE ao.ENTITY_TYPE IN (
             'Bitrix\\\\Disk\\\\Uf\\\\BlogPostCommentConnector',
@@ -664,16 +673,14 @@ class BitrixMySQLExtractor:
     SQL_COUNT_MEETINGS_TEMPLATE = """
         SELECT COUNT(*) AS cnt
         FROM b_calendar_event ce
-        WHERE (ce.IS_MEETING = '1' OR ce.MEETING_HOST IS NOT NULL)
-          AND ce.DELETED = 'N'
-          AND ce.ID = ce.PARENT_ID
+        WHERE {meeting_guard}
           AND {meeting_where_clause}
     """
     SQL_COUNT_MEETING_COMMENTS_TEMPLATE = """
         SELECT COUNT(*) AS cnt FROM b_forum_message fm
         STRAIGHT_JOIN b_calendar_event ce ON ce.FORUM_TOPIC_ID = fm.TOPIC_ID
         WHERE fm.SERVICE_TYPE IS NULL AND fm.NEW_TOPIC = 'N'
-          AND (ce.IS_MEETING = '1' OR ce.MEETING_HOST IS NOT NULL) AND ce.DELETED = 'N' AND ce.ID = ce.PARENT_ID
+          AND {meeting_guard}
           AND {meeting_where_clause}
     """
     SQL_COUNT_MEETING_SONET_COMMENTS_TEMPLATE = """
@@ -682,9 +689,7 @@ class BitrixMySQLExtractor:
         JOIN b_sonet_log_comment slc ON slc.LOG_ID = sl.ID
         JOIN b_calendar_event ce ON ce.ID = sl.SOURCE_ID
         WHERE sl.MODULE_ID = 'calendar'
-          AND (ce.IS_MEETING = '1' OR ce.MEETING_HOST IS NOT NULL)
-          AND ce.DELETED = 'N'
-          AND ce.ID = ce.PARENT_ID
+          AND {meeting_guard}
           AND {meeting_where_clause}
     """
 
@@ -886,8 +891,11 @@ class BitrixMySQLExtractor:
         return (self.date_from,) if self.date_from and self._get_project_filter_column() else None
 
     def _get_meeting_where_clause(self):
+        # Recurring events store DATE_FROM = first occurrence, which can be
+        # before the cut-off even when the series is still active. Keep them
+        # regardless of date_from when RRULE is non-empty.
         if self.date_from:
-            return 'ce.DATE_FROM >= %s'
+            return "(ce.DATE_FROM >= %s OR (ce.RRULE IS NOT NULL AND ce.RRULE != ''))"
         return '1=1'
 
     def _get_meeting_params(self):
@@ -1041,6 +1049,7 @@ class BitrixMySQLExtractor:
         )
         sql = self.SQL_MEETINGS_TEMPLATE.format(
             forum_topic_expr=forum_topic_expr,
+            meeting_guard=self._MEETING_GUARD,
             meeting_where_clause=self._get_meeting_where_clause(),
         )
         return self._execute(sql, self._get_meeting_params())
@@ -1049,10 +1058,12 @@ class BitrixMySQLExtractor:
         params = self._get_meeting_params()
         if self._uses_calendar_forum_comments():
             sql = self.SQL_MEETING_FORUM_COMMENTS.format(
+                meeting_guard=self._MEETING_GUARD,
                 meeting_where_clause=self._get_meeting_where_clause(),
             )
             return self._execute(sql, params)
         sql = self.SQL_MEETING_SONET_COMMENTS.format(
+            meeting_guard=self._MEETING_GUARD,
             meeting_where_clause=self._get_meeting_where_clause(),
         )
         return self._execute(sql, params)
@@ -1068,6 +1079,7 @@ class BitrixMySQLExtractor:
             params += self._get_meeting_params()
         return self._execute(
             self.SQL_MEETING_ATTACHMENTS.format(
+                meeting_guard=self._MEETING_GUARD,
                 meeting_where_clause=self._get_meeting_where_clause(),
             ),
             params,
@@ -1077,10 +1089,12 @@ class BitrixMySQLExtractor:
         params = self._get_meeting_params()
         if self._uses_calendar_forum_comments():
             sql = self.SQL_MEETING_FORUM_COMMENT_ATTACHMENTS.format(
+                meeting_guard=self._MEETING_GUARD,
                 meeting_where_clause=self._get_meeting_where_clause(),
             )
             return self._execute(sql, params)
         sql = self.SQL_MEETING_SONET_COMMENT_ATTACHMENTS.format(
+            meeting_guard=self._MEETING_GUARD,
             meeting_where_clause=self._get_meeting_where_clause(),
         )
         return self._execute(sql, params)
@@ -1248,6 +1262,7 @@ class BitrixMySQLExtractor:
 
     def count_meetings(self):
         sql = self.SQL_COUNT_MEETINGS_TEMPLATE.format(
+            meeting_guard=self._MEETING_GUARD,
             meeting_where_clause=self._get_meeting_where_clause(),
         )
         result = self._execute(sql, self._get_meeting_params())
@@ -1257,11 +1272,13 @@ class BitrixMySQLExtractor:
         params = self._get_meeting_params()
         if self._uses_calendar_forum_comments():
             sql = self.SQL_COUNT_MEETING_COMMENTS_TEMPLATE.format(
+                meeting_guard=self._MEETING_GUARD,
                 meeting_where_clause=self._get_meeting_where_clause(),
             )
             result = self._execute(sql, params)
             return result[0]['cnt'] if result else 0
         sql = self.SQL_COUNT_MEETING_SONET_COMMENTS_TEMPLATE.format(
+            meeting_guard=self._MEETING_GUARD,
             meeting_where_clause=self._get_meeting_where_clause(),
         )
         result = self._execute(sql, params)
