@@ -1,5 +1,75 @@
 # CHANGELOG
 
+## 2026-05-18 — Фильтр импорта Bitrix Disk: типы storage + статус сотрудника
+
+Анализ `b_disk_storage` показал, что без фильтров режим `mode='disk'` тянет в Odoo **1 935 storage, 196 087 файлов, ~287 GB**, из которых ~103 GB — диски уволенных, плюс 4 471 файл IM/Mail/DocumentGenerator/CRM Integration. Текущий CSV-фильтр `disk_storage_ids_csv` не масштабируется (1 546 ID — статичный снапшот строкой ~10 KB, ломается при найме/увольнении). Нужен декларативный фильтр в модели и SQL.
+
+### Анализ объёмов (Bitrix → Odoo, через `b_disk_storage` × `b_user`)
+
+| Категория (`entity_type`) | Storages | Папок | Файлов | Размер |
+|---|---:|---:|---:|---:|
+| `User` (все) | 1 783 | 3 817 | 149 781 | ~287 GB вместе |
+| `User` (ACTIVE='Y') | 1 398 | 2 416 | 101 259 | 184.30 GB |
+| `User` (ACTIVE='N') | 385 | 1 401 | 48 522 | ~103 GB (отсекается) |
+| `Common` | 1 | 1 997 | 41 656 | 33.77 GB |
+| `Group` | 147 | 217 | 160 | 0.46 GB |
+| `IM` | 1 | 1 010 | 3 179 | (отсекается) |
+| `Mail` | 1 | 43 | 1 291 | (отсекается) |
+| `DocumentGenerator` | 1 | 2 | 21 | (отсекается) |
+| `Crm` Integration | 1 | 1 | 0 | (отсекается) |
+| **Целевой объём (Common+Group+User-active)** | **1 546** | **4 630** | **143 075** | **≈ 218.5 GB** |
+
+Решение пользователя через `AskUserQuestion`: `Common + Group + User` + фильтр `b_user.ACTIVE='Y'`. Это автоматически отсекает диски уволенных и служебные storage (`IM`/`Mail`/`Doc`/`Crm`).
+
+### Изменения
+
+| Файл | Изменение | Причина |
+|---|---|---|
+| `addons/bitrix_migration/models/bitrix_migration_run.py:87-138` | Пять новых `Boolean`-полей: `disk_include_user`, `disk_include_common`, `disk_include_group`, `disk_include_im`, `disk_active_users_only`. Дефолты: User/Common/Group/ActiveOnly = True, IM = False | Декларативный фильтр в форме вместо статичного CSV-снапшота на 1 546 ID |
+| `addons/bitrix_migration/models/bitrix_migration_run.py:1283-1356` | `_run_disk`: сборка `entity_types` из чекбоксов, `UserError` при пустом наборе, проброс в `DiskLoader`. CSV-фильтр (`disk_storage_ids_csv`) сохранён — комбинируется через AND как точечный сужающий | Обратная совместимость с пилотным запуском по конкретному storage ID |
+| `addons/bitrix_migration/services/extractors/bitrix_mysql.py:720-755` | `SQL_DISK_STORAGES_TEMPLATE` с плейсхолдерами `{user_join}`, `{entity_clause}`, `{active_user_clause}`, `{storage_clause}`. Карта `DISK_ENTITY_TYPE_LIKE`: 7 паттернов LIKE без backslash в паттерне (MySQL `%` ловит `\`, поэтому экранирование обратного слеша не нужно) | `entity_type` в Bitrix — PHP FQN с `\` — LIKE-паттерн `'%ProxyType%User'` обходит проблемы с ESCAPE без потери точности |
+| `addons/bitrix_migration/services/extractors/bitrix_mysql.py:1330-1410` | Выделена чистая `@classmethod _build_disk_storage_filters(...)` — возвращает dict с SQL-фрагментами + params. `get_disk_storages()` стала тонкой обёрткой | Чистая функция покрывается юнит-тестами без БД; проще поддерживать, проще переиспользовать из shell для диагностики |
+| `addons/bitrix_migration/services/loaders/disk.py:35-72` | `DiskLoader.__init__` принимает `entity_types`/`active_users_only`, пробрасывает в `extractor.get_disk_storages(...)` в `run()` | Замыкает цепочку проброса из UI → модель → loader → extractor |
+| `addons/bitrix_migration/views/bitrix_migration_run_views.xml:179-200` | Новая `<group string="Storage filter">` с 5 чекбоксами на странице Disk Import + подсказка про AND-комбинирование с CSV | UI-видимость фильтра — без редактирования CSV |
+| `addons/bitrix_migration/tests/test_disk_filters.py` (новый) | 10 юнит-тестов `TestDiskStorageFilters`: пустой вызов, единичный/множественные `entity_types`, unknown raises `ValueError`, `active_users_only` с/без `User`, CSV-фильтр, комбинированный сценарий, проверка совпадения `sql.count('%s') == len(params)` через рендер шаблона | Покрытие опирается на чистоту `_build_disk_storage_filters` — БД не нужна |
+| `addons/bitrix_migration/tests/__init__.py` | Регистрация `test_disk_filters` | — |
+
+### Ключевой нюанс: порядок параметров в pymysql
+
+Первый запуск dry-run на `stage-odoo-odoo-1` вернул **147** вместо ожидаемых **1 546** — User-storage отфильтровывались полностью. Корень: `_build_disk_storage_filters` добавлял параметры в порядке `entity → user_join → active_user → storage`, но плейсхолдеры `%s` в `SQL_DISK_STORAGES_TEMPLATE` идут в порядке `user_join → entity → active_user → storage`. pymysql подставлял LIKE-параметры в другие позиции — `LEFT JOIN b_user u ON … LIKE '%ProxyType%Common'` фактически не матчил ни одного user'а.
+
+**Фикс**: `_build_disk_storage_filters` теперь собирает `params` строго в порядке появления `%s` в шаблоне (`user_join_params + entity_params + active_user_params + storage_params`). После фикса dry-run выдал ожидаемые 1 546.
+
+### Verification (на `stage-odoo-odoo-1` против живой `dbbitrixc9k`)
+
+1. **Юнит-тесты**: `odoo --test-enable --test-tags=/bitrix_migration:TestDiskStorageFilters` → `10 tests 0.11s 36 queries; 0 failed, 0 error(s)`.
+2. **Dry-run SELECT через `ext._get_extractor()`** (5 сценариев):
+   - `User+Common+Group, active=True` → **1 546** ✓ (1 + 147 + 1 398)
+   - `User+Common+Group, active=False` → 1 931 ✓ (1 + 147 + 1 783)
+   - `Common+Group` → 148 ✓
+   - Все типы, без фильтра → 1 935 ✓
+   - `storage_filter=[174] + User + active` → 0 ✓ (storage 174 «Наталия Веселова» — ENTITY_ID=134, `ACTIVE='N'`, корректно отсечена)
+3. **SQL-фрагменты в логе dry-run**:
+   ```
+   user_join: LEFT JOIN b_user u ON u.ID = s.ENTITY_ID AND s.ENTITY_TYPE LIKE %s
+   entity_clause: AND (s.ENTITY_TYPE LIKE %s OR s.ENTITY_TYPE LIKE %s OR s.ENTITY_TYPE LIKE %s)
+   active_user_clause: AND (s.ENTITY_TYPE NOT LIKE %s OR u.ACTIVE = 'Y')
+   params count: 5
+   ```
+4. Запись `bitrix.migration.run` id=1: `disk_storage_ids_csv` всё ещё `174` (пилотный). Перед боевым запуском пользователь очищает поле в UI; чекбоксы уже выставлены дефолтами на `Common+Group+User+ActiveOnly`.
+5. **Место на диске Odoo**: для импорта 218 GB нужно минимум ~250 GB свободного в `data_dir` (filestore + БД). Проверка — обязательна перед `mode=disk` без CSV.
+
+### Что попадает в git
+
+- `addons/bitrix_migration/models/bitrix_migration_run.py` — 5 новых полей, обновлённый `_run_disk`.
+- `addons/bitrix_migration/services/extractors/bitrix_mysql.py` — `DISK_ENTITY_TYPE_LIKE`, обновлённый SQL-шаблон, `_build_disk_storage_filters`, расширенный `get_disk_storages`.
+- `addons/bitrix_migration/services/loaders/disk.py` — параметры `entity_types`/`active_users_only`.
+- `addons/bitrix_migration/views/bitrix_migration_run_views.xml` — `<group string="Storage filter">`.
+- `addons/bitrix_migration/tests/test_disk_filters.py` (новый) + регистрация в `tests/__init__.py`.
+- `CHANGELOG.md` — эта запись.
+
+---
+
 ## 2026-05-18 — Фикс `UserError` при повторном импорте recurring-встреч
 
 После Round 2 от 2026-05-16 (импорт RRULE → Odoo recurrence) пользователь сегодня запустил `mode=full` повторно поверх уже импортированных встреч. В логах `stage-odoo-odoo-1`:
