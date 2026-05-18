@@ -32,15 +32,20 @@ class DiskLoader(BaseLoader):
     entity_type = 'disk'
     batch_size = 200
 
+    MAX_FILE_BYTES_DEFAULT = 500 * 1024 * 1024  # 500 MB — выше риск MemoryError и Integer overflow
+
     def __init__(self, env, extractor, local_root, storage_filter=None,
                  include_trashed=False, entity_types=None,
-                 active_users_only=False, log_callback=None):
+                 active_users_only=False, log_callback=None, max_file_bytes=None):
         super().__init__(env, extractor, log_callback=log_callback)
         self.local_root = local_root
         self.storage_filter = storage_filter
         self.include_trashed = include_trashed
         self.entity_types = entity_types
         self.active_users_only = active_users_only
+        self.max_file_bytes = (
+            max_file_bytes if max_file_bytes is not None else self.MAX_FILE_BYTES_DEFAULT
+        )
         self._folder_id_by_bid = {}
         self._admin_user_id = None
 
@@ -133,6 +138,10 @@ class DiskLoader(BaseLoader):
             except Exception as e:
                 self.error_count += 1
                 self.errors.append((obj.external_id, str(e)))
+                try:
+                    self.env.cr.rollback()
+                except Exception:
+                    pass
                 self.log(f'ERR upsert {obj.type} {obj.external_id}: {e}')
             processed += 1
             last_bid = obj.external_id
@@ -236,6 +245,16 @@ class DiskLoader(BaseLoader):
             )
             self.error_count += 1
             self.errors.append((obj.external_id, f'missing on FS: {local_path}'))
+            return
+
+        actual_size = os.path.getsize(local_path)
+        if self.max_file_bytes and actual_size > self.max_file_bytes:
+            self.log_once(
+                f'oversized:{obj.file_subdir}/{obj.file_diskname}',
+                f'skip oversized file id={obj.external_id} name={obj.name!r}: '
+                f'{actual_size:,} bytes > limit {self.max_file_bytes:,}',
+            )
+            self.skipped_count += 1
             return
 
         if self.dry_run:

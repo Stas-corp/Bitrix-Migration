@@ -124,6 +124,7 @@ class DepartmentLoader(BaseLoader):
 
         self.log(f'Pass 2 done: linked={linked}, errors={errors}')
         self.sync_department_managers(depts)
+        self.inherit_managers_from_parents(depts)
 
     def _restore_department_mappings(self, depts, existing=None):
         """Restore missing department mappings from hr.department.x_bitrix_id."""
@@ -231,6 +232,96 @@ class DepartmentLoader(BaseLoader):
             f'missing_department={missing_department}, '
             f'missing_manager={missing_manager}'
         )
+
+    def inherit_managers_from_parents(self, depts=None):
+        """Fill hr.department.manager_id from the nearest parent with UF_HEAD.
+
+        Container departments without their own UF_HEAD inherit a manager
+        from the closest ancestor that has one. Already-set ``manager_id``
+        is never overwritten. Cycle-safe.
+        """
+        from .hierarchy import build_department_tree
+
+        if depts is None:
+            self.log('Extracting Bitrix departments for manager inheritance...')
+            rows = self.extractor.get_departments()
+            depts = self._normalize_departments(rows)
+        if not depts:
+            return
+
+        dept_tree = build_department_tree(depts)
+        mapping = self.get_mapping()
+        existing = mapping.get_all_mappings(
+            'department', model_name='hr.department', only_existing=True,
+        )
+        Department = self.env['hr.department'].sudo().with_context(active_test=False)
+
+        inherited = 0
+        skipped_already_set = 0
+        no_head_in_chain = 0
+        missing_department = 0
+        missing_manager = 0
+
+        for dept in depts:
+            if dept.head_user_id:
+                continue
+
+            department = self._resolve_department(dept.dept_id, existing, Department)
+            if not department:
+                missing_department += 1
+                continue
+
+            if department.manager_id:
+                skipped_already_set += 1
+                continue
+
+            ancestor_head = self._find_ancestor_head(dept.dept_id, dept_tree)
+            if not ancestor_head:
+                no_head_in_chain += 1
+                continue
+
+            manager = self._resolve_manager(ancestor_head)
+            if not manager:
+                missing_manager += 1
+                continue
+
+            if not self.dry_run:
+                department.write({'manager_id': manager.id})
+            inherited += 1
+
+        if not self.dry_run:
+            self.commit_checkpoint(inherited)
+
+        self.log(
+            'Department managers inheritance done: '
+            f'inherited={inherited}, skipped_already_set={skipped_already_set}, '
+            f'no_head_in_chain={no_head_in_chain}, '
+            f'missing_department={missing_department}, '
+            f'missing_manager={missing_manager}'
+        )
+
+    @staticmethod
+    def _find_ancestor_head(dept_id, dept_tree):
+        """Walk up dept_tree from dept_id and return first non-empty UF_HEAD."""
+        try:
+            current = int(dept_id)
+        except (TypeError, ValueError):
+            return None
+        node = dept_tree.get(current)
+        if node is None:
+            return None
+        current = node.get('parent_id')
+        visited = set()
+        while current is not None and current not in visited:
+            visited.add(current)
+            node = dept_tree.get(current)
+            if node is None:
+                return None
+            head = node.get('uf_head')
+            if head:
+                return int(head)
+            current = node.get('parent_id')
+        return None
 
     def _resolve_department(self, bitrix_dept_id, department_map, Department):
         odoo_id = department_map.get(str(bitrix_dept_id))

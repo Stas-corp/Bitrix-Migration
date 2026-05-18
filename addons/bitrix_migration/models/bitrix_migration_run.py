@@ -25,6 +25,7 @@ class BitrixMigrationRun(models.Model):
         'fix_roles',
         'fix_attachments',
         'fix_descriptions',
+        'fix_hierarchy',
         'disk',
     }
 
@@ -39,6 +40,7 @@ class BitrixMigrationRun(models.Model):
         ('fix_roles', 'Fix Roles (re-sync task roles)'),
         ('fix_attachments', 'Fix Attachments (relink comment attachments)'),
         ('fix_descriptions', 'Fix Descriptions (repair empty descriptions with attachments)'),
+        ('fix_hierarchy', 'HR: Fix Employee Parent Hierarchy'),
         ('disk', 'Bitrix Disk → Documents'),
     ], required=True, default='full', string='Mode',
         help='Режим виконання міграції.')
@@ -299,6 +301,8 @@ class BitrixMigrationRun(models.Model):
                 self._run_fix_attachments(extractor)
             elif self.mode == 'fix_descriptions':
                 self._run_fix_descriptions(extractor)
+            elif self.mode == 'fix_hierarchy':
+                self._run_fix_hierarchy(extractor)
             elif self.mode == 'meetings':
                 self._run_meetings(extractor)
             elif self.mode == 'disk':
@@ -1106,6 +1110,7 @@ class BitrixMigrationRun(models.Model):
             log_callback=self._append_log,
         )
         dept_loader.sync_department_managers()
+        dept_loader.inherit_managers_from_parents()
 
     def action_fix_department_managers(self):
         """One-off repair action for already imported HR departments."""
@@ -1127,6 +1132,51 @@ class BitrixMigrationRun(models.Model):
             self.state = 'error'
             self._append_log(f'=== DEPARTMENT MANAGER SYNC ERROR ===\n{traceback.format_exc()}')
             _logger.exception('Department manager sync failed')
+        finally:
+            if extractor:
+                try:
+                    extractor.close()
+                except Exception:
+                    _logger.warning('Could not close Bitrix extractor cleanly', exc_info=True)
+
+        self.env.cr.commit()
+
+    def _run_fix_hierarchy(self, extractor):
+        """Recompute hr.employee.parent_id from Bitrix UF_HEAD chains.
+
+        Operates on already-imported employees only — no res.users / SFTP /
+        avatar side-effects. Safe to rerun: idempotent and cycle-safe.
+        """
+        from ..services.loaders.employees import EmployeeLoader
+
+        self._append_log('\n--- Employee Hierarchy ---')
+        emp_loader = EmployeeLoader(
+            self.env, extractor,
+            dry_run=False,
+            log_callback=self._append_log,
+        )
+        emp_loader.link_parents()
+
+    def action_fix_employee_hierarchy(self):
+        """One-off repair action for hr.employee.parent_id."""
+        self.ensure_one()
+        self.state = 'running'
+        self._append_log('=== Employee hierarchy fix started ===')
+        self.progress = 0.0
+        self.env.cr.commit()
+
+        extractor = None
+        try:
+            extractor = self._get_extractor()
+            self._run_fix_hierarchy(extractor)
+            self.state = 'done'
+            self.progress = 100.0
+            self._append_log('=== Employee hierarchy fix completed ===')
+        except Exception:
+            self.env.cr.rollback()
+            self.state = 'error'
+            self._append_log(f'=== EMPLOYEE HIERARCHY FIX ERROR ===\n{traceback.format_exc()}')
+            _logger.exception('Employee hierarchy fix failed')
         finally:
             if extractor:
                 try:
@@ -1653,6 +1703,15 @@ class BitrixMigrationRun(models.Model):
             'Employees (fired)': self.env['hr.employee'].sudo().with_context(
                 active_test=False,
             ).search_count([('x_bitrix_id', '!=', 0), ('active', '=', False)]),
+            'Employees with parent_id': self.env['hr.employee'].sudo().with_context(
+                active_test=False,
+            ).search_count([('x_bitrix_id', '!=', 0), ('parent_id', '!=', False)]),
+            'Employees without parent_id (active)': self.env['hr.employee'].sudo().search_count(
+                [('x_bitrix_id', '!=', 0), ('parent_id', '=', False)]),
+            'Departments with manager_id': self.env['hr.department'].sudo().search_count(
+                [('x_bitrix_id', '!=', 0), ('manager_id', '!=', False)]),
+            'Departments without manager_id': self.env['hr.department'].sudo().search_count(
+                [('x_bitrix_id', '!=', 0), ('manager_id', '=', False)]),
         }
         if self.fallback_project_id:
             checks['Tasks in fallback project'] = self.env['project.task'].sudo().with_context(

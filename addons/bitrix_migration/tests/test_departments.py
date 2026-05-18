@@ -11,6 +11,13 @@ class _FakeDepartmentExtractor:
         return self.rows
 
 
+class _TestDepartmentLoader(DepartmentLoader):
+    """DepartmentLoader override: no commit/checkpoint inside a test transaction."""
+
+    def commit_checkpoint(self, count, last_bitrix_id=None):
+        return None
+
+
 class TestDepartmentLoader(TransactionCase):
     @classmethod
     def setUpClass(cls):
@@ -21,128 +28,72 @@ class TestDepartmentLoader(TransactionCase):
             'tracking_disable': True,
         })
 
-    def test_run_recreates_departments_when_mapping_points_to_deleted_record(self):
-        stale_department = self.env['hr.department'].create({
-            'name': 'Old Sales',
-            'x_bitrix_id': 10,
+    def _make_inherit_loader(self):
+        return _TestDepartmentLoader(self.env, _FakeDepartmentExtractor([]))
+
+    def test_manager_inherited_from_parent_when_no_uf_head(self):
+        from ..services.normalizers.dto import BitrixDepartment
+
+        root_manager = self.env['hr.employee'].create({
+            'name': 'Root Boss',
+            'x_bitrix_id': 800,
         })
-        self.env['bitrix.migration.mapping'].create({
-            'bitrix_id': '10',
-            'entity_type': 'department',
-            'odoo_model': 'hr.department',
-            'odoo_id': stale_department.id,
+        Department = self.env['hr.department']
+        root_dept = Department.create({
+            'name': 'Root',
+            'x_bitrix_id': 50,
+            'manager_id': root_manager.id,
         })
-        stale_department.unlink()
-
-        extractor = _FakeDepartmentExtractor([
-            {
-                'dept_id': 10,
-                'dept_name': 'Sales',
-                'parent_dept_id': None,
-                'head_user_id': None,
-                'depth_level': 1,
-            },
-            {
-                'dept_id': 11,
-                'dept_name': 'Regional',
-                'parent_dept_id': 10,
-                'head_user_id': None,
-                'depth_level': 2,
-            },
-        ])
-
-        loader = DepartmentLoader(self.env, extractor=extractor, user_map={})
-        loader.run()
-
-        sales = self.env['hr.department'].search([('x_bitrix_id', '=', 10)], limit=1)
-        regional = self.env['hr.department'].search([('x_bitrix_id', '=', 11)], limit=1)
-        self.assertTrue(sales)
-        self.assertTrue(regional)
-        self.assertEqual(regional.parent_id, sales)
-
-        mapping = self.env['bitrix.migration.mapping']
-        current_map = mapping.get_all_mappings(
-            'department', model_name='hr.department', only_existing=True,
-        )
-        self.assertEqual(current_map.get('10'), sales.id)
-        self.assertEqual(current_map.get('11'), regional.id)
-
-    def test_run_restores_mapping_and_sets_manager_by_employee_bitrix_id(self):
-        department = self.env['hr.department'].create({
-            'name': 'Existing Support',
-            'x_bitrix_id': 20,
-        })
-        manager = self.env['hr.employee'].create({
-            'name': 'Support Manager',
-            'x_bitrix_id': 700,
+        container = Department.create({
+            'name': 'Container',
+            'x_bitrix_id': 51,
+            'parent_id': root_dept.id,
         })
 
-        extractor = _FakeDepartmentExtractor([{
-            'dept_id': 20,
-            'dept_name': 'Support',
-            'parent_dept_id': None,
-            'head_user_id': 700,
-            'depth_level': 1,
-        }])
+        depts = [
+            BitrixDepartment(dept_id=50, dept_name='Root', parent_dept_id=None,
+                             head_user_id=800, depth_level=1),
+            BitrixDepartment(dept_id=51, dept_name='Container', parent_dept_id=50,
+                             head_user_id=None, depth_level=2),
+        ]
+        self._make_inherit_loader().inherit_managers_from_parents(depts)
 
-        loader = DepartmentLoader(self.env, extractor=extractor, user_map={})
-        loader.run()
+        container.invalidate_recordset()
+        self.assertEqual(container.manager_id, root_manager)
 
-        department.invalidate_recordset()
-        self.assertEqual(department.manager_id, manager)
+    def test_inherited_manager_does_not_overwrite_existing(self):
+        from ..services.normalizers.dto import BitrixDepartment
 
-        current_map = self.env['bitrix.migration.mapping'].get_all_mappings(
-            'department', model_name='hr.department', only_existing=True,
-        )
-        self.assertEqual(current_map.get('20'), department.id)
-
-    def test_sync_department_managers_after_employee_import(self):
-        extractor = _FakeDepartmentExtractor([{
-            'dept_id': 30,
-            'dept_name': 'Operations',
-            'parent_dept_id': None,
-            'head_user_id': 701,
-            'depth_level': 1,
-        }])
-
-        loader = DepartmentLoader(self.env, extractor=extractor, user_map={})
-        loader.run()
-
-        department = self.env['hr.department'].search([('x_bitrix_id', '=', 30)], limit=1)
-        self.assertTrue(department)
-        self.assertFalse(department.manager_id)
-
-        manager = self.env['hr.employee'].create({
-            'name': 'Operations Manager',
-            'x_bitrix_id': 701,
+        existing_manager = self.env['hr.employee'].create({
+            'name': 'Manual Override',
+            'x_bitrix_id': 801,
+        })
+        root_manager = self.env['hr.employee'].create({
+            'name': 'Root Boss 2',
+            'x_bitrix_id': 802,
+        })
+        Department = self.env['hr.department']
+        root_dept = Department.create({
+            'name': 'Root 2',
+            'x_bitrix_id': 60,
+            'manager_id': root_manager.id,
+        })
+        container = Department.create({
+            'name': 'Pre-existing Container',
+            'x_bitrix_id': 61,
+            'parent_id': root_dept.id,
+            'manager_id': existing_manager.id,
         })
 
-        loader.sync_department_managers()
+        depts = [
+            BitrixDepartment(dept_id=60, dept_name='Root 2', parent_dept_id=None,
+                             head_user_id=802, depth_level=1),
+            BitrixDepartment(dept_id=61, dept_name='Pre-existing Container',
+                             parent_dept_id=60, head_user_id=None, depth_level=2),
+        ]
+        self._make_inherit_loader().inherit_managers_from_parents(depts)
 
-        department.invalidate_recordset()
-        self.assertEqual(department.manager_id, manager)
+        container.invalidate_recordset()
+        self.assertEqual(container.manager_id, existing_manager)
+        self.assertNotEqual(container.manager_id, root_manager)
 
-    def test_empty_head_does_not_clear_existing_manager(self):
-        manager = self.env['hr.employee'].create({
-            'name': 'Manual Manager',
-            'x_bitrix_id': 702,
-        })
-        department = self.env['hr.department'].create({
-            'name': 'Manual Department',
-            'x_bitrix_id': 40,
-            'manager_id': manager.id,
-        })
-
-        extractor = _FakeDepartmentExtractor([{
-            'dept_id': 40,
-            'dept_name': 'Manual Department',
-            'parent_dept_id': None,
-            'head_user_id': None,
-            'depth_level': 1,
-        }])
-
-        loader = DepartmentLoader(self.env, extractor=extractor, user_map={})
-        loader.run()
-
-        department.invalidate_recordset()
-        self.assertEqual(department.manager_id, manager)

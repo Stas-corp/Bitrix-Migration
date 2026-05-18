@@ -147,6 +147,140 @@ class EmployeeLoader(BaseLoader):
             self.commit_checkpoint(processed)
 
         self.log_stats()
+        self.link_parents()
+
+    def link_parents(self):
+        """Set hr.employee.parent_id from Bitrix department UF_HEAD hierarchy.
+
+        Two-pass companion to ``run()``: requires hr.employee records to
+        exist for both the employee and their resolved manager. Uses the
+        same first-UF_DEPARTMENT pick as ``_resolve_dept`` and walks up the
+        Bitrix department tree to the closest UF_HEAD that isn't the
+        employee themselves.
+
+        Idempotent: skips already-correct rows. Defensive against cycles
+        (both in Bitrix dept_tree and in Odoo hr.employee.parent_id).
+        Archived employees are accepted as parents so historical chains
+        survive when a manager has been fired.
+        """
+        from ...services.normalizers.dto import BitrixDepartment, BitrixEmployee
+        from .hierarchy import build_department_tree, compute_employee_parent_id
+
+        self.log('Extracting Bitrix departments for hierarchy linking...')
+        dept_rows = self.extractor.get_departments()
+        depts = []
+        for row in dept_rows:
+            try:
+                depts.append(BitrixDepartment(**row))
+            except Exception as e:
+                self.log(f'ERROR parsing department row {row}: {e}')
+        dept_tree = build_department_tree(depts)
+        self.log(f'Department tree built: {len(dept_tree)} nodes')
+
+        self.log('Extracting Bitrix employees for hierarchy linking...')
+        emp_rows = self.extractor.get_employees()
+        employees = []
+        for row in emp_rows:
+            try:
+                employees.append(BitrixEmployee(**row))
+            except Exception as e:
+                self.log(f'ERROR parsing employee row {row}: {e}')
+
+        Employee = self.env['hr.employee'].sudo().with_context(active_test=False)
+
+        # Cache hr.employee.id by Bitrix user_id in a single bulk lookup.
+        emp_records = Employee.search([
+            ('x_bitrix_id', '!=', False),
+            ('x_bitrix_id', '!=', 0),
+        ])
+        odoo_by_bitrix = {emp.x_bitrix_id: emp.id for emp in emp_records}
+        parent_lookup = {emp.id: (emp.parent_id.id or None) for emp in emp_records}
+
+        linked = 0
+        unchanged = 0
+        missing_parent_employee = 0
+        missing_self_employee = 0
+        cycles_detected = 0
+        no_parent = 0
+        processed = 0
+
+        for batch in self._batched(employees, self.batch_size):
+            for emp in batch:
+                processed += 1
+                self_id = odoo_by_bitrix.get(emp.user_id)
+                if not self_id:
+                    missing_self_employee += 1
+                    continue
+
+                parent_bitrix_id = compute_employee_parent_id(
+                    emp.user_id, emp.dept_ids, dept_tree,
+                )
+                if not parent_bitrix_id:
+                    no_parent += 1
+                    continue
+
+                parent_id = odoo_by_bitrix.get(parent_bitrix_id)
+                if not parent_id:
+                    missing_parent_employee += 1
+                    self.log(
+                        f'WARNING employee bitrix_id={emp.user_id}: '
+                        f'manager bitrix_id={parent_bitrix_id} not in Odoo'
+                    )
+                    continue
+
+                if parent_id == self_id:
+                    # Defensive: dept_tree walk already filters self,
+                    # but guard against any edge case.
+                    no_parent += 1
+                    continue
+
+                if parent_lookup.get(self_id) == parent_id:
+                    unchanged += 1
+                    continue
+
+                if self._creates_parent_cycle(self_id, parent_id, parent_lookup):
+                    cycles_detected += 1
+                    self.log(
+                        f'WARNING employee bitrix_id={emp.user_id}: '
+                        f'parent_id={parent_bitrix_id} would create a cycle, skipped'
+                    )
+                    continue
+
+                if not self.dry_run:
+                    try:
+                        Employee.browse(self_id).write({'parent_id': parent_id})
+                    except Exception as e:
+                        self.error_count += 1
+                        self.errors.append((emp.user_id, f'parent link: {e}'))
+                        self.log(
+                            f'ERROR linking parent for bitrix_id={emp.user_id}: {e}'
+                        )
+                        continue
+                parent_lookup[self_id] = parent_id
+                linked += 1
+
+            if not self.dry_run:
+                self.commit_checkpoint(processed)
+
+        self.log(
+            'Employee parent linking done: '
+            f'linked={linked}, unchanged={unchanged}, no_parent={no_parent}, '
+            f'missing_parent_employee={missing_parent_employee}, '
+            f'missing_self_employee={missing_self_employee}, '
+            f'cycles_detected={cycles_detected}'
+        )
+
+    @staticmethod
+    def _creates_parent_cycle(self_id, candidate_parent_id, parent_lookup):
+        """True when setting self_id.parent_id = candidate_parent_id causes a cycle."""
+        current = candidate_parent_id
+        seen = set()
+        while current is not None and current not in seen:
+            if current == self_id:
+                return True
+            seen.add(current)
+            current = parent_lookup.get(current)
+        return False
 
     def archive_fired(self):
         """Set active=False on hr.employee (and linked res.users) for Bitrix ACTIVE='N'.

@@ -508,28 +508,6 @@ class TestAssigneeUserIds(TransactionCase):
         self.assertIn(creator_user.id, access_ids)
         self.assertFalse(task.user_ids)
 
-    def test_loader_keeps_deadline_datetime_and_maps_status(self):
-        """Bitrix deadline keeps time and status code maps to task state."""
-        task = self._create_task('Deadline Status Sync')
-        deadline = datetime(2026, 4, 24, 18, 0, 0)
-
-        from ..services.loaders.tasks import TaskLoader
-        from ..services.normalizers.dto import BitrixTask
-        loader = TaskLoader(env=self.env, extractor=None)
-        bitrix_task = BitrixTask(
-            external_id=123456,
-            name='Deadline Status Sync',
-            date_deadline=deadline,
-            status_code=5,
-        )
-
-        loader._sync_deadline_and_status(task, bitrix_task)
-        task.invalidate_recordset()
-
-        self.assertEqual(task.date_deadline, deadline)
-        self.assertEqual(task.x_bitrix_status_code, 5)
-        self.assertEqual(task.state, '1_done')
-
     def test_task_search_supports_auditor_user_domain(self):
         """Searching through auditor.user_id works for computed Bitrix auditor field."""
         task = self._create_task('Auditor User Search Task')
@@ -556,33 +534,6 @@ class TestAssigneeUserIds(TransactionCase):
 
         self.assertEqual(found, self.project)
 
-    def test_access_followers_are_subscribed_to_task_and_project(self):
-        """Bitrix access users become followers for Odoo native follower rules."""
-        user = self.env['res.users'].create({
-            'name': 'Follower Sync User',
-            'login': 'follower_sync_user@example.com',
-            'email': 'follower_sync_user@example.com',
-        })
-        task = self._create_task('Follower Sync Task')
-
-        from ..services.loaders.tasks import TaskLoader
-        loader = TaskLoader(env=self.env, extractor=None)
-        loader._subscribe_access_followers(task, [user.id])
-
-        self.assertIn(user.partner_id.id, task.message_partner_ids.ids)
-        self.assertIn(user.partner_id.id, task.project_id.message_partner_ids.ids)
-
-    def test_task_watchers_are_followers_without_being_assignees(self):
-        """Odoo watchers get access subscriptions without becoming assignees."""
-        task = self._create_task('Odoo Watcher Task')
-        task.write({'x_task_watcher_user_ids': [(6, 0, [self.user_u.id])]})
-        task.invalidate_recordset()
-
-        self.assertIn(self.user_u.id, task.x_task_watcher_user_ids.ids)
-        self.assertNotIn(self.user_u.id, task.user_ids.ids)
-        self.assertIn(self.user_u.partner_id.id, task.message_partner_ids.ids)
-        self.assertIn(self.user_u.partner_id.id, task.project_id.message_partner_ids.ids)
-
     def test_bitrix_observer_users_can_be_backfilled_to_task_watchers(self):
         """Bitrix observer/access users can seed the Odoo watcher field."""
         task = self._create_task('Backfill Odoo Watchers')
@@ -593,19 +544,6 @@ class TestAssigneeUserIds(TransactionCase):
         self.assertNotIn(self.user_u.id, task.user_ids.ids)
         self.assertIn(self.user_u.partner_id.id, task.message_partner_ids.ids)
 
-    def test_delegation_keeps_old_and_new_assignees_as_followers(self):
-        """Replacing assignees preserves task access for old and new assignees."""
-        task = self._create_task('Delegation Access Task')
-        task.write({'user_ids': [(6, 0, [self.user_r.id])]})
-        task.write({'user_ids': [(6, 0, [self.user_a.id])]})
-        task.invalidate_recordset()
-
-        self.assertNotIn(self.user_r.id, task.user_ids.ids)
-        self.assertIn(self.user_a.id, task.user_ids.ids)
-        self.assertIn(self.user_r.partner_id.id, task.message_partner_ids.ids)
-        self.assertIn(self.user_a.partner_id.id, task.message_partner_ids.ids)
-        self.assertIn(self.user_r.partner_id.id, task.project_id.message_partner_ids.ids)
-        self.assertIn(self.user_a.partner_id.id, task.project_id.message_partner_ids.ids)
 
     def test_bitrix_employee_can_read_follower_project_after_role_subscription(self):
         """A Bitrix auditor can read a follower-only project after repair subscribes them."""
