@@ -717,6 +717,18 @@ class BitrixMySQLExtractor:
     """
 
     # ── Bitrix Disk ────────────────────────────────────────────────────
+    # b_disk_storage.ENTITY_TYPE — PHP FQN. LIKE-патерни підібрані під
+    # реальні значення цієї інсталяції. % підмінює будь-які символи,
+    # включно зі зворотним слешем, тому ескейп backslash не потрібен.
+    DISK_ENTITY_TYPE_LIKE = {
+        'User':   '%ProxyType%User',
+        'Common': '%ProxyType%Common',
+        'Group':  '%ProxyType%Group',
+        'IM':     '%Im%ProxyType%Im',
+        'Mail':   '%Mail%ProxyType%Mail',
+        'Doc':    '%DocumentGenerator%ProxyType%',
+        'Crm':    '%Crm%Integration%ProxyType%',
+    }
     SQL_DISK_STORAGES_TEMPLATE = """
         SELECT s.ID AS external_id,
                s.ENTITY_TYPE AS entity_type,
@@ -724,7 +736,11 @@ class BitrixMySQLExtractor:
                s.NAME AS name,
                s.ROOT_OBJECT_ID AS root_object_id
         FROM b_disk_storage s
-        WHERE 1 = 1 {storage_clause}
+        {user_join}
+        WHERE 1 = 1
+          {entity_clause}
+          {active_user_clause}
+          {storage_clause}
         ORDER BY s.ID
     """
     SQL_DISK_OBJECTS_TEMPLATE = """
@@ -1325,15 +1341,82 @@ class BitrixMySQLExtractor:
 
     # ── Bitrix Disk ────────────────────────────────────────────────────
 
-    def get_disk_storages(self, storage_filter=None):
-        storage_clause = ''
-        params = ()
-        if storage_filter:
-            storage_clause = ' AND s.ID IN ({})'.format(
-                ', '.join(['%s'] * len(storage_filter))
+    @classmethod
+    def _build_disk_storage_filters(cls, storage_filter=None,
+                                    entity_types=None,
+                                    active_users_only=False):
+        """Pure builder for SQL_DISK_STORAGES_TEMPLATE fragments.
+
+        Returns a dict with: user_join, entity_clause, active_user_clause,
+        storage_clause, params. Параметри впорядковані відповідно до
+        порядку появи %s у SQL_DISK_STORAGES_TEMPLATE
+        (user_join → entity_clause → active_user_clause → storage_clause).
+        Виокремлено для покриття юніт-тестами без БД.
+        """
+        if entity_types:
+            unknown = set(entity_types) - set(cls.DISK_ENTITY_TYPE_LIKE)
+            if unknown:
+                raise ValueError(
+                    f'Unknown disk entity_type(s): {sorted(unknown)}'
+                )
+
+        user_join = ''
+        user_join_params = []
+        active_user_clause = ''
+        active_user_params = []
+        wants_user = (not entity_types) or ('User' in entity_types)
+        if active_users_only and wants_user:
+            user_join = (
+                ' LEFT JOIN b_user u ON u.ID = s.ENTITY_ID '
+                "AND s.ENTITY_TYPE LIKE %s"
             )
-            params = tuple(int(x) for x in storage_filter)
-        sql = self.SQL_DISK_STORAGES_TEMPLATE.format(storage_clause=storage_clause)
+            user_join_params.append(cls.DISK_ENTITY_TYPE_LIKE['User'])
+            active_user_clause = (
+                " AND (s.ENTITY_TYPE NOT LIKE %s OR u.ACTIVE = 'Y')"
+            )
+            active_user_params.append(cls.DISK_ENTITY_TYPE_LIKE['User'])
+
+        entity_clause = ''
+        entity_params = []
+        if entity_types:
+            like_parts = []
+            for et in sorted(entity_types):
+                like_parts.append('s.ENTITY_TYPE LIKE %s')
+                entity_params.append(cls.DISK_ENTITY_TYPE_LIKE[et])
+            entity_clause = ' AND (' + ' OR '.join(like_parts) + ')'
+
+        storage_clause = ''
+        storage_params = []
+        if storage_filter:
+            ids = [int(x) for x in storage_filter]
+            storage_clause = ' AND s.ID IN ({})'.format(
+                ', '.join(['%s'] * len(ids))
+            )
+            storage_params.extend(ids)
+
+        params = (
+            user_join_params
+            + entity_params
+            + active_user_params
+            + storage_params
+        )
+        return {
+            'user_join': user_join,
+            'entity_clause': entity_clause,
+            'active_user_clause': active_user_clause,
+            'storage_clause': storage_clause,
+            'params': tuple(params),
+        }
+
+    def get_disk_storages(self, storage_filter=None, entity_types=None,
+                          active_users_only=False):
+        fragments = self._build_disk_storage_filters(
+            storage_filter=storage_filter,
+            entity_types=entity_types,
+            active_users_only=active_users_only,
+        )
+        params = fragments.pop('params')
+        sql = self.SQL_DISK_STORAGES_TEMPLATE.format(**fragments)
         return self._execute(sql, params if params else None)
 
     def get_disk_objects(self, storage_id, include_trashed=False):

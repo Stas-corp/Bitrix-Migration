@@ -33,11 +33,14 @@ class DiskLoader(BaseLoader):
     batch_size = 200
 
     def __init__(self, env, extractor, local_root, storage_filter=None,
-                 include_trashed=False, log_callback=None):
+                 include_trashed=False, entity_types=None,
+                 active_users_only=False, log_callback=None):
         super().__init__(env, extractor, log_callback=log_callback)
         self.local_root = local_root
         self.storage_filter = storage_filter
         self.include_trashed = include_trashed
+        self.entity_types = entity_types
+        self.active_users_only = active_users_only
         self._folder_id_by_bid = {}
         self._admin_user_id = None
 
@@ -53,7 +56,11 @@ class DiskLoader(BaseLoader):
                 'odoo_document_management_cloud_sync must be installed.'
             )
         root = self._ensure_root_folder()
-        storages = self.extractor.get_disk_storages(self.storage_filter)
+        storages = self.extractor.get_disk_storages(
+            storage_filter=self.storage_filter,
+            entity_types=self.entity_types,
+            active_users_only=self.active_users_only,
+        )
         self.log(f'Disk storages to import: {len(storages)}')
         for raw_storage in storages:
             try:

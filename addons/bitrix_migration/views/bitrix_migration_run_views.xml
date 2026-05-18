@@ -176,6 +176,24 @@
                                     <field name="disk_include_trashed"/>
                                 </group>
                             </group>
+                            <group string="Storage filter">
+                                <group>
+                                    <field name="disk_include_user"/>
+                                    <field name="disk_include_common"/>
+                                    <field name="disk_include_group"/>
+                                </group>
+                                <group>
+                                    <field name="disk_include_im"/>
+                                    <field name="disk_active_users_only"/>
+                                </group>
+                            </group>
+                            <div class="text-muted" style="margin-top:4px;">
+                                <small>
+                                    Чекбокси та CSV-фільтр комбінуються через AND:
+                                    спочатку відбираються типи storage, потім —
+                                    конкретні ID, якщо вказані.
+                                </small>
+                            </div>
                         </page>
                         <page string="Log Output">
                             <field name="log_output" readonly="1"

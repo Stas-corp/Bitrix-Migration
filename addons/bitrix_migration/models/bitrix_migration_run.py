@@ -107,6 +107,34 @@ class BitrixMigrationRun(models.Model):
         default=False,
         help='За замовч.: пропускати корзину Bitrix.',
     )
+    disk_include_user = fields.Boolean(
+        string='Include User storages',
+        default=True,
+        help='Особисті диски співробітників (Bitrix\\Disk\\ProxyType\\User).',
+    )
+    disk_include_common = fields.Boolean(
+        string='Include Common storage',
+        default=True,
+        help='Корпоративний загальний диск (Bitrix\\Disk\\ProxyType\\Common).',
+    )
+    disk_include_group = fields.Boolean(
+        string='Include Group storages',
+        default=True,
+        help='Диски робочих груп / проєктів (Bitrix\\Disk\\ProxyType\\Group).',
+    )
+    disk_include_im = fields.Boolean(
+        string='Include IM/Mail/Other',
+        default=False,
+        help='Службові диски: IM (чат), Mail (поштові вкладення), DocumentGenerator '
+             '(згенеровані документи CRM), CRM Integration. За замовчуванням '
+             'пропускаються.',
+    )
+    disk_active_users_only = fields.Boolean(
+        string='Active Users Only',
+        default=True,
+        help='Для User-storage імпортувати лише власників із b_user.ACTIVE=Y. '
+             'Пропускає диски звільнених співробітників.',
+    )
 
     # Options
     preserve_authorship = fields.Boolean(
@@ -1317,9 +1345,25 @@ class BitrixMigrationRun(models.Model):
                     f'Disk Storage IDs must be a comma-separated list of integers: {e}'
                 )
 
+        entity_types = set()
+        if self.disk_include_user:
+            entity_types.add('User')
+        if self.disk_include_common:
+            entity_types.add('Common')
+        if self.disk_include_group:
+            entity_types.add('Group')
+        if self.disk_include_im:
+            entity_types.update({'IM', 'Mail', 'Doc', 'Crm'})
+        if not entity_types:
+            raise UserError(
+                'Виберіть хоча б один тип storage (User / Common / Group / IM).'
+            )
+
         self._append_log('\n--- Bitrix Disk → Documents ---')
+        self._append_log(f'Entity types: {sorted(entity_types)}')
+        self._append_log(f'Active users only: {self.disk_active_users_only}')
         if storage_filter:
-            self._append_log(f'Storage filter: {storage_filter}')
+            self._append_log(f'Storage CSV filter: {storage_filter}')
         if self.disk_include_trashed:
             self._append_log('Including trashed (DELETED_TYPE != 0)')
 
@@ -1329,6 +1373,8 @@ class BitrixMigrationRun(models.Model):
             local_root=self.disk_local_root,
             storage_filter=storage_filter,
             include_trashed=self.disk_include_trashed,
+            entity_types=entity_types,
+            active_users_only=self.disk_active_users_only,
             log_callback=self._append_log,
         )
         loader.run()
