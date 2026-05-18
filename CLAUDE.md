@@ -115,11 +115,15 @@ docker compose exec odoo odoo --test-enable -d odoo -u bitrix_migration --stop-a
 | `comments` | Только комментарии |
 | `single_task` | Одна задача по `single_task_bitrix_id` |
 | `hr` | Отделы + сотрудники |
-| `departments_only` | Только отделы |
-| `employees_only` | Только сотрудники |
+| `archive_employees` | Архивирование уволенных сотрудников |
 | `fix_roles` | Пересинхронизация ролей у уже импортированных задач |
 | `fix_attachments` | Repair: перелінковка comment attachments з `project.task` на `mail.message` |
+| `fix_descriptions` | Восстановление пустых описаний задач из Bitrix DISK FILE placeholders |
+| `fix_hierarchy` | Пересчёт `hr.employee.parent_id` по Bitrix UF_HEAD |
 | `meetings` | Только зустрічі (calendar.event) |
+| `disk` | Bitrix Disk → Odoo Documents |
+
+> `departments_only` / `employees_only` / `purge_noise` убраны из Selection (2026-05-19). Чистка «noise»-аккаунтов выполняется только через кнопки **Purge Noise — Preview/Apply** в Danger Zone; отдельный импорт подразделений или сотрудников запускается комбинированным режимом `hr` (двухпроходный загрузчик уже обрабатывает каждую часть идемпотентно).
 
 ### Создание пользователей
 После импорта сотрудников — кнопки на форме `BitrixMigrationRun`:
@@ -127,6 +131,17 @@ docker compose exec odoo odoo --test-enable -d odoo -u bitrix_migration --stop-a
 2. **Create Test Employee User** — один сотрудник из `test_employee_id`
 3. **Send Password Reset** — рассылка писем сброса пароля
 4. **Purge Imported Data** / **Purge HR Data** — удалить всё импортированное (с подтверждением)
+
+### Danger Zone (форма `bitrix.migration.run`)
+
+Деструктивные операции, все с подтверждением и логированием:
+
+| Кнопка | Что делает |
+|---|---|
+| **Purge Imported Data** | Удаляет мигрированные сущности (проекты, задачи, стадии, комментарии, встречи, вкладення, теги) + mappings + checkpoints. HR не трогается. |
+| **Purge HR Data** | Удаляет employees + departments + связанные res.users / res.partner. Защищённые / всё ещё связанные SKIP в лог. |
+| **Purge Noise — Preview/Apply** | Двухшаговая чистка мусорных аккаунтов из Bitrix без `UF_DEPARTMENT` (imconnector_*, боты, B24 Network guests). Reassign `mail.message.author_id` на OdooBot. |
+| **Purge Orphan Contacts — Preview/Apply** | Удаляет `res.partner` без привязки к `hr.employee` (active/archived). Перед `unlink()` ссылки из `mail.message.author_id` переписываются на OdooBot (`base.partner_root`), `mail.followers` / `calendar.event.partner_ids` / `calendar.attendee` — удаляются. Защищены: компании, `base.partner_root` / `base.public_partner` / `base.main_partner`, internal users (`share=False`), active users, шаблоны (login в `default`, `__system__`, `public`, `portaltemplate`, `portal_template`), родительские контакты (`child_ids`). Active portal-юзеры дополнительно защищены native Odoo-проверкой → SKIP. |
 
 ### DTO (dto.py)
 Pydantic v2. Все поля валидируются через `field_validator`. Ноль / пустая строка / 'NULL' → `None` через `_clean_str()` и `_to_int_or_none()`. PHP-сериализованные массивы (`a:N:{...}`) парсит `parse_php_int_array()`.

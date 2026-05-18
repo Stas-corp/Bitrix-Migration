@@ -1,5 +1,167 @@
 # CHANGELOG
 
+## 2026-05-19 — Убраны устаревшие режимы из mode Selection (`departments_only`, `employees_only`, `purge_noise`)
+
+Три варианта `mode` устарели и дублировали другой функционал — мешали в выпадающем списке формы `bitrix.migration.run`:
+
+- **`departments_only`** и **`employees_only`** — пользы от них нет, потому что комбинированный режим `hr` (`_run_hr_combined`) делает обе части идемпотентно за один проход. Прицельный перезапуск отдельной части ни разу не понадобился.
+- **`purge_noise`** — дублировал кнопки **Purge Noise — Preview/Apply** в Danger Zone, причём ветка `action_run` запускала Apply без предварительного Preview (опасно).
+
+### Решение
+
+Удалены варианты из `mode` Selection и из диспетчера `action_run`. Сами загрузчики/методы оставлены — они переиспользуются:
+
+- `_run_departments_only` / `_run_employees_only` — продолжают вызываться из `_run_hr_combined` для режима `hr`.
+- `_run_purge_noise` + `EmployeeLoader.purge_noise_accounts()` — продолжают вызываться из `action_purge_noise_preview` / `action_purge_noise_apply` в Danger Zone.
+
+### Изменения
+
+| Файл | Изменение | Причина |
+|---|---|---|
+| `addons/bitrix_migration/models/bitrix_migration_run.py` | Удалены три `('…', '…')` из Selection `mode`; удалены `'departments_only'`, `'employees_only'` из `_visible_modes`; убраны три `elif self.mode == …` ветки в `action_run` | Чистка устаревших режимов |
+| `addons/bitrix_migration/views/bitrix_migration_run_views.xml` | В info-блоке режима оставлен только `mode != 'hr'` (раньше показывался для трёх HR-модов с описанием каждого); поправлены `invisible="mode in (...)"` для `migration_date_from` / `fallback_project_id`; в Help-блоке удалены строки «HR: Departments Only» / «HR: Employees Only» и упоминание «потрібний HR-режим» в quick-start | Удалить ссылки на исчезнувшие значения mode |
+| `CLAUDE.md` | Таблица режимов: убраны `departments_only` / `employees_only`, добавлены отсутствовавшие `archive_employees`, `fix_descriptions`, `fix_hierarchy`, `disk` + примечание о Purge Noise в Danger Zone | Синхронизация с реальным набором режимов |
+
+### Verification
+
+`docker compose run --rm odoo odoo -d odoo -u bitrix_migration --stop-after-init` — Odoo при обновлении сам удалил три записи `ir.model.fields.selection` (`__mode__purge_noise`, `__mode__employees_only`, `__mode__departments_only`) и связанные `ir.model.data`. Существующая запись с `mode='full'` не задета (никто не использовал удалённые значения).
+
+`odoo shell`: после reload `bitrix.migration.run._fields['mode'].selection` содержит 9 значений (`hr`, `archive_employees`, `full`, `meetings`, `fix_roles`, `fix_attachments`, `fix_descriptions`, `fix_hierarchy`, `disk`); `_visible_modes` — тот же набор без `archive_employees`-обвязки.
+
+UI: на вкладке Danger Zone группа **Noise Accounts** с кнопками Purge Noise — Preview/Apply на месте и работает — функционал не потерян, только убран дублирующий запуск через mode.
+
+### Что попадает в git
+
+- `addons/bitrix_migration/models/bitrix_migration_run.py` — чистка `mode` / `_visible_modes` / `action_run`
+- `addons/bitrix_migration/views/bitrix_migration_run_views.xml` — info-блок, invisible, Help
+- `CLAUDE.md` — таблица режимов
+- `CHANGELOG.md` — эта запись
+
+---
+
+## 2026-05-19 — Danger Zone: Purge Orphan Contacts (удаление `res.partner` без привязки к `hr.employee`)
+
+После HR-миграции и ручных правок в `res.partner` накапливаются «осиротевшие» карточки — контакты, которые не привязаны ни к одному сотруднику и захламляют справочник. Существующие операции в Danger Zone (`Purge Imported Data`, `Purge HR Data`, `Purge Noise`) их не убирают.
+
+### Решение
+
+Добавлена группа **Orphan Contacts** на вкладке Danger Zone формы `bitrix.migration.run` с парой кнопок **Preview / Apply** (по образцу Purge Noise).
+
+Логика отбора кандидатов на удаление в `_collect_orphan_partner_candidates`:
+
+- **Кандидат**: любой `res.partner` (включая `active=False`), у которого **нет** связи с `hr.employee` через `work_contact_id` / `address_home_id` / `user_id.partner_id` (active и archived employees).
+- **Защищены** (исключены из выборки):
+  - все `res.company.partner_id`
+  - xmlid `base.partner_root`, `base.public_partner`, `base.main_partner` (xmlid `base.default_user` в Odoo 19 отсутствует — заменён списком login'ов)
+  - `res.users.partner_id` с `share=False` (внутренние Odoo-юзеры: admin, бухгалтерия и т. п.)
+  - `res.users.partner_id` с `active=True` (любой active user)
+  - `res.users.partner_id` с login в `('default', '__system__', 'public', 'portaltemplate', 'portal_template')` — системные шаблоны
+  - партнёры с непустым `child_ids` — родительские карточки (иерархия не ломается)
+
+Перед `partner.unlink()` выполняется `_reassign_partner_references(partner, fallback)` — иначе FK / Odoo-валидаторы блокируют удаление:
+
+| Источник ссылки | Действие |
+|---|---|
+| `mail.message.author_id` | переводится на `base.partner_root` (OdooBot) |
+| `mail.followers.partner_id` | follower-запись удаляется |
+| `calendar.event.partner_ids` | удаляется из M2M (`(3, partner_id)`) |
+| `calendar.attendee.partner_id` | attendee-запись удаляется |
+| native «cannot delete contact linked to active user» | ловится try/except → SKIP с причиной в логе |
+
+Active portal-юзеры сохраняются автоматически: native Odoo-проверка в `res.partner.unlink()` отрабатывает раньше нашего кода и попадает в общий SKIP-блок с понятной диагностикой.
+
+### Изменения
+
+| Файл | Изменение | Причина |
+|---|---|---|
+| `addons/bitrix_migration/models/bitrix_migration_run.py` | Новые методы `_collect_orphan_partner_candidates`, `_reassign_partner_references`, `_run_purge_orphan_partners`, `action_purge_orphan_partners_preview`, `action_purge_orphan_partners_apply` | Сбор кандидатов с защитой системных partner'ов + reassign ссылок перед unlink |
+| `addons/bitrix_migration/views/bitrix_migration_run_views.xml` | Новая `<group string="Orphan Contacts">` в Danger Zone с парой кнопок Preview/Apply и confirm-сообщением | UI-точка входа |
+
+### Verification
+
+Smoke-test через `odoo shell` в контейнере (`docker compose run --rm odoo odoo shell -d odoo --no-http --stop-after-init`):
+
+1. **Чистая БД (5 системных партнёров)** → Preview: `Found 0 candidate partners` — все системные защищены.
+2. **Создан plain orphan + partner-автор `mail.message`** → Preview: `Found 2`. Apply: `deleted=2, skipped=0`, `mail.message.author_id` переписан на `base.partner_root` (id=2 в этой БД).
+3. **Создан partner с active portal-user** → попадает в кандидаты, при Apply ловится Odoo native check → SKIP с причиной `You cannot delete contacts linked to an active user`, контакт остаётся.
+4. **Системные** (My Company, OdooBot, Administrator, Public user, Portal User Template) сохраняются после Apply.
+5. **Internal admin** (`base.user_admin`, `share=False`) защищён через ветку internal-users, даже если у него нет employee.
+
+### Что попадает в git
+
+- `addons/bitrix_migration/models/bitrix_migration_run.py` — методы purge orphan contacts
+- `addons/bitrix_migration/views/bitrix_migration_run_views.xml` — группа Orphan Contacts
+- `CLAUDE.md` — упоминание новой операции в разделе Danger Zone
+- `CHANGELOG.md` — эта запись
+
+---
+
+## 2026-05-18 — Фикс UnicodeEncodeError при скачивании DMS-файлов с кириллическим именем (bridge-модуль `dms_access_fix`)
+
+На проде werkzeug падал при отдаче ответа от `/api/document/file/<id>/download` для файлов с не-ASCII именами:
+
+```
+File "/usr/lib/python3.12/http/server.py", line 526, in send_header
+    ("%s: %s\r\n" % (keyword, value)).encode('latin-1', 'strict'))
+UnicodeEncodeError: 'latin-1' codec can't encode characters in position 43-49
+```
+
+В логе виден `200 OK`, но клиенту байты не доезжают: HTTP-заголовки обязаны кодироваться в Latin-1 (RFC 7230), а вендорский контроллер `odoo_document_management_cloud_sync` подставляет имя файла прямо в `Content-Disposition`:
+
+```python
+# odoo_document_management_cloud_sync/controllers/document_api.py:829
+('Content-Disposition', f'attachment; filename="{file_data["name"]}"')
+```
+
+У файлов, импортированных из Bitrix, имена в основном кириллические — заголовок ломает Latin-1 в werkzeug. Та же проблема в `/api/document/file/<id>/view` (3 ветки) и в `/document/download/<token>` (публичные шары).
+
+### Решение
+
+RFC 5987 / RFC 6266: к `filename=` добавляется ASCII-fallback, а оригинальное имя кладётся в `filename*=UTF-8''<percent-encoded>`. Все современные браузеры используют `filename*` и сохраняют файл с корректным именем; werkzeug сериализует только ASCII-байты, Latin-1 проходит.
+
+Фикс положен в существующий bridge-модуль `dms_access_fix` (`auto_install: True`, `depends: ['odoo_document_management_cloud_sync']`) — вендорский код не трогается. Реализация — пост-процессинг готового `Response` через override методов через `super()`: вся логика учёта скачиваний / `log_activity` / mimetype остаётся в вендоре, bridge только переписывает один заголовок. Если оригинал когда-нибудь починит баг сам — `_patch_disposition` проверит, валиден ли уже заголовок в Latin-1, и пропустит работу (no-op).
+
+### Изменения
+
+| Файл | Изменение | Причина |
+|---|---|---|
+| `addons/dms_access_fix/controllers/__init__.py` (новый) | `from . import disposition_fix` | Регистрация пакета контроллеров |
+| `addons/dms_access_fix/controllers/disposition_fix.py` (новый) | Хелперы `_rfc5987(name, disposition)` и `_patch_disposition(response)`; классы `DocumentAPIControllerPatched` (override `download_file`, `view_file`) и `DocumentManagementControllerPatched` (override `document_download`) | Переписывают `Content-Disposition` на RFC 5987 для всех трёх маршрутов выдачи файлов |
+| `addons/dms_access_fix/__init__.py` | Добавлен `from . import controllers` | Подхват пакета при загрузке модуля |
+
+### Verification на `stage-odoo-odoo-1`
+
+1. `rsync` модуля в `stage-odoo/addons/dms_access_fix/`, `docker exec stage-odoo-odoo-1 odoo -d odoo -u dms_access_fix --stop-after-init` → `Modules loaded`, ошибок нет.
+2. Перезапуск контейнера → `Registry loaded`, `routing map generated`, бус живой.
+3. Импорт классов: `DocumentAPIControllerPatched` и `DocumentManagementControllerPatched` действительно наследуют вендорские базовые контроллеры.
+4. `_rfc5987('Регламент работы.docx')` → `attachment; filename="_________ ______.docx"; filename*=UTF-8''%D0%A0%D0%B5%D0%B3%D0%BB%D0%B0%D0%BC%D0%B5%D0%BD%D1%82%20%D1%80%D0%B0%D0%B1%D0%BE%D1%82%D1%8B.docx` — `.encode('latin-1')` проходит без ошибок.
+5. `_patch_disposition` на «битом» заголовке (`filename="Регламент.docx"`) выдаёт latin-1-safe строку; на уже-безопасном (`filename="ok.txt"`) — no-op.
+
+### Что НЕ трогаем
+
+- `document_main.py:92` (`document_preview`) — заголовок `'inline'` без имени.
+- `document_api.py:1488` (`audit_log.csv`) — имя ASCII.
+- ZIP-скачка папок (`document_api.py:637`) — имя `document_files_<timestamp>.zip` ASCII.
+
+### Деплой на прод
+
+```bash
+git pull
+docker exec <prod-container> odoo --stop-after-init -u dms_access_fix -d <db>
+docker restart <prod-container>
+```
+
+`auto_install: True` уже стоит; повторная установка не требуется.
+
+### Что попадает в git
+
+- `addons/dms_access_fix/controllers/__init__.py` (новый)
+- `addons/dms_access_fix/controllers/disposition_fix.py` (новый)
+- `addons/dms_access_fix/__init__.py` — `from . import controllers`
+- `CHANGELOG.md` — эта запись
+
+---
+
 ## 2026-05-18 — Удалены 16 нерабочих baseline-тестов (Odoo 19 запретил `cr.commit()` в TransactionCase)
 
 Тесты создавали loader-ы напрямую (`DepartmentLoader(...)`, `EmployeeLoader(...)`) и вызывали `run()`, который внутри делает `commit_checkpoint() → self.env.cr.commit()`. В Odoo 19 это завершается `AssertionError: Cannot commit or rollback a cursor from inside a test`. Тесты были нерабочими в текущем виде ещё до сегодняшних правок (проверено `git stash` + прогон).

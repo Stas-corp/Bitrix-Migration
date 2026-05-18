@@ -17,8 +17,6 @@ class BitrixMigrationRun(models.Model):
     _attachment_sync_types = ('task', 'comment', 'meeting', 'meeting_comment')
     _visible_modes = {
         'hr',
-        'departments_only',
-        'employees_only',
         'archive_employees',
         'full',
         'meetings',
@@ -31,10 +29,7 @@ class BitrixMigrationRun(models.Model):
 
     mode = fields.Selection([
         ('hr', 'HR: Departments + Employees'),
-        ('departments_only', 'HR: Departments Only'),
-        ('employees_only', 'HR: Employees Only'),
         ('archive_employees', 'HR: Archive Fired Employees'),
-        ('purge_noise', 'HR: Purge Noise Accounts (imconnector_*, bots, ...)'),
         ('full', 'Full Migration'),
         ('meetings', 'Meetings Only'),
         ('fix_roles', 'Fix Roles (re-sync task roles)'),
@@ -287,14 +282,8 @@ class BitrixMigrationRun(models.Model):
                 self._run_comments(extractor)
             elif self.mode == 'hr':
                 self._run_hr(extractor)
-            elif self.mode == 'departments_only':
-                self._run_departments_only(extractor)
-            elif self.mode == 'employees_only':
-                self._run_employees_only(extractor)
             elif self.mode == 'archive_employees':
                 self._run_archive_employees(extractor)
-            elif self.mode == 'purge_noise':
-                self._run_purge_noise(extractor, dry_run=False)
             elif self.mode == 'fix_roles':
                 self._run_fix_roles(extractor)
             elif self.mode == 'fix_attachments':
@@ -2902,6 +2891,194 @@ class BitrixMigrationRun(models.Model):
         finally:
             if extractor is not None:
                 extractor.close()
+            self.env.cr.commit()
+
+    def _collect_orphan_partner_candidates(self):
+        """Return res.partner recordset of contacts not linked to any hr.employee.
+
+        Protected partners (kept regardless of employee link):
+          * hr.employee (work_contact_id / address_home_id / user_id.partner_id)
+          * res.company.partner_id
+          * base.partner_root, base.public_partner, base.default_user.partner_id,
+            base.main_partner xmlids (system partners)
+          * res.users.partner_id where share=False (internal Odoo users such as
+            Administrator, accountants without HR cards)
+          * Partners that act as parent of other contacts (child_ids) — to keep
+            hierarchy intact
+        """
+        Partner = self.env['res.partner'].sudo().with_context(active_test=False)
+        Users = self.env['res.users'].sudo().with_context(active_test=False)
+        Employee = self.env['hr.employee'].sudo().with_context(active_test=False)
+        Company = self.env['res.company'].sudo()
+
+        protected_ids = set()
+
+        emp_fields = Employee._fields
+        if 'work_contact_id' in emp_fields:
+            ids = Employee.search([('work_contact_id', '!=', False)]).mapped('work_contact_id').ids
+            protected_ids.update(ids)
+        if 'address_home_id' in emp_fields:
+            ids = Employee.search([('address_home_id', '!=', False)]).mapped('address_home_id').ids
+            protected_ids.update(ids)
+        emp_user_partner_ids = Employee.search([('user_id', '!=', False)]).mapped('user_id.partner_id').ids
+        protected_ids.update(emp_user_partner_ids)
+
+        company_partner_ids = Company.search([]).mapped('partner_id').ids
+        protected_ids.update(company_partner_ids)
+
+        for xmlid in ('base.partner_root', 'base.public_partner', 'base.main_partner'):
+            rec = self.env.ref(xmlid, raise_if_not_found=False)
+            if rec:
+                protected_ids.add(rec.id)
+
+        internal_user_partner_ids = Users.search([('share', '=', False)]).mapped('partner_id').ids
+        protected_ids.update(internal_user_partner_ids)
+
+        active_user_partner_ids = Users.search([('active', '=', True)]).mapped('partner_id').ids
+        protected_ids.update(active_user_partner_ids)
+
+        template_logins = ('default', '__system__', 'public', 'portaltemplate', 'portal_template')
+        template_users = Users.search([('login', 'in', template_logins)])
+        protected_ids.update(template_users.mapped('partner_id').ids)
+
+        parents_with_children = Partner.search([('child_ids', '!=', False)]).ids
+        protected_ids.update(parents_with_children)
+
+        domain = [('id', 'not in', list(protected_ids))]
+        return Partner.search(domain, order='id asc')
+
+    def _reassign_partner_references(self, partner, fallback_partner):
+        """Move/clear references that would block partner.unlink().
+
+        Returns a dict {model: count} of what was reassigned/removed."""
+        stats = {}
+
+        Msg = self.env['mail.message'].sudo()
+        msgs = Msg.search([('author_id', '=', partner.id)])
+        if msgs:
+            msgs.write({'author_id': fallback_partner.id})
+            stats['mail.message'] = len(msgs)
+
+        Followers = self.env['mail.followers'].sudo()
+        followers = Followers.search([('partner_id', '=', partner.id)])
+        if followers:
+            count = len(followers)
+            followers.unlink()
+            stats['mail.followers'] = count
+
+        CalendarEvent = self.env.get('calendar.event')
+        if CalendarEvent is not None:
+            events = CalendarEvent.sudo().with_context(active_test=False).search(
+                [('partner_ids', 'in', partner.id)]
+            )
+            if events:
+                events.write({'partner_ids': [(3, partner.id)]})
+                stats['calendar.event'] = len(events)
+
+        CalendarAttendee = self.env.get('calendar.attendee')
+        if CalendarAttendee is not None:
+            attendees = CalendarAttendee.sudo().search([('partner_id', '=', partner.id)])
+            if attendees:
+                count = len(attendees)
+                attendees.unlink()
+                stats['calendar.attendee'] = count
+
+        return stats
+
+    def _run_purge_orphan_partners(self, dry_run):
+        Partner = self.env['res.partner'].sudo().with_context(active_test=False)
+        fallback = self.env.ref('base.partner_root', raise_if_not_found=False)
+        if not dry_run and not fallback:
+            raise UserError("base.partner_root not found; cannot reassign references")
+
+        candidates = self._collect_orphan_partner_candidates()
+        total = len(candidates)
+        self._append_log(f'Found {total} candidate partners without linked employee')
+
+        would_delete = 0
+        deleted = 0
+        skipped = 0
+        batch_size = 200
+
+        for start in range(0, total, batch_size):
+            batch_ids = candidates.ids[start:start + batch_size]
+            batch = Partner.browse(batch_ids).exists()
+
+            for partner in batch:
+                if dry_run:
+                    would_delete += 1
+                    continue
+
+                try:
+                    stats = self._reassign_partner_references(partner, fallback)
+                    if stats:
+                        parts = ', '.join(f'{k}={v}' for k, v in stats.items())
+                        self._append_log(
+                            f'Reassigned partner id={partner.id} name={partner.display_name}: {parts}'
+                        )
+                    partner.unlink()
+                    deleted += 1
+                    if deleted % 50 == 0:
+                        self._append_log(f'Purged partners: {deleted}')
+                except Exception as e:
+                    self.env.cr.rollback()
+                    skipped += 1
+                    self._append_log(
+                        f'SKIP partner id={partner.id} name={partner.display_name}: {e}'
+                    )
+                self.env.cr.commit()
+
+            if total:
+                self.progress = min(95.0, (start + len(batch_ids)) * 95.0 / total)
+            self.env.cr.commit()
+
+        if dry_run:
+            self._append_log(f'would_delete={would_delete}')
+        else:
+            if deleted and deleted % 50:
+                self._append_log(f'Purged partners: {deleted}')
+            self._append_log(f'deleted={deleted}, skipped={skipped}')
+
+    def action_purge_orphan_partners_preview(self):
+        """Dry-run preview: report how many orphan res.partner records would be purged."""
+        self.ensure_one()
+        self.state = 'running'
+        self.log_output = '=== Purge Orphan Contacts PREVIEW ==='
+        self.progress = 0.0
+        self.env.cr.commit()
+
+        try:
+            self._run_purge_orphan_partners(dry_run=True)
+            self.state = 'done'
+            self.progress = 100.0
+            self._append_log('=== Preview completed ===')
+        except Exception:
+            self.env.cr.rollback()
+            self.state = 'error'
+            self._append_log(f'=== PURGE ORPHAN PREVIEW ERROR ===\n{traceback.format_exc()}')
+            _logger.exception('Purge orphan partners preview failed')
+        finally:
+            self.env.cr.commit()
+
+    def action_purge_orphan_partners_apply(self):
+        """Apply: physically delete orphan res.partner records."""
+        self.ensure_one()
+        self.state = 'running'
+        self.log_output = '=== Purge Orphan Contacts APPLY ==='
+        self.progress = 0.0
+        self.env.cr.commit()
+
+        try:
+            self._run_purge_orphan_partners(dry_run=False)
+            self.state = 'done'
+            self.progress = 100.0
+            self._append_log('=== Purge completed ===')
+        except Exception:
+            self.env.cr.rollback()
+            self.state = 'error'
+            self._append_log(f'=== PURGE ORPHAN ERROR ===\n{traceback.format_exc()}')
+            _logger.exception('Purge orphan partners apply failed')
+        finally:
             self.env.cr.commit()
 
     def _clear_checkpoints(self):

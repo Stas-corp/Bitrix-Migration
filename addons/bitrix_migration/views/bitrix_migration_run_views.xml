@@ -46,32 +46,22 @@
                     <group>
                         <group string="Migration Mode">
                             <field name="mode"/>
-                            <group invisible="mode not in ('hr', 'departments_only', 'employees_only')"
+                            <group invisible="mode != 'hr'"
                                    colspan="2">
                                 <div class="alert alert-info" role="alert">
-                                    <strong>HR режими:</strong>
-                                    <p style="margin:8px 0 4px 0;">
-                                        <b>Departments Only</b> — створює ієрархію підрозділів
-                                        hr.department; керівники підтягнуться, якщо співробітники вже є.
-                                    </p>
-                                    <p style="margin:0 0 4px 0;">
-                                        <b>Employees Only</b> — створює hr.employee
-                                        (підрозділи мають бути імпортовані раніше).
-                                    </p>
-                                    <p style="margin:0;">
-                                        <b>Departments + Employees</b> — запускає обидва кроки
-                                        в правильному порядку.
-                                    </p>
+                                    <strong>HR: Departments + Employees</strong> — імпортує ієрархію
+                                    підрозділів hr.department, далі співробітників hr.employee і
+                                    прив'язує керівників.
                                 </div>
                             </group>
                         </group>
                         <group string="Options">
                             <field name="preserve_authorship"/>
                             <field name="migration_date_from"
-                                   invisible="mode in ('hr', 'departments_only', 'employees_only', 'fix_roles', 'fix_attachments')"/>
+                                   invisible="mode in ('hr', 'fix_roles', 'fix_attachments')"/>
                             <field name="fallback_project_id"
                                    options="{'no_create_edit': True}"
-                                   invisible="mode in ('hr', 'departments_only', 'employees_only', 'fix_roles', 'fix_attachments', 'fix_descriptions')"
+                                   invisible="mode in ('hr', 'fix_roles', 'fix_attachments', 'fix_descriptions')"
                                    placeholder="Auto-created if empty"/>
                             <field name="test_employee_id"
                                    options="{'no_create': True, 'no_open': True}"
@@ -247,6 +237,21 @@
                                         to see what would be deleted, then Apply.
                                     </p>
                                 </group>
+                                <group string="Orphan Contacts">
+                                    <button name="action_purge_orphan_partners_preview" string="Purge Orphan Contacts — Preview"
+                                            type="object" class="btn-secondary"
+                                            invisible="state == 'running'"/>
+                                    <button name="action_purge_orphan_partners_apply" string="Purge Orphan Contacts — Apply"
+                                            type="object" class="btn-danger"
+                                            invisible="state == 'running'"
+                                            confirm="This permanently deletes res.partner records not linked to any hr.employee (active or archived). References from mail messages, followers, and calendar events are reassigned to OdooBot before deletion. System partners (companies, OdooBot, public/portal users, internal Odoo users, parent contacts) are protected. Continue?"/>
+                                    <p class="text-muted">
+                                        Removes res.partner records that have no link to any hr.employee
+                                        (active or archived). Message authors are reassigned to OdooBot;
+                                        followers and calendar links are removed. System and internal
+                                        Odoo user partners are protected. Run Preview first.
+                                    </p>
+                                </group>
                             </group>
                         </page>
                         <page string="Help">
@@ -255,7 +260,7 @@
                                     <strong>Швидкий сценарій запуску</strong>
                                     <ol style="margin:8px 0 0 18px;">
                                         <li>Заповніть MySQL Connection, а для вкладень або фото — налаштування Files &amp; Avatars.</li>
-                                        <li>Для HR-міграції спочатку оберіть <b>HR: Departments + Employees</b> або потрібний HR-режим.</li>
+                                        <li>Для HR-міграції оберіть <b>HR: Departments + Employees</b>.</li>
                                         <li>Для задач, проєктів, коментарів і вкладень використовуйте <b>Full Migration</b>.</li>
                                         <li>Виконайте <b>Create Employee Users</b> і <b>Send Password Reset</b> для створення користувачів співробітникам.</li>
                                         <li><b>Purge HR Data</b> використовуйте лише для повного очищення всіх співробітників, підрозділів і повʼязаних employee users/contacts.</li>
@@ -265,8 +270,6 @@
                                 <h4 style="margin:0 0 8px 0;">Режими</h4>
                                 <ul class="text-muted" style="margin:0 0 16px 18px;">
                                     <li><b>HR: Departments + Employees</b> — спочатку імпортує підрозділи, потім співробітників і їх фото.</li>
-                                    <li><b>HR: Departments Only</b> — тільки структура підрозділів і керівники.</li>
-                                    <li><b>HR: Employees Only</b> — тільки співробітники (після імпорту підрозділів).</li>
                                     <li><b>Full Migration</b> — повна міграція користувачів, проєктів, задач, коментарів і вкладень.</li>
                                     <li><b>Meetings Only</b> — імпортує зустрічі, їх коментарі та вкладення.</li>
                                     <li><b>Fix Roles</b> — повторна синхронізація ролей учасників задач.</li>
