@@ -33,6 +33,7 @@ class BitrixMigrationRun(models.Model):
         ('departments_only', 'HR: Departments Only'),
         ('employees_only', 'HR: Employees Only'),
         ('archive_employees', 'HR: Archive Fired Employees'),
+        ('purge_noise', 'HR: Purge Noise Accounts (imconnector_*, bots, ...)'),
         ('full', 'Full Migration'),
         ('meetings', 'Meetings Only'),
         ('fix_roles', 'Fix Roles (re-sync task roles)'),
@@ -262,6 +263,8 @@ class BitrixMigrationRun(models.Model):
                 self._run_employees_only(extractor)
             elif self.mode == 'archive_employees':
                 self._run_archive_employees(extractor)
+            elif self.mode == 'purge_noise':
+                self._run_purge_noise(extractor, dry_run=False)
             elif self.mode == 'fix_roles':
                 self._run_fix_roles(extractor)
             elif self.mode == 'fix_attachments':
@@ -1051,6 +1054,19 @@ class BitrixMigrationRun(models.Model):
         )
         emp_loader.archive_fired()
 
+    def _run_purge_noise(self, extractor, dry_run=False):
+        """Delete hr.employee imported by mistake (non-employee Bitrix users)."""
+        from ..services.loaders.employees import EmployeeLoader
+
+        label = 'PREVIEW' if dry_run else 'APPLY'
+        self._append_log(f'\n--- Purge Noise Accounts ({label}) ---')
+        emp_loader = EmployeeLoader(
+            self.env, extractor,
+            dry_run=dry_run,
+            log_callback=self._append_log,
+        )
+        emp_loader.purge_noise_accounts()
+
     def _run_department_manager_sync(self, extractor):
         """Backfill hr.department.manager_id from Bitrix UF_HEAD."""
         from ..services.loaders.departments import DepartmentLoader
@@ -1586,6 +1602,11 @@ class BitrixMigrationRun(models.Model):
                 [('x_bitrix_id', '!=', 0)]),
             'Employees': self.env['hr.employee'].sudo().with_context(active_test=False).search_count(
                 [('x_bitrix_id', '!=', 0)]),
+            'Employees (active)': self.env['hr.employee'].sudo().search_count(
+                [('x_bitrix_id', '!=', 0)]),
+            'Employees (fired)': self.env['hr.employee'].sudo().with_context(
+                active_test=False,
+            ).search_count([('x_bitrix_id', '!=', 0), ('active', '=', False)]),
         }
         if self.fallback_project_id:
             checks['Tasks in fallback project'] = self.env['project.task'].sudo().with_context(
@@ -1622,6 +1643,23 @@ class BitrixMigrationRun(models.Model):
         """, (bitrix_task_ids,))
         multi_responsible = len(self.env.cr.fetchall())
         self._append_log(f'  Tasks with >1 responsible: {multi_responsible}')
+
+        # Tasks whose canonical responsible is a fired (archived) employee
+        if bitrix_task_ids:
+            self.env.cr.execute("""
+                SELECT COUNT(DISTINCT l.task_id)
+                FROM bitrix_task_employee_link l
+                JOIN hr_employee e ON e.id = l.employee_id
+                WHERE l.role = 'responsible'
+                  AND l.task_id = ANY(%s)
+                  AND e.active = FALSE
+            """, (bitrix_task_ids,))
+            tasks_with_fired_responsible = self.env.cr.fetchone()[0]
+        else:
+            tasks_with_fired_responsible = 0
+        self._append_log(
+            f'  Tasks with fired responsible: {tasks_with_fired_responsible}'
+        )
 
         # Role distribution
         for role in ('responsible', 'accomplice', 'auditor', 'originator', 'creator'):
@@ -2710,6 +2748,56 @@ class BitrixMigrationRun(models.Model):
             _logger.exception('HR purge failed')
 
         self.env.cr.commit()
+
+    def action_purge_noise_preview(self):
+        """Dry-run preview: report how many noise hr.employee would be purged."""
+        self.ensure_one()
+        self.state = 'running'
+        self.log_output = '=== Purge Noise PREVIEW ==='
+        self.progress = 0.0
+        self.env.cr.commit()
+
+        extractor = None
+        try:
+            extractor = self._get_extractor()
+            self._run_purge_noise(extractor, dry_run=True)
+            self.state = 'done'
+            self.progress = 100.0
+            self._append_log('=== Preview completed ===')
+        except Exception:
+            self.env.cr.rollback()
+            self.state = 'error'
+            self._append_log(f'=== PURGE PREVIEW ERROR ===\n{traceback.format_exc()}')
+            _logger.exception('Purge noise preview failed')
+        finally:
+            if extractor is not None:
+                extractor.close()
+            self.env.cr.commit()
+
+    def action_purge_noise_apply(self):
+        """Apply: actually delete noise hr.employee records and orphan partners."""
+        self.ensure_one()
+        self.state = 'running'
+        self.log_output = '=== Purge Noise APPLY ==='
+        self.progress = 0.0
+        self.env.cr.commit()
+
+        extractor = None
+        try:
+            extractor = self._get_extractor()
+            self._run_purge_noise(extractor, dry_run=False)
+            self.state = 'done'
+            self.progress = 100.0
+            self._append_log('=== Purge completed ===')
+        except Exception:
+            self.env.cr.rollback()
+            self.state = 'error'
+            self._append_log(f'=== PURGE ERROR ===\n{traceback.format_exc()}')
+            _logger.exception('Purge noise apply failed')
+        finally:
+            if extractor is not None:
+                extractor.close()
+            self.env.cr.commit()
 
     def _clear_checkpoints(self):
         checkpoint_keys = [

@@ -1,5 +1,190 @@
 # CHANGELOG
 
+## 2026-05-18 — Фикс `UserError` при повторном импорте recurring-встреч
+
+После Round 2 от 2026-05-16 (импорт RRULE → Odoo recurrence) пользователь сегодня запустил `mode=full` повторно поверх уже импортированных встреч. В логах `stage-odoo-odoo-1`:
+
+```
+[meeting] Extracting Bitrix meetings...
+[meeting] Found 604 meetings
+ERROR Migration failed
+  File ".../bitrix_migration/services/loaders/meetings.py", line 265, in run
+    ).write(diff)
+  File ".../odoo/addons/calendar/models/calendar_event.py", line 776, in write
+    raise UserError(_('Unable to save the recurrence with "This Event"'))
+```
+
+Падал на первом же existing-record-with-recurrence — `meeting` останавливался, `meeting_comments`/`attachments`/`reconciliation` дальше не отрабатывали.
+
+### Корневая причина
+
+В `calendar.event.write` (Odoo 19, `calendar_event.py:775-776`) стоит gate:
+
+```python
+recurrence_update_setting = values.pop('recurrence_update', None)
+update_recurrence = (recurrence_update_setting in ('all_events', 'future_events')
+                    and len(self) == 1 and self.recurrence_id)
+if any(vals in self._get_recurrent_fields() for vals in values) \
+        and not (update_recurrence or values.get('recurrency')):
+    raise UserError(_('Unable to save the recurrence with "This Event"'))
+```
+
+`_get_recurrent_fields()` = `{byday, until, rrule_type, month_by, event_tz, rrule, interval, count, end_type, mon..sun, day, weekday}` — `recurrency` сама в множество не входит.
+
+В `MeetingLoader.run()` ветка «не created» делала `diff` по `_RECURRENCE_FIELDS`, включая «реккурентные» поля. Сценарий падения для **detached-master** (`recurrency=True`, `recurrence_id=NULL` — результат `calendar.recurrence._detach_events` при `BYDAY` ≠ `start.weekday()`, см. `calendar_recurrence.py:365-369`):
+
+1. `record.recurrency = True` → совпадает с `vals['recurrency']=True` → НЕ в diff.
+2. `record.recurrence_id` пуст → `_compute_recurrence` (`calendar_event.py:492-511`) для пустого `recurrence_id` подставляет дефолты (`interval=1`, без BYDAY, `end_type='forever'`, …) → `record.rrule_type / mon / until / interval` ≠ нашим `vals` → попадают в diff.
+3. `write(diff)` получает recurrent-поля **без** `recurrency=True` и **без** `recurrence_update` → gate срабатывает.
+
+Тесты в `TestMeetingRecurrenceWrite` проверяли только **create**-путь — re-write путь не был покрыт, регрессия проскочила.
+
+### Изменения
+
+| Файл | Изменение | Причина |
+|---|---|---|
+| `addons/bitrix_migration/services/loaders/meetings.py:24-34` | Новая константа `_REWRITE_FIELDS = ('name', 'description', 'start', 'stop')` — поля, безопасные для re-sync на повторном импорте | Recurrence-поля интенсивно отделены от «обычных» — миграция одноразовая, RRULE прошедших встреч не меняется |
+| `addons/bitrix_migration/services/loaders/meetings.py:249-269` | Цикл diff'а заменён с `_RECURRENCE_FIELDS` на `_REWRITE_FIELDS`. Добавлен страховочный фильтр `diff = {k: v for k, v in diff.items() if k not in calendar.event._get_recurrent_fields()}` | Recurrence-поля никогда не попадут в `write` — даже если кто-то в будущем расширит `_REWRITE_FIELDS` |
+| `addons/bitrix_migration/tests/test_meetings.py` (`TestMeetingRecurrenceWrite`) | Новый тест `test_re_import_recurring_meeting_does_not_raise` — создаёт recurring event, симулирует Odoo-detach (`UPDATE calendar_event SET recurrence_id=NULL, active=FALSE`), прогоняет `MeetingLoader.run()` повторно, ассертит `error_count=0`, `skipped_count=1` | Точечно ловит регрессию: detached-master + re-import |
+
+**Ключевое решение по «recurrence-only-at-create»**: правильное обновление активной recurrence-серии через `recurrence_update='all_events'` требует записи на `record.recurrence_id.base_event_id`. Для detached-кейса `record.recurrence_id` пуст, а `base_event_id` — другая запись (один из сгенерированных понедельников). Этот путь брittлен и не нужен: миграция одноразовая, RRULE для прошедших встреч в Bitrix не меняется. Решение — recurrence устанавливается ТОЛЬКО при первом `create`, re-imports перезаписывают только `name/description/start/stop/partner_ids`.
+
+**Ключевое решение по страховочному фильтру**: даже если будущий разработчик расширит `_REWRITE_FIELDS` recurrence-полем по ошибке, явный `diff = {k: v for k, v in diff.items() if k not in recurrence_keys}` не пустит её до `write`. Двойная защита.
+
+### Verification
+
+1. **Unit-тесты**: 21/21 meeting-тестов прошли (`TestMeetingDTO` × 5, `TestMeetingCalendarEvent` × 4, `TestBitrixRRuleConverter` × 9, `TestMeetingSQLFilter` × 1, `TestMeetingRecurrenceWrite` × 2 включая новый regression). 0 failed / 0 errors.
+2. **End-to-end на `stage-odoo`**: `action_run(mode='meetings')` через `odoo shell` завершился без `UserError`. В БД 31 503 `calendar.event` с `x_bitrix_id` (близко к 32 119 из Round 2 от 2026-05-16).
+3. **Идемпотентность recurrence**: встреча 64158 («оновлення стану задач в ІТ проекті») после re-import — 628 events, `recurrency=True`, `rrule_type='weekly'`, `mon=True`, `until=2038-01-01` — параметры серии не изменились.
+4. В логах строка `[meeting] DONE: created=…, updated=…, skipped=…, errors=…` без traceback.
+
+### Что попадает в git
+
+- `addons/bitrix_migration/services/loaders/meetings.py` — `_REWRITE_FIELDS`, переработанная re-write ветка.
+- `addons/bitrix_migration/tests/test_meetings.py` — `test_re_import_recurring_meeting_does_not_raise`.
+- `CHANGELOG.md` — эта запись.
+
+---
+
+## 2026-05-18 — Импорт уволенных сотрудников + очистка мусорных аккаунтов
+
+Задача из двух связанных частей:
+
+1. На примере уволенного **Дьякова Владислава** (Bitrix ID=200, ACTIVE='N', последний логин 2026‑04‑08): в Bitrix он participant в 8 256 задачах (1090 как R, 530 как A, 1952 как O, 5318 как U, 1952 как creator), но в Odoo `hr.employee` отсутствует — `SQL_EMPLOYEES` фильтровал `WHERE u.ACTIVE='Y'`. Все его роли терялись, `bitrix_task_employee_link.responsible` оставался пустым, поиск задач по нему был невозможен. Масштаб: 380 уволенных в Bitrix, 58 203 задач с responsible-уволенным, 101 914 задач с любой ролью уволенного.
+2. После исправления (Round 1) обнаружилось переусердствование: в Odoo попали **1783 hr_employee** + 1791 res_partner вместо ожидаемых ~605. Распределение в Bitrix `b_user`: 782 `imconnector_*` (интеграции Open Channels), 388 «human» без UF_DEPARTMENT (`imopenlines_*` гости + `*@*.bitrix24.ru` Network), 7 ботов/анонимных. Все они попали в `hr.employee` после снятия фильтра.
+
+---
+
+### Round 1: импорт уволенных сотрудников
+
+Корневая причина, найденная по реальному Bitrix MySQL:
+
+- `SQL_EMPLOYEES` фильтровал `WHERE u.ACTIVE='Y' AND uu.UF_DEPARTMENT IS NOT NULL` — уволенные с любым UF_DEPARTMENT не попадали в Odoo.
+- `archive_fired()` (`employees.py:145`) пытался архивировать существующих, но т.к. уволенные никогда не создавались — ничего не делал.
+- `find_employee_by_bitrix_id` (`base.py:152`) уже использует `active_test=False`, поэтому изменений в TaskLoader не требовалось.
+- Подтверждено: Odoo 19 при создании `hr.employee` автоматически создаёт `work_contact_id` (res.partner) — 226/226 импортированных имели partner. Это покрывает все ссылки на контакты в комментариях/встречах/follower'ах.
+
+| Файл | Изменение | Причина |
+|---|---|---|
+| `addons/bitrix_migration/services/extractors/bitrix_mysql.py:547-572` | `SQL_EMPLOYEES`: убран `ACTIVE='Y'`, `JOIN → LEFT JOIN b_uts_user`, `TRIM(CONCAT_WS(...))` для пустых имён системных аккаунтов | Включить уволенных в стандартный путь импорта; единая точка обработки вместо двух SQL |
+| `addons/bitrix_migration/services/normalizers/dto.py:251-300` | `BitrixEmployee.active: bool = True` + `field_validator('active', mode='before')` для `'Y'/'N' → bool` | DTO должен моделировать статус активности; пустые значения → `True` (безопасный дефолт) |
+| `addons/bitrix_migration/services/loaders/employees.py:68-149` | В `run()`: пропуск `_resolve_user()` для уволенных, лог `'{n} active / {n} fired'` | У уволенного не должно быть активного res.users assignee; `archive_fired()` остаётся ответственным за линк с res.users |
+| `addons/bitrix_migration/services/loaders/employees.py:245-281` | `_build_employee_vals`: ставит `active=False` только для уволенных (для активных полагаемся на Odoo default `True`); `_prepare_update_vals`: защита от re‑activate — `False → True` никогда не применяется автоматически | Защищает админа, вручную заархивировавшего сотрудника, от автоматического восстановления при повторном прогоне |
+| `addons/bitrix_migration/models/bitrix_migration_run.py` (`_run_reconciliation`) | Новые счётчики: `Employees (active)`, `Employees (fired)`, `Tasks with fired responsible` (через JOIN `bitrix_task_employee_link` × `hr_employee.active=FALSE`) | Видимость качества миграции после правок |
+| `addons/bitrix_migration/tests/test_fired_employees.py` (новый) | 14 тестов: DTO normalization (Y/N/empty/default), `_build_employee_vals`, `_prepare_update_vals` (downgrade vs no re‑activate), полный `run()` через `_NoCommitLoader` override, link на архивного employee | `commit_checkpoint()` запрещён в TransactionCase Odoo 19 — переопределяем no‑op |
+
+**Ключевое решение по `_NoCommitLoader`**: subclass с пустым `commit_checkpoint` — позволил тестировать полный `run()` внутри TransactionCase, минуя запрет на `cr.commit()`. Это паттерн для будущих тестов loader'ов.
+
+**Ключевое решение по re‑activate**: исключить ключ `active` из общего обхода `_prepare_update_vals` и обрабатывать отдельно: записывать только `active=False`, никогда `True`. Иначе ручная архивация в Odoo перетиралась бы при следующем прогоне миграции.
+
+**Проверено**: 14/14 новых тестов прошли. Регрессий нет (12 fail в `test_departments`/`test_employee_avatars`/`test_role_mapping`/`test_meeting_comments` — унаследованный baseline из‑за `cr.commit()` в TransactionCase).
+
+---
+
+### Round 2: возврат UF_DEPARTMENT и очистка мусора
+
+После Round 1 пользователь сообщил: в Odoo 1398 активных + 385 архивных = 1783 hr_employee (а в структуре Telemart — 198 активных + 363 архивных = 561). Анализ Bitrix `b_user` × UF_DEPARTMENT × ACTIVE:
+
+| Bucket | Кол-во | Статус |
+|---|---:|---|
+| `human` + UF_DEPARTMENT + ACTIVE='Y' | 223 | реальные сотрудники |
+| `human` + UF_DEPARTMENT + ACTIVE='N' | 379 | уволенные сотрудники |
+| `imconnector_*` (Open Channels) | 782 | **шум** (0 упоминаний в задачах) |
+| `human` без UF_DEPARTMENT, ACTIVE='Y' | 388 | **шум** (imopenlines/`*@*.bitrix24.ru` Network) — лишь 12 в задачах |
+| `bot_*` / `anonymous*` / `support*` + 4 фантома | 11 | шум |
+| **Итого настоящих** | **605** | (225 active + 380 fired) |
+
+Истинный фильтр сотрудников Telemart — наличие `UF_DEPARTMENT`. Это автоматически отсекает 100% мусора, включая будущие новые префиксы.
+
+**Решения пользователя** (через AskUserQuestion):
+1. Фильтр: `UF_DEPARTMENT IS NOT NULL AND != ''` (без ACTIVE — уволенные с отделом остаются).
+2. Очистка: **жёсткое `unlink()`** через ORM с предварительным dry‑run preview.
+3. Со ссылками: перевод `mail.message.author_id` на system_partner (OdooBot `base.partner_root`) и удалить.
+
+| Файл | Изменение | Причина |
+|---|---|---|
+| `addons/bitrix_migration/services/extractors/bitrix_mysql.py:547-572` | `SQL_EMPLOYEES`: `LEFT JOIN → JOIN b_uts_user` + `WHERE uu.UF_DEPARTMENT IS NOT NULL AND != ''`. То же для `SQL_FIRED_EMPLOYEE_IDS` (симметрия для `archive_fired`) | UF_DEPARTMENT — единственный надёжный признак реального сотрудника компании |
+| `addons/bitrix_migration/services/extractors/bitrix_mysql.py:578-589` | Новый `SQL_NOISE_USER_IDS` + метод `get_noise_user_ids()` — возвращает user_id с `UF_DEPARTMENT IS NULL OR ''` | Для `purge_noise_accounts()` — обратный к основному фильтр |
+| `addons/bitrix_migration/services/loaders/employees.py:245-401` | Новый метод `purge_noise_accounts(dry_run)`: находит hr.employee по `x_bitrix_id IN noise_ids`; для каждого — `mail.message.author_id` → OdooBot, `x_bitrix_author_employee_id` → False, `project.task.x_bitrix_creator_employee_id` → False, `mail.followers` на bitrix-моделях → unlink, mapping → unlink, hr.employee → unlink (CASCADE удалит `bitrix_task_employee_link`), orphan `work_contact_id` → unlink (если не shared) | Жёсткое удаление с переносом orphan-ссылок на системного актора — компромисс между чистотой БД и сохранением аудит-следа |
+| `addons/bitrix_migration/services/loaders/employees.py` | Новые хелперы: `_get_system_author_partner()` → `base.partner_root` (OdooBot); `_partner_is_orphan()` → проверяет, что никто кроме удаляемого employee не ссылается на partner | OdooBot всегда есть, не архивируется, визуально маркирует system-владение |
+| `addons/bitrix_migration/models/bitrix_migration_run.py` | Новый `mode='purge_noise'`, диспетчер в `action_run` (строки 263-266), `_run_purge_noise(extractor, dry_run)` | Поддержка через стандартный flow `action_run` для CLI-сценариев |
+| `addons/bitrix_migration/models/bitrix_migration_run.py` | Два action‑метода: `action_purge_noise_preview()` (dry_run=True) и `action_purge_noise_apply()` (dry_run=False с confirm); состояние `running` + `extractor.close()` в `finally` | UI: пользователь сначала Preview, потом Apply с подтверждением |
+| `addons/bitrix_migration/views/bitrix_migration_run_views.xml` | Новый раздел "Noise Accounts" в Danger Zone с двумя кнопками | Видимость для пользователя |
+| `addons/bitrix_migration/tests/test_purge_noise.py` (новый) | 5 тестов: основной purge (employee + orphan partner), dry_run без изменений, partner shared с другим employee — НЕ удаляется, `mail.message.author_id` → OdooBot, `project.task.x_bitrix_creator_employee_id` → False | Покрытие всех edge cases |
+
+**Ключевое решение по полю mapping**: `bitrix.migration.mapping` имеет поле `odoo_id`, не `odoo_record_id` (мой первый вариант). Найдено через тесты (первый прогон дал 5 ERROR с `KeyError: 'odoo_record_id'`).
+
+**Ключевое решение по OdooBot vs новый partner**: переиспользуем `base.partner_root` (OdooBot) вместо нового "Bitrix Migration System Partner". OdooBot — стандартный, всегда есть, не требует генерации, ясно сигнализирует system-владение.
+
+**Ключевое решение по orphan-проверке partner**: перед `unlink` partner проверяем (a) других hr.employee с тем же `work_contact_id` и (b) линкованных res.users. Если есть — partner остаётся (может быть в чужих модулях — CRM, sales).
+
+**Verification на чистом stage-odoo через `odoo shell`**:
+```
+Found 1178 noise user IDs in Bitrix
+Matched 1178 noise hr.employee records in Odoo
+Using system partner id=2 (name="OdooBot")
+Would purge: 1178 hr.employee, 1178 res.partner;
+  reassigned 0 mail.message, untied 0 project.task creators,
+  removed 0 mail.followers, removed 1178 mapping rows; errors=0
+```
+
+Цифры точно совпадают с ожиданием: 1783 − 1178 = **605** реальных сотрудников после apply. Сам apply пользователь запустит через UI после backup БД.
+
+---
+
+### Round 3: тесты
+
+| Файл | Изменение |
+|---|---|
+| `addons/bitrix_migration/tests/test_fired_employees.py` | 14 тестов (4 класса): `TestBitrixEmployeeDTO` (5), `TestEmployeeValsBuilder` (4), `TestFiredEmployeeLoader` (4), `TestFiredEmployeeRolesOnTasks` (1) |
+| `addons/bitrix_migration/tests/test_purge_noise.py` | 5 тестов в `TestPurgeNoise` (full purge, dry_run, shared partner, mail.message reassign, task creator unset) |
+| `addons/bitrix_migration/tests/__init__.py` | Регистрация двух новых модулей |
+
+Прогон в stage-odoo: **131 теста, 12 failures (baseline унаследованный — те же давние тесты с `cr.commit()` в TransactionCase), 0 errors**. Все 19 новых тестов прошли.
+
+---
+
+### Итоговая верификация
+
+1. SQL_EMPLOYEES в Bitrix теперь возвращает **605** строк (225 active + 380 fired) вместо 1783 — фильтр UF_DEPARTMENT возвращён.
+2. `action_purge_noise_preview` на stage-odoo: «Would purge: 1178 hr.employee, 1178 res.partner, 1178 mapping rows; errors=0». Цифры идеально совпадают с расчётом.
+3. Дьяков Владислав (`x_bitrix_id=200`, ACTIVE='N') после следующей `employees_only` миграции будет `hr.employee` с `active=False`, `work_contact_id` (partner) автоматически создан Odoo.
+4. После Apply покойный сотрудник в `hr_employee` будет findable через стандартный фильтр Odoo «Archived» по `x_bitrix_responsible_employee_id` — отдельной кнопки/UI не потребовалось.
+5. Идемпотентность: повторный preview/apply — no‑op (нет hr.employee с мусорными x_bitrix_id).
+
+### Что попадает в git
+
+- `addons/bitrix_migration/services/extractors/bitrix_mysql.py` — SQL_EMPLOYEES, SQL_FIRED_EMPLOYEE_IDS, SQL_NOISE_USER_IDS, `get_noise_user_ids()`.
+- `addons/bitrix_migration/services/normalizers/dto.py` — `BitrixEmployee.active` + валидатор.
+- `addons/bitrix_migration/services/loaders/employees.py` — поддержка `active` в `run`/`_build_employee_vals`/`_prepare_update_vals`, новый `purge_noise_accounts()` + `_get_system_author_partner` / `_partner_is_orphan`.
+- `addons/bitrix_migration/models/bitrix_migration_run.py` — `mode='purge_noise'`, `_run_purge_noise`, `action_purge_noise_preview/apply`, расширенный `_run_reconciliation`.
+- `addons/bitrix_migration/views/bitrix_migration_run_views.xml` — секция "Noise Accounts" с двумя кнопками.
+- `addons/bitrix_migration/tests/test_fired_employees.py` (новый) — 14 тестов.
+- `addons/bitrix_migration/tests/test_purge_noise.py` (новый) — 5 тестов.
+- `addons/bitrix_migration/tests/__init__.py` — регистрация.
+
+---
+
 ## 2026-05-16 — Purge встреч + импорт повторяющихся встреч из Bitrix
 
 Задача состояла из двух связанных частей:

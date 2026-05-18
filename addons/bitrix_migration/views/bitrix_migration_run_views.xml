@@ -211,6 +211,20 @@
                                         HR cleanup scope. Protected or still-linked records are skipped and logged.
                                     </p>
                                 </group>
+                                <group string="Noise Accounts">
+                                    <button name="action_purge_noise_preview" string="Purge Noise — Preview"
+                                            type="object" class="btn-secondary"
+                                            invisible="state == 'running'"/>
+                                    <button name="action_purge_noise_apply" string="Purge Noise — Apply"
+                                            type="object" class="btn-danger"
+                                            invisible="state == 'running'"
+                                            confirm="This permanently deletes hr.employee records imported from Bitrix users without UF_DEPARTMENT (imconnector_*, imopenlines_*, bots, Bitrix24 Network guests). Orphan partners are dropped. Linked mail.message author_id is reassigned to OdooBot. Continue?"/>
+                                    <p class="text-muted">
+                                        One-off cleanup: removes integration/network/bot accounts that were
+                                        imported by mistake (no UF_DEPARTMENT in Bitrix). Run Preview first
+                                        to see what would be deleted, then Apply.
+                                    </p>
+                                </group>
                             </group>
                         </page>
                         <page string="Help">

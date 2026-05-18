@@ -68,7 +68,7 @@ class EmployeeLoader(BaseLoader):
     def run(self):
         self.log('Extracting Bitrix employees...')
         rows = self.extractor.get_employees()
-        self.log(f'Found {len(rows)} active employees with department')
+        self.log(f'Found {len(rows)} Bitrix users (active + fired)')
 
         if not rows:
             return
@@ -87,6 +87,10 @@ class EmployeeLoader(BaseLoader):
             except Exception as e:
                 self.log(f'ERROR parsing employee row {row}: {e}')
 
+        active_count = sum(1 for e in employees if e.active)
+        fired_count = len(employees) - active_count
+        self.log(f'Parsed: {active_count} active, {fired_count} fired')
+
         mapping = self.get_mapping()
         existing = mapping.get_all_mappings('employee')
         Employee = self.env['hr.employee'].sudo().with_context(active_test=False)
@@ -96,7 +100,9 @@ class EmployeeLoader(BaseLoader):
             for emp in batch:
                 bid = str(emp.user_id)
                 dept_id = self._resolve_dept(emp.dept_ids)
-                odoo_user_id = self._resolve_user(emp.user_id)
+                # Skip res.users lookup for fired users: they should not become
+                # active assignees. archive_fired() handles legacy linked users.
+                odoo_user_id = self._resolve_user(emp.user_id) if emp.active else None
                 vals = self._build_employee_vals(
                     emp,
                     dept_id=dept_id,
@@ -233,6 +239,182 @@ class EmployeeLoader(BaseLoader):
         )
         self.log_stats()
 
+    def purge_noise_accounts(self):
+        """Delete hr.employee records imported by mistake (non-employee accounts).
+
+        Targets users without UF_DEPARTMENT in Bitrix: imconnector_*,
+        imopenlines_*, Bitrix24 Network guests (*@*.bitrix24.ru), bots, etc.
+
+        Before unlink:
+          - mail.message.x_bitrix_author_employee_id == emp → unset and
+            switch author_id to a system partner (OdooBot);
+          - project.task.x_bitrix_creator_employee_id == emp → unset;
+          - mail_followers on bitrix-linked records (project.task,
+            project.project, calendar.event) pointing to emp.work_contact_id
+            → removed;
+          - bitrix.migration.mapping (entity='employee') for this employee
+            → removed;
+          - bitrix_task_employee_link rows on this employee → cascaded by FK.
+
+        After unlink hr.employee, the orphan work_contact_id partner is
+        unlinked too, unless other models still reference it.
+
+        Honours ``self.dry_run`` — counts what would be removed.
+        """
+        self.log('Extracting Bitrix noise user IDs (no UF_DEPARTMENT)...')
+        rows = self.extractor.get_noise_user_ids()
+        noise_ids = [int(r['user_id']) for r in rows if r.get('user_id')]
+        self.log(f'Found {len(noise_ids)} noise user IDs in Bitrix')
+        if not noise_ids:
+            self.log_stats()
+            return
+
+        Employee = self.env['hr.employee'].sudo().with_context(active_test=False)
+        employees = Employee.search([('x_bitrix_id', 'in', noise_ids)])
+        self.log(f'Matched {len(employees)} noise hr.employee records in Odoo')
+        if not employees:
+            self.log_stats()
+            return
+
+        system_partner = self._get_system_author_partner()
+        if not system_partner:
+            self.log('ABORT: no system partner available for reassignment')
+            return
+        self.log(
+            f'Using system partner id={system_partner.id} '
+            f'(name="{system_partner.name}") for orphan author_id reassignment'
+        )
+
+        Message = self.env['mail.message'].sudo()
+        Task = self.env['project.task'].sudo().with_context(active_test=False)
+        Follower = self.env['mail.followers'].sudo()
+        Mapping = self.env['bitrix.migration.mapping'].sudo()
+        Partner = self.env['res.partner'].sudo().with_context(active_test=False)
+
+        bitrix_follower_models = ('project.task', 'project.project', 'calendar.event')
+
+        purged_employees = 0
+        purged_partners = 0
+        reassigned_messages = 0
+        untied_tasks = 0
+        removed_followers = 0
+        removed_mappings = 0
+        errors = 0
+
+        for batch in self._batched(employees, self.batch_size):
+            for emp in batch:
+                emp_id = emp.id
+                bid = emp.x_bitrix_id
+                partner = emp.work_contact_id
+
+                msg_domain = []
+                if 'x_bitrix_author_employee_id' in Message._fields:
+                    msg_domain = [('x_bitrix_author_employee_id', '=', emp_id)]
+                messages = Message.search(msg_domain) if msg_domain else Message.browse()
+
+                task_domain = [('x_bitrix_creator_employee_id', '=', emp_id)]
+                tasks = Task.search(task_domain)
+
+                followers = Follower.browse()
+                if partner:
+                    followers = Follower.search([
+                        ('partner_id', '=', partner.id),
+                        ('res_model', 'in', list(bitrix_follower_models)),
+                    ])
+
+                mappings = Mapping.search([
+                    ('entity_type', '=', 'employee'),
+                    ('odoo_id', '=', emp_id),
+                ])
+
+                if self.dry_run:
+                    reassigned_messages += len(messages)
+                    untied_tasks += len(tasks)
+                    removed_followers += len(followers)
+                    removed_mappings += len(mappings)
+                    purged_employees += 1
+                    if partner and self._partner_is_orphan(partner, emp):
+                        purged_partners += 1
+                    continue
+
+                try:
+                    if messages:
+                        vals = {'x_bitrix_author_employee_id': False}
+                        if 'author_id' in messages._fields:
+                            vals['author_id'] = system_partner.id
+                        messages.write(vals)
+                        reassigned_messages += len(messages)
+
+                    if tasks:
+                        tasks.write({'x_bitrix_creator_employee_id': False})
+                        untied_tasks += len(tasks)
+
+                    if followers:
+                        removed_followers += len(followers)
+                        followers.unlink()
+
+                    if mappings:
+                        removed_mappings += len(mappings)
+                        mappings.unlink()
+
+                    drop_partner = bool(partner) and self._partner_is_orphan(partner, emp)
+                    emp.unlink()
+                    purged_employees += 1
+
+                    if drop_partner:
+                        try:
+                            partner.unlink()
+                            purged_partners += 1
+                        except Exception as e:
+                            self.log(
+                                f'Skip partner id={partner.id} '
+                                f'(bitrix_id={bid}): {e}'
+                            )
+                except Exception as e:
+                    errors += 1
+                    self.error_count += 1
+                    self.errors.append((bid, str(e)))
+                    self.log(f'ERROR purging hr.employee bitrix_id={bid}: {e}')
+
+            if not self.dry_run:
+                self.commit_checkpoint(purged_employees)
+
+        action = 'Would purge' if self.dry_run else 'Purged'
+        self.log(
+            f'{action}: {purged_employees} hr.employee, {purged_partners} res.partner; '
+            f'reassigned {reassigned_messages} mail.message, '
+            f'untied {untied_tasks} project.task creators, '
+            f'removed {removed_followers} mail.followers, '
+            f'removed {removed_mappings} mapping rows; errors={errors}'
+        )
+        self.updated_count += purged_employees
+        self.log_stats()
+
+    def _get_system_author_partner(self):
+        """Return a res.partner to receive orphan author_id references.
+
+        Uses ``base.partner_root`` (OdooBot) — always present, can't be
+        archived, and visually indicates a system-owned record.
+        """
+        partner = self.env.ref('base.partner_root', raise_if_not_found=False)
+        return partner if partner else self.env['res.partner']
+
+    def _partner_is_orphan(self, partner, deleting_employee):
+        """True when only the deleting employee references this partner."""
+        Employee = self.env['hr.employee'].sudo().with_context(active_test=False)
+        Users = self.env['res.users'].sudo().with_context(active_test=False)
+
+        other_employees = Employee.search_count([
+            ('work_contact_id', '=', partner.id),
+            ('id', '!=', deleting_employee.id),
+        ])
+        if other_employees:
+            return False
+        linked_user = Users.search_count([('partner_id', '=', partner.id)])
+        if linked_user:
+            return False
+        return True
+
     def _get_protected_user_ids(self):
         """res.users that must never be archived (admin/root/public)."""
         protected = set()
@@ -259,14 +441,28 @@ class EmployeeLoader(BaseLoader):
             vals['department_id'] = dept_id
         if odoo_user_id:
             vals['user_id'] = odoo_user_id
+        # Only flag fired users explicitly; rely on Odoo's default active=True
+        # for new active employees (so re-activate guard in _prepare_update_vals
+        # never sees active=True coming from us).
+        if not emp.active:
+            vals['active'] = False
 
         return vals
 
     def _prepare_update_vals(self, employee, vals):
-        """Keep reruns safe: fill missing data and sync changed source values."""
+        """Keep reruns safe: fill missing data and sync changed source values.
+
+        Special handling for ``active``:
+          - downgrade (True → False) is allowed when Bitrix marks user as fired;
+          - upgrade (False → True) is NEVER auto-applied — protects manually
+            archived employees from being re-enabled by a rerun.
+        """
         update_vals = {}
 
         for field_name, value in vals.items():
+            if field_name == 'active':
+                # Handled separately below.
+                continue
             if value in (None, False, ''):
                 continue
 
@@ -277,6 +473,10 @@ class EmployeeLoader(BaseLoader):
 
             if current_value != value:
                 update_vals[field_name] = value
+
+        # Active flag: only allow downgrade.
+        if vals.get('active') is False and employee.active:
+            update_vals['active'] = False
 
         return update_vals
 

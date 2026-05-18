@@ -27,6 +27,12 @@ _RECURRENCE_FIELDS = (
     'month_by', 'day', 'byday', 'weekday',
 )
 
+# Fields safe to re-sync on re-import. Recurrence params are intentionally
+# excluded — Odoo's calendar.event.write rejects partial recurrence updates
+# unless recurrence_update='all_events' is set on the right base event, which
+# is brittle after detach. Recurrence is established only at first create.
+_REWRITE_FIELDS = ('name', 'description', 'start', 'stop')
+
 
 def _parse_bitrix_until(raw):
     """Parse the UNTIL component of a Bitrix RRULE into a ``date``.
@@ -246,7 +252,7 @@ class MeetingLoader(BaseLoader):
                         if existing_partner_ids != all_partner_ids:
                             diff['partner_ids'] = [(6, 0, sorted(all_partner_ids))]
 
-                    for field in _RECURRENCE_FIELDS:
+                    for field in _REWRITE_FIELDS:
                         if field not in vals:
                             continue
                         current = record[field]
@@ -255,6 +261,9 @@ class MeetingLoader(BaseLoader):
                             current = current.id
                         if current != target:
                             diff[field] = target
+
+                    recurrence_keys = self.env['calendar.event']._get_recurrent_fields()
+                    diff = {k: v for k, v in diff.items() if k not in recurrence_keys}
 
                     if diff:
                         record.with_context(

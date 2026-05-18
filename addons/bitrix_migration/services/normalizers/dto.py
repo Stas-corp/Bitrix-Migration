@@ -253,6 +253,7 @@ class BitrixEmployee(BaseModel):
     login: str = ''
     full_name: str
     email: Optional[str] = None
+    active: bool = True
     dept_ids: list = Field(default_factory=list)
     work_phone: Optional[str] = None
     mobile_phone: Optional[str] = None
@@ -281,6 +282,21 @@ class BitrixEmployee(BaseModel):
     @classmethod
     def clean_login(cls, v):
         return _clean_str(v) or ''
+
+    @field_validator('active', mode='before')
+    @classmethod
+    def normalize_active(cls, v):
+        # Bitrix stores 'Y'/'N'. Empty/None defaults to True (safe).
+        if v is None:
+            return True
+        if isinstance(v, bool):
+            return v
+        s = str(v).strip().upper()
+        if s in ('N', 'NO', 'FALSE', '0'):
+            return False
+        if s in ('Y', 'YES', 'TRUE', '1'):
+            return True
+        return True
 
 
 class BitrixMeeting(BaseModel):

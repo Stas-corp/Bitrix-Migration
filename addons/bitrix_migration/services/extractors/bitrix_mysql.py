@@ -543,12 +543,19 @@ class BitrixMySQLExtractor:
         ORDER BY s.DEPTH_LEVEL, s.LEFT_MARGIN
     """
 
-    # ── Employees with departments ────────────────────────────────────
+    # ── Employees (active + fired, employees of the company only) ─────
+    # Active employees are imported as hr.employee active=True.
+    # Fired (ACTIVE='N') are imported as hr.employee active=False so that
+    # their historical roles on tasks/comments/meetings resolve correctly
+    # via find_employee_by_bitrix_id (which uses active_test=False).
+    # UF_DEPARTMENT IS NOT NULL excludes integration accounts (imconnector_*,
+    # imopenlines_*), Bitrix24 Network users (*@*.bitrix24.ru), bots and
+    # other non-employee accounts — they all live without UF_DEPARTMENT.
     SQL_EMPLOYEES = """
         SELECT
             u.ID                                    AS user_id,
             u.LOGIN                                 AS login,
-            CONCAT(u.NAME, ' ', u.LAST_NAME)        AS full_name,
+            TRIM(CONCAT_WS(' ', u.NAME, u.LAST_NAME)) AS full_name,
             u.EMAIL                                 AS email,
             u.ACTIVE                                AS active,
             uu.UF_DEPARTMENT                        AS raw_dept,
@@ -557,17 +564,33 @@ class BitrixMySQLExtractor:
             u.PERSONAL_PHONE                        AS personal_phone
         FROM b_user u
         JOIN b_uts_user uu ON uu.VALUE_ID = u.ID
-        WHERE u.ACTIVE = 'Y'
-          AND uu.UF_DEPARTMENT IS NOT NULL
+        WHERE uu.UF_DEPARTMENT IS NOT NULL
           AND uu.UF_DEPARTMENT != ''
         ORDER BY u.ID
     """
 
     # ── Fired (inactive) Bitrix users ─────────────────────────────────
+    # Same UF_DEPARTMENT filter — archive_fired() must not touch
+    # integration/network accounts.
     SQL_FIRED_EMPLOYEE_IDS = """
         SELECT u.ID AS user_id
         FROM b_user u
+        JOIN b_uts_user uu ON uu.VALUE_ID = u.ID
         WHERE u.ACTIVE = 'N'
+          AND uu.UF_DEPARTMENT IS NOT NULL
+          AND uu.UF_DEPARTMENT != ''
+        ORDER BY u.ID
+    """
+
+    # ── Noise Bitrix user IDs (NOT real employees) ────────────────────
+    # Used by purge_noise_accounts() to find already-imported hr.employee
+    # rows that should be deleted (imconnector_*, imopenlines_*, bots,
+    # Bitrix24 Network guests, etc.).
+    SQL_NOISE_USER_IDS = """
+        SELECT u.ID AS user_id
+        FROM b_user u
+        LEFT JOIN b_uts_user uu ON uu.VALUE_ID = u.ID
+        WHERE uu.UF_DEPARTMENT IS NULL OR uu.UF_DEPARTMENT = ''
         ORDER BY u.ID
     """
 
@@ -1104,6 +1127,16 @@ class BitrixMySQLExtractor:
 
     def get_employees(self):
         return self._execute(self.SQL_EMPLOYEES)
+
+    def get_noise_user_ids(self):
+        """Return Bitrix user IDs that are NOT real employees of the company.
+
+        These are integration accounts (imconnector_*, imopenlines_*),
+        Bitrix24 Network guests, bots, etc. — anyone without UF_DEPARTMENT.
+        Used by EmployeeLoader.purge_noise_accounts() to clean up legacy
+        imports made before the UF_DEPARTMENT filter was added back.
+        """
+        return self._execute(self.SQL_NOISE_USER_IDS)
 
     def get_fired_employee_ids(self):
         """Return Bitrix user IDs marked ACTIVE='N' (fired/blocked)."""

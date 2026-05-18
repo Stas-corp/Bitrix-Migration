@@ -264,3 +264,59 @@ class TestMeetingRecurrenceWrite(TransactionCase):
         self.assertFalse(event.tue)
         self.assertEqual(event.end_type, 'end_date')
         self.assertEqual(event.until, date(2038, 1, 1))
+
+    def test_re_import_recurring_meeting_does_not_raise(self):
+        """Re-importing the same recurring meeting must be a safe no-op.
+
+        Regression: previously raised UserError('Unable to save the
+        recurrence with "This Event"') when the record had recurrency=True
+        but recurrence_id was cleared (Odoo's detach path).
+        """
+        from ..services.loaders.meetings import (
+            _bitrix_rrule_to_odoo_recurrence, MeetingLoader,
+        )
+
+        rrule_vals = _bitrix_rrule_to_odoo_recurrence(
+            'FREQ=WEEKLY;UNTIL=01.01.2038;INTERVAL=1;BYDAY=MO',
+            dtstart=datetime(2025, 12, 23, 15, 30),
+        )
+        base = self.env['calendar.event'].sudo().create({
+            'name': 'Recurring re-import',
+            'start': '2025-12-23 15:30:00',
+            'stop': '2025-12-23 16:00:00',
+            'x_bitrix_id': '99999',
+            'recurrency': True,
+            **rrule_vals,
+        })
+        self.env.cr.execute(
+            "UPDATE calendar_event SET recurrence_id = NULL, active = FALSE "
+            "WHERE id = %s",
+            (base.id,),
+        )
+        base.invalidate_recordset()
+
+        class _OneMeetingExtractor:
+            def get_meetings(self_inner):
+                return [{
+                    'external_id': 99999,
+                    'name': 'Recurring re-import',
+                    'date_start': '2025-12-23 15:30:00',
+                    'date_end': '2025-12-23 16:00:00',
+                    'rrule': 'FREQ=WEEKLY;UNTIL=01.01.2038;INTERVAL=1;BYDAY=MO',
+                    'exdate': None,
+                    'section_id': None,
+                    'organizer_bitrix_id': None,
+                    'participant_bitrix_ids': None,
+                    'description': '',
+                    'forum_topic_id': None,
+                }]
+
+        loader = MeetingLoader(
+            env=self.env, extractor=_OneMeetingExtractor(), dry_run=False,
+        )
+        loader.commit_checkpoint = lambda *a, **kw: None
+
+        loader.run()
+
+        self.assertEqual(loader.error_count, 0)
+        self.assertEqual(loader.skipped_count, 1)
