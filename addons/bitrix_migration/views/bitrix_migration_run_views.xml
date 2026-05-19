@@ -252,6 +252,22 @@
                                         Odoo user partners are protected. Run Preview first.
                                     </p>
                                 </group>
+                                <group string="Project Followers">
+                                    <button name="action_purge_project_followers_preview" string="Purge Project Followers — Preview"
+                                            type="object" class="btn-secondary"
+                                            invisible="state == 'running'"/>
+                                    <button name="action_purge_project_followers_apply" string="Purge Project Followers — Apply"
+                                            type="object" class="btn-danger"
+                                            invisible="state == 'running'"
+                                            confirm="This removes mail.followers on imported projects, keeping only the project manager (project.user_id). Required to make privacy_visibility='followers' actually restrict task visibility: standard Odoo rule lets any project follower see all tasks. Followers on individual tasks are not touched. Continue?"/>
+                                    <p class="text-muted">
+                                        Removes stale followers from imported `project.project` records,
+                                        leaving only the project manager. Needed because legacy importer
+                                        subscribed every task assignee to the parent project, which made
+                                        the standard rule (`project_id.message_partner_ids in
+                                        user.partner_id`) expose all tasks of a project. Run Preview first.
+                                    </p>
+                                </group>
                             </group>
                         </page>
                         <page string="Help">

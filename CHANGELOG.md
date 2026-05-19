@@ -1,5 +1,44 @@
 # CHANGELOG
 
+## 2026-05-19 — Чистка унаследованных project followers (Purge Project Followers — Preview/Apply)
+
+На свежем бэкапе с прода у `project.project` импортированных проектов оказалось от десятков до сотен `mail.followers` (149 на «Bitrix: Без проекта» — все assignees задач). Стандартное правило Odoo 19 `Project/Task: project users: follow required for follower-only projects` (`ir.rule` через `project_id.message_partner_ids in [user.partner_id]`) трактует follower'а проекта как имеющего доступ **ко всем** задачам этого проекта — поэтому Internal User-сотрудники видели всю Bitrix-историю независимо от своих R/A/U/O ролей.
+
+### Корень проблемы
+
+Раньше `services/loaders/tasks.py` содержал `_subscribe_project_followers`, который подписывал R+A+U+O партнёров на родительский `project.project`. Метод удалён ещё 2026-05-13 (текущий `_subscribe_access_followers` подписывает только `project.task`), но накопленные за время старой логики записи в `mail.followers` остались. Эксперимент подтвердил, что `task.message_subscribe(...)` в Odoo 19 НЕ каскадит на проект — значит достаточно однократной чистки.
+
+### Решение
+
+Добавлены кнопки **Purge Project Followers — Preview/Apply** в Danger Zone и метод `_run_purge_project_followers(dry_run)`:
+
+- Берёт `project.project` с `x_bitrix_id != False` **или** имеющие хотя бы одну задачу с `x_bitrix_id` (последнее покрывает fallback-проект «Bitrix: Без проекта», у которого собственного `x_bitrix_id` нет).
+- Сохраняет follower'а, чей `partner_id == project.user_id.partner_id` (менеджер проекта).
+- Остальные `mail.followers` для `project.project/<id>` — `unlink()`.
+
+Followers `project.task` не трогаются: они корректны и не дают доступа сверх роли.
+
+### Файлы
+
+| Файл | Изменение | Причина |
+|---|---|---|
+| `addons/bitrix_migration/models/bitrix_migration_run.py` | Новые методы `_run_purge_project_followers`, `action_purge_project_followers_preview`, `action_purge_project_followers_apply`. Домен охватывает и fallback-проект через `('task_ids.x_bitrix_id','!=',False)` | Точечная чистка project followers без вмешательства в задачи |
+| `addons/bitrix_migration/views/bitrix_migration_run_views.xml` | Группа кнопок «Project Followers» в Danger Zone | UI для запуска preview → apply |
+
+### Проверка на stage (`stage-odoo-odoo-1`)
+
+```
+=== Purge Project Followers APPLY ===
+Imported projects to check: 17
+Removed 148 follower(s) from project id=5 name=Bitrix: Без проекта
+Removed 58  follower(s) from project id=55 name=Call-центр
+Removed 19  follower(s) from project id=58 name=Корпотивний сегмент
+...
+projects_affected=10, removed=260
+```
+
+После чистки у Стаса Самойлова (`s.samoylov.corp@gmail.com`) в проекте «Bitrix: Без проекта» осталось 18 видимых задач (через followers задач) + 8 (через `user_ids`), вместо 2351.
+
 ## 2026-05-19 — Убраны устаревшие режимы из mode Selection (`departments_only`, `employees_only`, `purge_noise`)
 
 Три варианта `mode` устарели и дублировали другой функционал — мешали в выпадающем списке формы `bitrix.migration.run`:

@@ -3081,6 +3081,104 @@ class BitrixMigrationRun(models.Model):
         finally:
             self.env.cr.commit()
 
+    def _run_purge_project_followers(self, dry_run):
+        """Strip stale followers from imported projects.
+
+        Legacy importer subscribed every R/A/U/O partner to the parent
+        project, which makes them see all tasks via the standard Odoo
+        rule `project_id.message_partner_ids in user.partner_id`. Keep
+        only the project manager (`project.user_id.partner_id`).
+        """
+        Project = self.env['project.project'].sudo().with_context(active_test=False)
+        Followers = self.env['mail.followers'].sudo()
+
+        # Cover both imported projects and the fallback "Bitrix: Без проекта"
+        # (created without x_bitrix_id but full of imported tasks).
+        projects = Project.search([
+            '|',
+                ('x_bitrix_id', '!=', False),
+                ('task_ids.x_bitrix_id', '!=', False),
+        ], order='id')
+        self._append_log(f'Imported projects to check: {len(projects)}')
+
+        total_would = 0
+        total_removed = 0
+        touched = 0
+
+        for project in projects:
+            keep_partner_id = project.user_id.partner_id.id if project.user_id and project.user_id.partner_id else False
+            domain = [
+                ('res_model', '=', 'project.project'),
+                ('res_id', '=', project.id),
+            ]
+            if keep_partner_id:
+                domain.append(('partner_id', '!=', keep_partner_id))
+            stale = Followers.search(domain)
+            if not stale:
+                continue
+
+            count = len(stale)
+            label = f'project id={project.id} name={project.display_name}'
+            if dry_run:
+                total_would += count
+                touched += 1
+                self._append_log(f'WOULD remove {count} follower(s) from {label}')
+            else:
+                stale.unlink()
+                total_removed += count
+                touched += 1
+                self._append_log(f'Removed {count} follower(s) from {label}')
+                if touched % 20 == 0:
+                    self.env.cr.commit()
+
+        if dry_run:
+            self._append_log(f'projects_affected={touched}, would_remove={total_would}')
+        else:
+            self.env.cr.commit()
+            self._append_log(f'projects_affected={touched}, removed={total_removed}')
+
+    def action_purge_project_followers_preview(self):
+        """Dry-run preview: report how many project followers would be removed."""
+        self.ensure_one()
+        self.state = 'running'
+        self.log_output = '=== Purge Project Followers PREVIEW ==='
+        self.progress = 0.0
+        self.env.cr.commit()
+
+        try:
+            self._run_purge_project_followers(dry_run=True)
+            self.state = 'done'
+            self.progress = 100.0
+            self._append_log('=== Preview completed ===')
+        except Exception:
+            self.env.cr.rollback()
+            self.state = 'error'
+            self._append_log(f'=== PURGE PROJECT FOLLOWERS PREVIEW ERROR ===\n{traceback.format_exc()}')
+            _logger.exception('Purge project followers preview failed')
+        finally:
+            self.env.cr.commit()
+
+    def action_purge_project_followers_apply(self):
+        """Apply: physically unlink stale mail.followers on imported projects."""
+        self.ensure_one()
+        self.state = 'running'
+        self.log_output = '=== Purge Project Followers APPLY ==='
+        self.progress = 0.0
+        self.env.cr.commit()
+
+        try:
+            self._run_purge_project_followers(dry_run=False)
+            self.state = 'done'
+            self.progress = 100.0
+            self._append_log('=== Purge completed ===')
+        except Exception:
+            self.env.cr.rollback()
+            self.state = 'error'
+            self._append_log(f'=== PURGE PROJECT FOLLOWERS ERROR ===\n{traceback.format_exc()}')
+            _logger.exception('Purge project followers apply failed')
+        finally:
+            self.env.cr.commit()
+
     def _clear_checkpoints(self):
         checkpoint_keys = [
             'user', 'tag', 'project', 'stage', 'task', 'task_relink',
