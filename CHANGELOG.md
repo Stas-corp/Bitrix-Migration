@@ -1,5 +1,62 @@
 # CHANGELOG
 
+## 2026-05-19 — `action_run` вынесен в cron-batch + hotfix `limit_time_real` для stage-odoo
+
+Повторный запуск `mode=full` в контейнере `stage-odoo-odoo-1` стабильно «зависал» на 5/9 Tasks: после ≈170 секунд работы Odoo-watchdog по `limit_time_real` дампил стек, делал internal reload (`os.kill(SIGTERM)` → `Modules loaded / Registry loaded / Bus.loop listen imbus`), транзакция HTTP-request'а откатывалась и `bitrix_migration_run.state` залипал на `running`. В прошлом запуске тот же симптом проявлялся в `_run_reconciliation()` (regex-сканы по `mail.message.body`).
+
+### Корень проблемы
+
+1. **`stage-odoo/docker-compose.yml` не монтировал `odoo.conf`** — контейнер брал дефолтный `/etc/odoo/odoo.conf` из образа `odoo:19`, где все `limit_*` закомментированы. Значит применялись hardcoded Odoo-defaults: `limit_time_real=120s`, `limit_time_cpu=60s`, `workers=0`.
+2. **`action_run` исполнял миграцию синхронно внутри HTTP-request'а** — `state='running'` коммитился сразу (line 258), `state='done'` коммитился только в самом конце (line 316). Любое прерывание потока (watchdog, OOM-killer, закрытый браузер) → транзакция rollback → `state='running'` навсегда, хотя `commit_checkpoint` в `BaseLoader` уже зафиксировал прогресс. Финальная reconciliation в одном HTTP-request — гарантированный кандидат на kill, даже при поднятых лимитах.
+
+### Решение
+
+**Стадия 1 — hotfix лимитов воркера (stage-odoo)**
+
+Контейнер `stage-odoo-odoo-1` получил собственный `odoo.conf` с увеличенными лимитами (значения из `Bitrix-Migration/odoo.conf`).
+
+**Стадия 2 — `action_run` → cron-batch**
+
+`action_run` теперь только ставит миграцию в очередь и возвращает notification, фактическая работа идёт в cron-job'е, который не подпадает под `limit_time_real` (cron использует `limit_time_real_cron`, дефолт `-1` = без лимита).
+
+- Новые поля на `bitrix.migration.run`:
+  - `full_sync_state` (`pending/running/done/error`) — состояние очереди, видно в UI.
+  - `full_sync_started_at` — когда поставлена в очередь.
+- `action_run` пишет `state='running'`, `full_sync_state='pending'`, commit и возвращает `display_notification`. Тело синхронной миграции перенесено в `_execute_run_inline()`.
+- `_cron_process_full_migration()` (interval 1 мин) ищет первую запись с `full_sync_state in ('pending','running')`, берёт PG advisory lock (`pg_try_advisory_lock(84622, run.id)`), вызывает `_execute_run_inline()`, по итогу выставляет `full_sync_state` ↔ `state`. На случай рестарта контейнера в середине прогона: cron подхватит запись на следующем тике, миграция продолжится с существующих `bitrix_migration.checkpoint.*` (idempotent get_or_create).
+- `action_reset` дополнительно вызывает `_reset_full_sync_state()` (иначе cron подхватит зависшую запись после ручного reset'а).
+- Защита от двойного клика: `action_run` при `full_sync_state in ('pending','running')` возвращает warning-notification вместо повторной постановки в очередь.
+
+### Файлы
+
+| Файл | Изменение | Причина |
+|---|---|---|
+| `addons/bitrix_migration/models/bitrix_migration_run.py` | Поля `full_sync_state` / `full_sync_started_at`; `action_run` → queue + notification; новый `_execute_run_inline()` (тело старого `action_run`); `_try_lock_full_sync` / `_unlock_full_sync` / `_reset_full_sync_state`; `_cron_process_full_migration()`; `action_reset` чистит `full_sync_state` | Развязать миграцию от `limit_time_real` HTTP-воркера |
+| `addons/bitrix_migration/data/ir_cron_data.xml` | Новый `ir.cron` `ir_cron_full_migration` (1 min interval) | Тикающий обработчик очереди |
+| `addons/bitrix_migration/views/bitrix_migration_run_views.xml` | Группа **Full Migration Queue** в форме (видна только если `full_sync_state` заполнено) | UI для состояния очереди |
+| `../stage-odoo/odoo.conf` (вне репозитория) | Создан с `limit_time_real=7200, limit_time_cpu=3600, workers=0, limit_memory_hard=2_684_354_560` | Hotfix: убрать дефолтные 120с HTTP-watchdog'а |
+| `../stage-odoo/docker-compose.yml` (вне репозитория) | Добавлен mount `./odoo.conf:/etc/odoo/odoo.conf:ro` в сервис `odoo` | Без mount'а контейнер брал дефолтный закомментированный конфиг |
+| `CHANGELOG.md` | Эта запись | — |
+
+### Verification
+
+1. **Лимиты применились**: `docker exec stage-odoo-odoo-1 grep -E '^(limit|workers)' /etc/odoo/odoo.conf` → `limit_time_cpu=3600`, `limit_time_real=7200`, `workers=0`.
+2. **Schema-апгрейд прошёл**: `docker compose run --rm --no-deps odoo odoo -d odoo -u bitrix_migration --stop-after-init` → `Registry loaded in 2.277s`, в `bitrix_migration_run` появились `full_sync_state` / `full_sync_started_at`. В `ir_cron` появилась запись `Bitrix Migration: Process Full Migration` (active, 1 min).
+3. **Юнит-тесты модуля**: `odoo --test-enable --test-tags=/bitrix_migration -d odoo -u bitrix_migration --stop-after-init` → `185 tests 3.86s 5740 queries`, `0 failed, 0 errors`.
+4. **Smoke-тест через `odoo shell`**:
+   - `run.action_run()` → `state='running'`, `full_sync_state='pending'`, `full_sync_started_at='2026-05-19 13:31:47'`, возвращён `ir.actions.client display_notification`. ✓
+   - `run.action_reset()` → `state='draft'`, `full_sync_state=False`. ✓
+5. **Сохранность прогресса**: после сброса `state` checkpoints в `ir_config_parameter` (`bitrix_migration.checkpoint.task=193238` ≈ 6000/8409, `project=254`, `stage=4161`, `disk=227176`) остались — следующий запуск продолжит доимпорт с этого места.
+
+### Что попадает в git
+
+- `addons/bitrix_migration/models/bitrix_migration_run.py`
+- `addons/bitrix_migration/data/ir_cron_data.xml`
+- `addons/bitrix_migration/views/bitrix_migration_run_views.xml`
+- `CHANGELOG.md`
+
+`stage-odoo/odoo.conf` и `stage-odoo/docker-compose.yml` находятся в соседнем репозитории и в git Bitrix-Migration не попадают.
+
 ## 2026-05-19 — Чистка унаследованных project followers (Purge Project Followers — Preview/Apply)
 
 На свежем бэкапе с прода у `project.project` импортированных проектов оказалось от десятков до сотен `mail.followers` (149 на «Bitrix: Без проекта» — все assignees задач). Стандартное правило Odoo 19 `Project/Task: project users: follow required for follower-only projects` (`ir.rule` через `project_id.message_partner_ids in [user.partner_id]`) трактует follower'а проекта как имеющего доступ **ко всем** задачам этого проекта — поэтому Internal User-сотрудники видели всю Bitrix-историю независимо от своих R/A/U/O ролей.

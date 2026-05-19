@@ -227,6 +227,15 @@ class BitrixMigrationRun(models.Model):
         default=0.0,
     )
 
+    # Full migration background-stage progress (cron-driven, immune to HTTP limit_time_real)
+    full_sync_state = fields.Selection([
+        ('pending', 'Pending'),
+        ('running', 'Running'),
+        ('done', 'Done'),
+        ('error', 'Error'),
+    ], string='Full Sync State', readonly=True)
+    full_sync_started_at = fields.Datetime(string='Full Sync Started At', readonly=True)
+
     def _append_log(self, message):
         self.ensure_one()
         try:
@@ -251,6 +260,55 @@ class BitrixMigrationRun(models.Model):
         )
 
     def action_run(self):
+        """Queue migration for execution by background cron.
+
+        HTTP request would otherwise be killed by `limit_time_real` watchdog
+        (default 120s in threading mode). Cron runs without that limit
+        (limit_time_real_cron defaults to -1), so the actual work happens there.
+        Returns immediately with a notification.
+        """
+        self.ensure_one()
+        if self.full_sync_state in ('pending', 'running'):
+            return {
+                'type': 'ir.actions.client',
+                'tag': 'display_notification',
+                'params': {
+                    'title': 'Already queued',
+                    'message': (
+                        f'Migration is already {self.full_sync_state}. '
+                        f'Wait for the cron to finish, or click Reset first.'
+                    ),
+                    'type': 'warning',
+                    'sticky': False,
+                },
+            }
+        self.sudo().write({
+            'state': 'running',
+            'full_sync_state': 'pending',
+            'full_sync_started_at': fields.Datetime.now(),
+            'progress': 0.0,
+            'log_output': (
+                f'=== Migration queued: mode={self.mode} ===\n'
+                f'Background cron will pick up within 1 minute.'
+            ),
+        })
+        self.env.cr.commit()
+        return {
+            'type': 'ir.actions.client',
+            'tag': 'display_notification',
+            'params': {
+                'title': 'Migration queued',
+                'message': (
+                    f'mode={self.mode} will start within 1 minute. '
+                    f'Cron is immune to HTTP request timeout; you can close this tab safely.'
+                ),
+                'type': 'success',
+                'sticky': False,
+            },
+        }
+
+    def _execute_run_inline(self):
+        """Synchronous body of the migration. Called by cron (and by tests)."""
         self.ensure_one()
         self.state = 'running'
         self.log_output = f'=== Migration started: mode={self.mode} ==='
@@ -561,6 +619,68 @@ class BitrixMigrationRun(models.Model):
     def _unlock_attachment_sync(self):
         self.ensure_one()
         self.env.cr.execute('SELECT pg_advisory_unlock(%s, %s)', (84621, self.id))
+
+    def _try_lock_full_sync(self):
+        self.ensure_one()
+        self.env.cr.execute('SELECT pg_try_advisory_lock(%s, %s)', (84622, self.id))
+        return bool(self.env.cr.fetchone()[0])
+
+    def _unlock_full_sync(self):
+        self.ensure_one()
+        self.env.cr.execute('SELECT pg_advisory_unlock(%s, %s)', (84622, self.id))
+
+    def _reset_full_sync_state(self):
+        self.ensure_one()
+        self.sudo().write({
+            'full_sync_state': False,
+            'full_sync_started_at': False,
+        })
+
+    @api.model
+    def _cron_process_full_migration(self):
+        """Background cron: execute a queued migration end-to-end.
+
+        Cron is immune to `limit_time_real` (uses `limit_time_real_cron`,
+        default -1 = unlimited). A single cron tick runs the whole migration;
+        if the container is restarted mid-run, the next tick picks the job
+        back up because individual loaders persist progress via
+        `bitrix.migration.checkpoint.*` and `get_or_create` is idempotent.
+        """
+        run = self.search(
+            [('full_sync_state', 'in', ('pending', 'running'))],
+            limit=1, order='id asc',
+        )
+        if not run:
+            return
+        if not run._try_lock_full_sync():
+            _logger.info(
+                '[full_migration] lock busy for run id=%s; skipping tick', run.id,
+            )
+            return
+
+        try:
+            run.sudo().write({'full_sync_state': 'running'})
+            run.env.cr.commit()
+            try:
+                run._execute_run_inline()
+            except Exception:
+                run.env.cr.rollback()
+                run.sudo().write({'full_sync_state': 'error', 'state': 'error'})
+                run._append_log(f'=== CRON ERROR ===\n{traceback.format_exc()}')
+                _logger.exception('[full_migration] cron run failed')
+            else:
+                # If the inline runner reached its happy path it already wrote
+                # state='done'. If it set 'error', mirror it on full_sync_state.
+                final_state = run.sudo().read(['state'])[0]['state']
+                if final_state == 'done':
+                    run.sudo().write({'full_sync_state': 'done'})
+                elif final_state == 'error':
+                    run.sudo().write({'full_sync_state': 'error'})
+                else:
+                    run.sudo().write({'full_sync_state': 'done'})
+            run.env.cr.commit()
+        finally:
+            run._unlock_full_sync()
 
     def _next_attachment_type(self, attachment_type):
         if not attachment_type:
@@ -3195,6 +3315,7 @@ class BitrixMigrationRun(models.Model):
         self.progress = 0.0
         self._reset_avatar_sync_state()
         self._reset_attachment_sync_state(remove_tmp=True)
+        self._reset_full_sync_state()
 
     @api.model
     def get_singleton_action(self):

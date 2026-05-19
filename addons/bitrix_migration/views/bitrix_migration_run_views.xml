@@ -69,6 +69,13 @@
                             <field name="progress" widget="progressbar"/>
                         </group>
                     </group>
+                    <group string="Full Migration Queue"
+                           invisible="not full_sync_state">
+                        <group>
+                            <field name="full_sync_state" readonly="1"/>
+                            <field name="full_sync_started_at" readonly="1"/>
+                        </group>
+                    </group>
                     <group string="Avatar Sync"
                            invisible="not avatar_sync_state">
                         <group>
