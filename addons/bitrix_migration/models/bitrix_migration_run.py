@@ -24,6 +24,7 @@ class BitrixMigrationRun(models.Model):
         'fix_attachments',
         'fix_descriptions',
         'fix_hierarchy',
+        'fix_job_titles',
         'disk',
     }
 
@@ -36,6 +37,7 @@ class BitrixMigrationRun(models.Model):
         ('fix_attachments', 'Fix Attachments (relink comment attachments)'),
         ('fix_descriptions', 'Fix Descriptions (repair empty descriptions with attachments)'),
         ('fix_hierarchy', 'HR: Fix Employee Parent Hierarchy'),
+        ('fix_job_titles', 'HR: Fix Job Titles (sync positions only)'),
         ('disk', 'Bitrix Disk → Documents'),
     ], required=True, default='full', string='Mode',
         help='Режим виконання міграції.')
@@ -350,6 +352,8 @@ class BitrixMigrationRun(models.Model):
                 self._run_fix_descriptions(extractor)
             elif self.mode == 'fix_hierarchy':
                 self._run_fix_hierarchy(extractor)
+            elif self.mode == 'fix_job_titles':
+                self._run_fix_job_titles(extractor)
             elif self.mode == 'meetings':
                 self._run_meetings(extractor)
             elif self.mode == 'disk':
@@ -1286,6 +1290,51 @@ class BitrixMigrationRun(models.Model):
             self.state = 'error'
             self._append_log(f'=== EMPLOYEE HIERARCHY FIX ERROR ===\n{traceback.format_exc()}')
             _logger.exception('Employee hierarchy fix failed')
+        finally:
+            if extractor:
+                try:
+                    extractor.close()
+                except Exception:
+                    _logger.warning('Could not close Bitrix extractor cleanly', exc_info=True)
+
+        self.env.cr.commit()
+
+    def _run_fix_job_titles(self, extractor):
+        """Sync hr.employee.job_id / job_title from Bitrix WORK_POSITION.
+
+        Operates only on already-imported employees. No SFTP / avatar /
+        res.users side-effects. Idempotent.
+        """
+        from ..services.loaders.employees import EmployeeLoader
+
+        self._append_log('\n--- Employee Job Titles ---')
+        emp_loader = EmployeeLoader(
+            self.env, extractor,
+            dry_run=False,
+            log_callback=self._append_log,
+        )
+        emp_loader.sync_job_titles_only()
+
+    def action_fix_employee_job_titles(self):
+        """One-off repair action for hr.employee.job_id / job_title."""
+        self.ensure_one()
+        self.state = 'running'
+        self._append_log('=== Employee job-title fix started ===')
+        self.progress = 0.0
+        self.env.cr.commit()
+
+        extractor = None
+        try:
+            extractor = self._get_extractor()
+            self._run_fix_job_titles(extractor)
+            self.state = 'done'
+            self.progress = 100.0
+            self._append_log('=== Employee job-title fix completed ===')
+        except Exception:
+            self.env.cr.rollback()
+            self.state = 'error'
+            self._append_log(f'=== EMPLOYEE JOB-TITLE FIX ERROR ===\n{traceback.format_exc()}')
+            _logger.exception('Employee job-title fix failed')
         finally:
             if extractor:
                 try:

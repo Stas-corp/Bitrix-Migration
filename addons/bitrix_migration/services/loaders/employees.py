@@ -64,6 +64,8 @@ class EmployeeLoader(BaseLoader):
         self.avatar_http_base_url = (avatar_http_base_url or '').rstrip('/')
         self.avatar_http_headers = self._parse_http_headers(avatar_http_headers)
         self.avatar_http_timeout = avatar_http_timeout or 30
+        # {normalized_position: hr.job.id} — кеш по нормализованному имени
+        self._job_cache = {}
 
     def run(self):
         self.log('Extracting Bitrix employees...')
@@ -103,11 +105,13 @@ class EmployeeLoader(BaseLoader):
                 # Skip res.users lookup for fired users: they should not become
                 # active assignees. archive_fired() handles legacy linked users.
                 odoo_user_id = self._resolve_user(emp.user_id) if emp.active else None
+                job_id = self._resolve_job_id(emp.work_position)
                 vals = self._build_employee_vals(
                     emp,
                     dept_id=dept_id,
                     odoo_user_id=odoo_user_id,
                     telegram=telegram_map.get(bid),
+                    job_id=job_id,
                 )
 
                 employee = None
@@ -148,6 +152,90 @@ class EmployeeLoader(BaseLoader):
 
         self.log_stats()
         self.link_parents()
+
+    def sync_job_titles_only(self):
+        """Refresh job_id / job_title on already-imported employees.
+
+        Idempotent companion to ``run()``: does NOT create new employees,
+        does NOT touch contacts/department/user/active. Targets the
+        ``fix_job_titles`` migration mode.
+        """
+        from ...services.normalizers.dto import BitrixEmployee
+
+        self.log('Extracting Bitrix employees for job-title sync...')
+        rows = self.extractor.get_employees()
+        self.log(f'Found {len(rows)} Bitrix users (active + fired)')
+
+        Employee = self.env['hr.employee'].sudo().with_context(active_test=False)
+        emp_records = Employee.search([
+            ('x_bitrix_id', '!=', False),
+            ('x_bitrix_id', '!=', 0),
+        ])
+        by_bitrix = {emp.x_bitrix_id: emp for emp in emp_records}
+
+        updated = 0
+        cleared = 0
+        skipped_no_match = 0
+        unchanged = 0
+        processed = 0
+
+        for row in rows:
+            try:
+                emp = BitrixEmployee(**row)
+            except Exception as e:
+                self.log(f'ERROR parsing employee row {row}: {e}')
+                continue
+
+            processed += 1
+            employee = by_bitrix.get(emp.user_id)
+            if not employee:
+                skipped_no_match += 1
+                continue
+
+            position = self._normalize_position(emp.work_position)
+            job_id = self._resolve_job_id(emp.work_position)
+
+            current_job_id = employee.job_id.id or False
+            current_title = employee.job_title or False
+            target_job_id = job_id or False
+            target_title = position or False
+
+            update_vals = {}
+            if current_job_id != target_job_id:
+                update_vals['job_id'] = target_job_id
+            if current_title != target_title:
+                update_vals['job_title'] = target_title
+
+            if not update_vals:
+                unchanged += 1
+                continue
+
+            if self.dry_run:
+                updated += 1
+                continue
+
+            try:
+                employee.write(update_vals)
+            except Exception as e:
+                self.error_count += 1
+                self.errors.append((emp.user_id, f'job sync: {e}'))
+                self.log(f'ERROR updating job for bitrix_id={emp.user_id}: {e}')
+                continue
+
+            if target_title or target_job_id:
+                updated += 1
+            else:
+                cleared += 1
+
+            if processed % self.batch_size == 0:
+                self.commit_checkpoint(processed)
+
+        self.commit_checkpoint(processed)
+
+        self.log(
+            f'Job-title sync: processed={processed} updated={updated} '
+            f'cleared={cleared} unchanged={unchanged} no_match={skipped_no_match}'
+        )
 
     def link_parents(self):
         """Set hr.employee.parent_id from Bitrix department UF_HEAD hierarchy.
@@ -558,7 +646,8 @@ class EmployeeLoader(BaseLoader):
                 protected.add(user.id)
         return protected
 
-    def _build_employee_vals(self, emp, dept_id=None, odoo_user_id=None, telegram=None):
+    def _build_employee_vals(self, emp, dept_id=None, odoo_user_id=None, telegram=None,
+                             job_id=None):
         """Map Bitrix employee contacts to the closest Odoo employee fields."""
         vals = {
             'name': emp.full_name,
@@ -575,6 +664,11 @@ class EmployeeLoader(BaseLoader):
             vals['department_id'] = dept_id
         if odoo_user_id:
             vals['user_id'] = odoo_user_id
+        position = self._normalize_position(emp.work_position)
+        if position:
+            vals['job_title'] = position
+        if job_id:
+            vals['job_id'] = job_id
         # Only flag fired users explicitly; rely on Odoo's default active=True
         # for new active employees (so re-activate guard in _prepare_update_vals
         # never sees active=True coming from us).
@@ -600,7 +694,7 @@ class EmployeeLoader(BaseLoader):
             if value in (None, False, ''):
                 continue
 
-            if field_name in ('department_id', 'user_id'):
+            if field_name in ('department_id', 'user_id', 'job_id'):
                 current_value = employee[field_name].id if employee[field_name] else False
             else:
                 current_value = employee[field_name] or False
@@ -700,6 +794,31 @@ class EmployeeLoader(BaseLoader):
             if odoo_id and Department.browse(odoo_id).exists():
                 return odoo_id
         return None
+
+    @staticmethod
+    def _normalize_position(value):
+        """Strip/collapse whitespace; return None for empty/blank input."""
+        if not value:
+            return None
+        normalized = ' '.join(str(value).split())
+        return normalized or None
+
+    def _resolve_job_id(self, work_position):
+        """get_or_create hr.job by normalized name; cached per loader instance."""
+        normalized = self._normalize_position(work_position)
+        if not normalized:
+            return None
+        cached = self._job_cache.get(normalized)
+        if cached:
+            return cached
+        Job = self.env['hr.job'].sudo().with_context(active_test=False)
+        job = Job.search([('name', '=', normalized)], limit=1)
+        if not job and not self.dry_run:
+            job = Job.create({'name': normalized})
+        job_id = job.id if job else None
+        if job_id:
+            self._job_cache[normalized] = job_id
+        return job_id
 
     def _resolve_user(self, bitrix_user_id):
         """Return res.users.id for a Bitrix user_id via partner mapping."""

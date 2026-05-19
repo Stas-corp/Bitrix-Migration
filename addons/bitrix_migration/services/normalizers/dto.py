@@ -259,6 +259,7 @@ class BitrixEmployee(BaseModel):
     mobile_phone: Optional[str] = None
     personal_phone: Optional[str] = None
     telegram: Optional[str] = None  # заполняется отдельно в загрузчике
+    work_position: Optional[str] = None
 
     @model_validator(mode='before')
     @classmethod
@@ -273,7 +274,7 @@ class BitrixEmployee(BaseModel):
         return _clean_str(v) or 'Unknown Employee'
 
     @field_validator('email', 'work_phone', 'mobile_phone', 'personal_phone', 'telegram',
-                     mode='before')
+                     'work_position', mode='before')
     @classmethod
     def clean_contact(cls, v):
         return _clean_str(v)

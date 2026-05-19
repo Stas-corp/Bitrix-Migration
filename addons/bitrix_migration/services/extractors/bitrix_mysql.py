@@ -561,7 +561,8 @@ class BitrixMySQLExtractor:
             uu.UF_DEPARTMENT                        AS raw_dept,
             u.WORK_PHONE                            AS work_phone,
             u.PERSONAL_MOBILE                       AS mobile_phone,
-            u.PERSONAL_PHONE                        AS personal_phone
+            u.PERSONAL_PHONE                        AS personal_phone,
+            COALESCE(u.WORK_POSITION, '')           AS work_position
         FROM b_user u
         JOIN b_uts_user uu ON uu.VALUE_ID = u.ID
         WHERE uu.UF_DEPARTMENT IS NOT NULL

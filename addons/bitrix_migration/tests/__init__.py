@@ -9,3 +9,4 @@ from . import test_fired_employees
 from . import test_purge_noise
 from . import test_disk_filters
 from . import test_employee_hierarchy
+from . import test_employee_job

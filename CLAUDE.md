@@ -120,6 +120,7 @@ docker compose exec odoo odoo --test-enable -d odoo -u bitrix_migration --stop-a
 | `fix_attachments` | Repair: перелінковка comment attachments з `project.task` на `mail.message` |
 | `fix_descriptions` | Восстановление пустых описаний задач из Bitrix DISK FILE placeholders |
 | `fix_hierarchy` | Пересчёт `hr.employee.parent_id` по Bitrix UF_HEAD |
+| `fix_job_titles` | Синхронізація `hr.employee.job_id` / `job_title` з `b_user.WORK_POSITION` без повної перезагрузки HR |
 | `meetings` | Только зустрічі (calendar.event) |
 | `disk` | Bitrix Disk → Odoo Documents |
 

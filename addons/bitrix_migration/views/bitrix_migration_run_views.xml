@@ -31,6 +31,10 @@
                             type="object" class="btn-secondary"
                             invisible="state == 'running'"
                             confirm="Recompute hr.employee.parent_id from Bitrix UF_HEAD chains for already imported employees?"/>
+                    <button name="action_fix_employee_job_titles" string="Fix Job Titles"
+                            type="object" class="btn-secondary"
+                            invisible="state == 'running'"
+                            confirm="Sync hr.employee.job_id / job_title from Bitrix WORK_POSITION for already imported employees?"/>
                     <button name="action_create_test_employee_user" string="Create Test Employee User"
                             type="object" class="btn-secondary"
                             invisible="state == 'running' or not test_employee_id"
