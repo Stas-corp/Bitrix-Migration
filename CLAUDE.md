@@ -8,6 +8,11 @@ Odoo 19 CE addon `bitrix_migration` для одноразовой миграци
 Технологический стек: Python 3.12, Odoo 19, PostgreSQL 16, PyMySQL, Pydantic v2, Paramiko.
 Docker: Odoo доступен на `http://localhost:8079`.
 
+В репозитории живут **три** аддона (`addons/`):
+- `bitrix_migration` — основной модуль миграции (всё ниже относится к нему).
+- `odoo_document_management_cloud_sync` — сторонний платный DMS (File Manager + Cloud Sync). Используется как назначение для режима `disk`. Не редактировать без необходимости.
+- `dms_access_fix` — собственный модуль (`auto_install=True`, `post_init_hook`), закрывающий ACL-утечку `base.group_user` в DMS: делает шеринг для Document User read-only. Зависит от `odoo_document_management_cloud_sync`.
+
 ## Архитектура
 
 ```
@@ -37,11 +42,17 @@ addons/bitrix_migration/
 │   │   ├── attachments.py             # SFTP → Odoo ir.attachment (compound key, comment linking)
 │   │   ├── users.py
 │   │   ├── departments.py
-│   │   ├── employees.py               # + SFTP avatar sync
-│   │   └── meetings.py                # MeetingLoader → calendar.event
+│   │   ├── employees.py               # + SFTP avatar sync, job_id sync, archive_fired
+│   │   ├── hierarchy.py               # Pure helpers: dept tree → employee.parent_id (UF_HEAD)
+│   │   ├── meetings.py                # MeetingLoader → calendar.event
+│   │   └── disk.py                    # DiskLoader: Bitrix Disk → Odoo Documents (DMS)
 │   └── normalizers/
 │       ├── dto.py                     # Pydantic DTOs: BitrixProject, BitrixTask, BitrixMeeting, ...
 │       └── bitrix_markup.py           # BBCode → HTML конвертер для Bitrix markup
+├── data/
+│   └── ir_cron_data.xml               # 3 крона: avatar / attachment / full-migration батчи
+├── security/
+│   └── bitrix_task_employee_security.xml
 └── views/
     ├── bitrix_migration_run_views.xml
     ├── hr_employee_views.xml
@@ -80,9 +91,13 @@ docker compose exec odoo odoo --test-enable -d odoo -u bitrix_migration --stop-a
 - `test_role_mapping.py` — маппинг ролей Bitrix → Odoo, UNIQUE constraint на responsible
 - `test_markup_normalizer.py` — BBCode → HTML конвертация
 - `test_attachments.py` — ідемпотентність вкладень, прив'язка до коментарів
-- `test_meetings.py` — створення calendar.event з даними зустрічей
-- `test_employee_avatars.py` — синхронізація фото, SVG-placeholder detection
+- `test_meetings.py` / `test_meeting_attachments.py` / `test_meeting_comments.py` — calendar.event, вкладення і коментарі зустрічей
 - `test_departments.py` — ієрархія відділів, прив'язка керівника
+- `test_employee_hierarchy.py` — обчислення `parent_id` з dept tree / UF_HEAD (pure helpers з `hierarchy.py`)
+- `test_employee_job.py` — синхронізація `job_id` / `job_title` з WORK_POSITION
+- `test_fired_employees.py` — уволені створюються `active=True`, архівуються тільки в `archive_fired()`
+- `test_disk_filters.py` — фільтри Bitrix Disk
+- `test_purge_noise.py` — чистка мусорних аккаунтів
 
 ## Ключевые паттерны
 
@@ -114,8 +129,8 @@ docker compose exec odoo odoo --test-enable -d odoo -u bitrix_migration --stop-a
 | `relink` | Только tasks_relink (parent_id) |
 | `comments` | Только комментарии |
 | `single_task` | Одна задача по `single_task_bitrix_id` |
-| `hr` | Отделы + сотрудники |
-| `archive_employees` | Архивирование уволенных сотрудников |
+| `hr` | Отделы + сотрудники (ВСЕ создаются как `active=True`, включая уволенных) |
+| `archive_employees` | Финальный шаг: архивирование уволенных сотрудников + их `res.users` |
 | `fix_roles` | Пересинхронизация ролей у уже импортированных задач |
 | `fix_attachments` | Repair: перелінковка comment attachments з `project.task` на `mail.message` |
 | `fix_descriptions` | Восстановление пустых описаний задач из Bitrix DISK FILE placeholders |
@@ -132,6 +147,19 @@ docker compose exec odoo odoo --test-enable -d odoo -u bitrix_migration --stop-a
 2. **Create Test Employee User** — один сотрудник из `test_employee_id`
 3. **Send Password Reset** — рассылка писем сброса пароля
 4. **Purge Imported Data** / **Purge HR Data** — удалить всё импортированное (с подтверждением)
+
+### Канонический порядок миграции
+
+Уволенные сотрудники должны остаться видимыми в `project.task.user_ids` («Виконавці») и `calendar.event.partner_ids`. Для этого они импортируются как **активные** и архивируются только в самом конце:
+
+1. **Mode `hr`** — импорт отделов и сотрудников. `EmployeeLoader.run()` создаёт ВСЕХ (включая `ACTIVE='N'`) как `hr.employee.active=True`. `_build_employee_vals` намеренно не выставляет `active=False` — это контракт.
+2. **Кнопка «Create Employee Users»** — создаёт `res.users` для всех импортированных `hr.employee`. На этом шаге все сотрудники ещё активны, поэтому `_ensure_user_for_employee` создаёт активные учётки автоматически.
+3. **Mode `full`** — проекты/задачи/комментарии/встречи. Уволенные попадают в `project.task.user_ids` через стандартный механизм, потому что у них уже есть активный `res.users`.
+4. **Mode `archive_employees`** — `EmployeeLoader.archive_fired()` ставит `active=False` и на `hr.employee`, и на связанных `res.users` (с защитой системных и общих с активными сотрудниками). Ссылки `task.user_ids.ids` остаются нетронутыми — Many2many продолжает хранить ID архивных users, и виджет Odoo отрисовывает их с пометкой archived.
+
+**Важно:** `Send Password Reset` запускать ПОСЛЕ `archive_employees`, иначе письма со сбросом пароля могут уйти уволенным.
+
+**Idempotency.** Повторный запуск `hr` НЕ реактивирует уже архивированных: `_build_employee_vals` не пишет ключ `active`, поэтому downgrade-guard в `_prepare_update_vals` никогда не получает True→True. Активация требует ручного действия или удаления mapping + повторного `hr` на чистой записи.
 
 ### Danger Zone (форма `bitrix.migration.run`)
 
@@ -212,10 +240,19 @@ Legacy plain `file_path` keys продовжують читатися для bac
 Якщо відповідний `mail.message` не знайдено — fallback на `project.task`.
 Attachment SQL-запити фільтруються тим же `task_where_clause`, що й задачі/коментарі.
 
+## Фонові стадії (cron)
+
+Довгі стадії винесені у cron-воркери (`data/ir_cron_data.xml`, інтервал 1 хв), щоб обійти HTTP-таймаут `limit_time_real`. Усі реентерабельні: стан черги тримається у полях `bitrix.migration.run`, кожен тік обробляє батч у межах бюджету часу і коммітить прогрес.
+
+| Cron | Метод | Стан-поля | Що робить |
+|---|---|---|---|
+| Avatar Batch | `_cron_process_avatar_batch()` | `avatar_sync_state`, `avatar_last_user_id`, `avatar_*_count` | По 20 аватарів/тік, бюджет 45 с |
+| Attachment Batch | `_cron_process_attachment_batch()` | `attachment_sync_state`, `attachment_current_type/index`, `attachment_active_*` | SFTP-вкладення по типах task/comment/meeting/meeting_comment, з докачуванням великих файлів |
+| Full Migration | `_cron_process_full_migration()` | `full_sync_state`, `full_sync_started_at` | Повна міграція у фоні (cron-driven), імунна до HTTP-таймауту |
+
 ## Аватарки співробітників
 
-`EmployeeLoader.sync_avatars()` ставить у чергу SFTP-завантаження з `b_user.PERSONAL_PHOTO → b_file`.
-Фактичне завантаження виконується фоновим cron-джобом `_cron_process_avatar_batch()` — по 20 аватарів за тік з бюджетом 45 с. Стан черги зберігається в полях `avatar_sync_state` / `avatar_last_user_id` запису `bitrix.migration.run`. Джоб реентерабельний: безпечний перезапуск в середині черги.
+`EmployeeLoader.sync_avatars()` ставить у чергу SFTP-завантаження з `b_user.PERSONAL_PHOTO → b_file`; фактичне завантаження виконує cron `_cron_process_avatar_batch()` (див. таблицю вище).
 Політика: фото встановлюється тільки якщо `image_1920` порожнє (безпечний rerun).
 
 ## Fallback-проект для задач без GROUP_ID

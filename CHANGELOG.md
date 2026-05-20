@@ -1,5 +1,55 @@
 # CHANGELOG
 
+## 2026-05-20 — Миграция должности сотрудника (`WORK_POSITION` → `hr.employee.job_id` / `job_title`)
+
+До этого поле должности из Bitrix не переносилось вообще: `SQL_EMPLOYEES` не выбирал `WORK_POSITION`, в DTO `BitrixEmployee` поля не было, `_build_employee_vals` не заполнял ни `job_id`, ни `job_title`. После импорта у всех `hr.employee` оставались пустыми и «Вакансия» (`job_id`), и «Назва посади» (`job_title`).
+
+### Решение
+
+Перенос `b_user.WORK_POSITION` (стандартная строковая колонка Bitrix) в **оба** поля Odoo:
+
+- `job_id` (Many2one → `hr.job`) — через `get_or_create` по уникальному нормализованному имени должности. Открывает путь к штатке/рекрутингу/отчётам по позициям.
+- `job_title` (Char) — выставляется явно из `WORK_POSITION` (надёжнее, чем полагаться на onchange при последующем редактировании).
+
+Применяется в двух местах:
+
+1. **Встроено в `EmployeeLoader.run()`** — срабатывает при `mode='hr'` и `mode='full'`. Новый `_resolve_job_id()` кеширует `hr.job` по нормализованному имени (`_normalize_position`: strip + схлопывание пробелов, регистр сохраняется), так что повторные значения в батче не плодят дубликаты.
+2. **Новый режим `fix_job_titles`** — `EmployeeLoader.sync_job_titles_only()` обновляет только `job_id` / `job_title` у уже импортированных `hr.employee` без полной перезагрузки HR. Не создаёт новых сотрудников, не трогает контакты/отдел/user/active. Умеет также **очищать** оба поля, если `WORK_POSITION` опустел в Bitrix. Доступен как кнопка **Fix Job Titles** на форме и как режим в Selection.
+
+`_prepare_update_vals` дополнен: `job_id` теперь сравнивается как Many2one (`.id`), наравне с `department_id` / `user_id`.
+
+### Файлы
+
+| Файл | Изменение | Причина |
+|---|---|---|
+| `addons/bitrix_migration/services/extractors/bitrix_mysql.py` | В `SQL_EMPLOYEES` добавлен `COALESCE(u.WORK_POSITION, '') AS work_position` | Источник должности из `b_user` |
+| `addons/bitrix_migration/services/normalizers/dto.py` | Поле `BitrixEmployee.work_position`; добавлено в `_clean_str`-валидатор (пустые/`NULL` → `None`) | Нормализация значения должности |
+| `addons/bitrix_migration/services/loaders/employees.py` | `_job_cache` в `__init__`; статический `_normalize_position`; `_resolve_job_id`; `_build_employee_vals(job_id=...)` + выставление `job_title`; `run()` резолвит `job_id`; `sync_job_titles_only()`; `_prepare_update_vals` трактует `job_id` как Many2one | Заполнение полей + fix-режим |
+| `addons/bitrix_migration/models/bitrix_migration_run.py` | Режим `fix_job_titles` (Selection + `_BACKGROUND_MODES` + диспетчер); `_run_fix_job_titles`; `action_fix_employee_job_titles` | Точечная синхронизация должностей без полного HR |
+| `addons/bitrix_migration/views/bitrix_migration_run_views.xml` | Кнопка **Fix Job Titles** рядом с **Fix Employee Hierarchy** | UI для fix-режима |
+| `addons/bitrix_migration/tests/test_employee_job.py` (новый) + `tests/__init__.py` | 19 тестов: нормализация, парсинг DTO, `_resolve_job_id` (создание/кеш/дедуп/пустое), полный `run()` (создание `hr.job` + idempotency), `sync_job_titles_only` (update/no-create/promotion/clearing/no-op) | Покрытие новой логики |
+| `CLAUDE.md` | Запись `fix_job_titles` в таблице режимов | Документация |
+| `CHANGELOG.md` | Эта запись | — |
+
+### Verification
+
+1. **Schema-апгрейд**: `docker compose run --rm odoo odoo -d odoo -u bitrix_migration --stop-after-init` → загрузка без ошибок.
+2. **Юнит-тесты модуля**: `odoo --test-enable --test-tags=/bitrix_migration -d odoo --stop-after-init` → `162 tests`, `0 failed, 0 errors` (вкл. 19 новых из `test_employee_job.py`).
+3. **Запуск миграции**: на форме `bitrix.migration.run` режим **HR: Fix Job Titles** (или одноимённая кнопка) → лог `Job-title sync: processed=… updated=… cleared=… unchanged=… no_match=…`.
+4. **Sanity в Odoo shell**: `self.env['hr.employee'].search_count([('job_id','!=',False)])`, `search_count([('job_title','!=',False)])`, `self.env['hr.job'].search_count([])` (≈ числу уникальных `WORK_POSITION`).
+
+### Что попадает в git
+
+- `addons/bitrix_migration/services/extractors/bitrix_mysql.py`
+- `addons/bitrix_migration/services/normalizers/dto.py`
+- `addons/bitrix_migration/services/loaders/employees.py`
+- `addons/bitrix_migration/models/bitrix_migration_run.py`
+- `addons/bitrix_migration/views/bitrix_migration_run_views.xml`
+- `addons/bitrix_migration/tests/test_employee_job.py`
+- `addons/bitrix_migration/tests/__init__.py`
+- `CLAUDE.md`
+- `CHANGELOG.md`
+
 ## 2026-05-19 — `action_run` вынесен в cron-batch + hotfix `limit_time_real` для stage-odoo
 
 Повторный запуск `mode=full` в контейнере `stage-odoo-odoo-1` стабильно «зависал» на 5/9 Tasks: после ≈170 секунд работы Odoo-watchdog по `limit_time_real` дампил стек, делал internal reload (`os.kill(SIGTERM)` → `Modules loaded / Registry loaded / Bus.loop listen imbus`), транзакция HTTP-request'а откатывалась и `bitrix_migration_run.state` залипал на `running`. В прошлом запуске тот же симптом проявлялся в `_run_reconciliation()` (regex-сканы по `mail.message.body`).

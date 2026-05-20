@@ -102,9 +102,11 @@ class EmployeeLoader(BaseLoader):
             for emp in batch:
                 bid = str(emp.user_id)
                 dept_id = self._resolve_dept(emp.dept_ids)
-                # Skip res.users lookup for fired users: they should not become
-                # active assignees. archive_fired() handles legacy linked users.
-                odoo_user_id = self._resolve_user(emp.user_id) if emp.active else None
+                # Resolve existing res.users for all employees (fired included).
+                # Fired employees stay active until archive_employees mode is
+                # run, so they can become task assignees during the main
+                # migration and remain visible in user_ids after archival.
+                odoo_user_id = self._resolve_user(emp.user_id)
                 job_id = self._resolve_job_id(emp.work_position)
                 vals = self._build_employee_vals(
                     emp,
@@ -669,11 +671,11 @@ class EmployeeLoader(BaseLoader):
             vals['job_title'] = position
         if job_id:
             vals['job_id'] = job_id
-        # Only flag fired users explicitly; rely on Odoo's default active=True
-        # for new active employees (so re-activate guard in _prepare_update_vals
-        # never sees active=True coming from us).
-        if not emp.active:
-            vals['active'] = False
+        # Do NOT mark fired employees as active=False here. They must stay
+        # active during the main migration so that res.users gets created and
+        # they end up in project.task.user_ids ("Виконавці"). Actual archival
+        # is delegated to archive_fired() (mode `archive_employees`), which is
+        # the last step of the canonical migration flow.
 
         return vals
 
